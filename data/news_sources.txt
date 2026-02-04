@@ -1,0 +1,13 @@
+https://www.reuters.com/technology/rss
+https://news.google.com/rss/search?q=site:reuters.com%20semiconductors%20ai&hl=en-US&gl=US&ceid=US:en
+https://feeds.bloomberg.com/technology/ai/news.rss
+https://semianalysis.com/feed/
+https://asia.nikkei.com/rss/feed/technology
+https://asia.nikkei.com/rss/feed/nar
+https://www.theverge.com/rss/index.xml
+https://technews.tw/feed/
+https://www.inside.com.tw/feed
+https://www.techmeme.com/feed.xml
+https://techcrunch.com/feed/
+https://www.semafor.com/rss/technology
+https://wccftech.com/feed/

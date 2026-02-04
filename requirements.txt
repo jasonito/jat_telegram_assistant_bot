@@ -3,3 +3,6 @@ uvicorn
 python-dotenv
 requests
 slack_bolt
+feedparser
+rapidfuzz
+tzdata

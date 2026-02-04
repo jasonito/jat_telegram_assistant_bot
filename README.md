@@ -8,12 +8,17 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+
 ## Env
 
 Copy `.env.example` to `.env` and set your tokens. Optional group logging:
 
 - `TELEGRAM_ALLOWED_GROUPS` comma-separated group titles to log
 - `DATA_DIR` location for SQLite + Markdown
+- `TELEGRAM_LONG_POLLING` set `1` to enable getUpdates instead of webhook
+- `TELEGRAM_LOCAL_WEBHOOK_URL` local URL for polling to forward updates (default: `http://127.0.0.1:8000/telegram`)
+- `TESSERACT_CMD` full path to `tesseract.exe` if not on PATH (optional)
+- `TESSERACT_LANG` OCR languages (default: `chi_tra+eng`)
 
 Slack (Socket Mode):
 
@@ -25,6 +30,14 @@ Slack (Socket Mode):
 
 ```powershell
 uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+### Long polling (no ngrok/webhook)
+
+Set `TELEGRAM_LONG_POLLING=1`, then run:
+
+```powershell
+.\start.ps1
 ```
 
 ## Expose with ngrok
