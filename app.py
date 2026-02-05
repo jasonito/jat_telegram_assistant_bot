@@ -8,6 +8,8 @@ import sqlite3
 import hashlib
 import json
 import time
+import logging
+import logging.handlers
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -16,6 +18,7 @@ from threading import Event
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import requests
+import httpx
 from dotenv import load_dotenv
 import feedparser
 from rapidfuzz import fuzz
@@ -24,6 +27,44 @@ from slack_bolt import App as SlackApp
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 load_dotenv()
+
+# Setup logging
+def setup_logging():
+    """Configure logging with both file and console handlers."""
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    # Create formatters
+    detailed_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    simple_formatter = logging.Formatter('%(levelname)s: %(message)s')
+
+    # File handler with rotation
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_dir / "app.log",
+        maxBytes=10_000_000,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(detailed_formatter)
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(simple_formatter)
+
+    # Configure root logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+logger = setup_logging()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 if not BOT_TOKEN:
@@ -66,7 +107,7 @@ try:
 except ZoneInfoNotFoundError:
     # Fallback for Windows without tzdata installed.
     NEWS_TZ = timezone(timedelta(hours=8))
-    print("[WARN] tzdata not found; falling back to fixed UTC+08:00")
+    logger.warning("tzdata not found; falling back to fixed UTC+08:00")
 
 app = FastAPI()
 
@@ -172,28 +213,47 @@ def sort_downloads() -> str:
         try:
             shutil.move(str(item), str(dest_path))
             moved += 1
-        except Exception:
+        except (OSError, IOError, PermissionError) as e:
+            logger.error(f"Failed to move {item.name}: {e}")
             continue
 
     return f"Sorted {moved} file(s) into {sorted_root}."
 
 
 async def send_message(chat_id: int, text: str) -> None:
+    """Send a message to Telegram using async HTTP client."""
     payload = {"chat_id": chat_id, "text": text}
-    resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    print(f"sendMessage status={resp.status_code} body={resp.text}")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json=payload,
+                timeout=10.0
+            )
+            logger.info(f"sendMessage status={resp.status_code} chat_id={chat_id}")
+            if resp.status_code != 200:
+                logger.error(f"sendMessage failed: {resp.text}")
+    except httpx.TimeoutException as e:
+        logger.error(f"sendMessage timeout for chat_id={chat_id}: {e}")
+    except httpx.HTTPError as e:
+        logger.error(f"sendMessage HTTP error for chat_id={chat_id}: {e}")
 
 
 def delete_telegram_webhook(drop_pending: bool = False) -> None:
+    """Delete Telegram webhook (sync version for startup)."""
     try:
         resp = requests.post(
             f"{TELEGRAM_API}/deleteWebhook",
             json={"drop_pending_updates": drop_pending},
             timeout=10,
         )
-        print(f"deleteWebhook status={resp.status_code} body={resp.text}")
-    except Exception as e:
-        print(f"deleteWebhook error: {e}")
+        logger.info(f"deleteWebhook status={resp.status_code}")
+        if resp.status_code != 200:
+            logger.error(f"deleteWebhook failed: {resp.text}")
+    except requests.Timeout as e:
+        logger.error(f"deleteWebhook timeout: {e}")
+    except requests.RequestException as e:
+        logger.error(f"deleteWebhook request error: {e}")
 
 
 def handle_command(text: str) -> str:
@@ -764,6 +824,7 @@ NEWS_SHORTCUTS = {
 
 
 def set_telegram_commands() -> None:
+    """Set Telegram bot commands menu."""
     commands = [
         {"command": "news_latest", "description": "最新新聞"},
         {"command": "news_search", "description": "搜尋新聞"},
@@ -779,15 +840,27 @@ def set_telegram_commands() -> None:
             json={"commands": commands},
             timeout=10,
         )
-        print(f"setMyCommands status={resp.status_code} body={resp.text}")
-    except Exception as e:
-        print(f"setMyCommands error: {e}")
+        logger.info(f"setMyCommands status={resp.status_code}")
+        if resp.status_code != 200:
+            logger.error(f"setMyCommands failed: {resp.text}")
+    except requests.Timeout as e:
+        logger.error(f"setMyCommands timeout: {e}")
+    except requests.RequestException as e:
+        logger.error(f"setMyCommands request error: {e}")
 
 
 def send_message_sync(chat_id: str, text: str) -> None:
+    """Send a message to Telegram (sync version for background threads)."""
     payload = {"chat_id": chat_id, "text": text}
-    resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    print(f"sendMessage status={resp.status_code} body={resp.text}")
+    try:
+        resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+        logger.info(f"sendMessage status={resp.status_code} chat_id={chat_id}")
+        if resp.status_code != 200:
+            logger.error(f"sendMessage failed: {resp.text}")
+    except requests.Timeout as e:
+        logger.error(f"sendMessage timeout for chat_id={chat_id}: {e}")
+    except requests.RequestException as e:
+        logger.error(f"sendMessage request error for chat_id={chat_id}: {e}")
 
 
 def push_news_to_subscribers() -> None:
@@ -809,7 +882,8 @@ def push_news_to_subscribers() -> None:
                 last_dt = datetime.fromisoformat(last_sent_at)
                 if last_dt < datetime.fromisoformat(cutoff_iso):
                     effective_last = cutoff_iso
-            except Exception:
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Invalid last_sent_at for chat_id={chat_id}: {last_sent_at}, error: {e}")
                 effective_last = cutoff_iso
         with sqlite3.connect(DB_PATH) as conn:
             if effective_last:
@@ -848,38 +922,52 @@ def push_news_to_subscribers() -> None:
 
 
 def start_news_thread() -> None:
+    """Start background thread for news fetching and pushing."""
     def loop():
         while True:
             try:
                 fetch_and_store_news()
                 push_news_to_subscribers()
             except Exception as e:
-                print(f"news worker error: {e}")
+                logger.exception(f"News worker error: {e}")
             time.sleep(max(1, NEWS_FETCH_INTERVAL_MINUTES) * 60)
 
     t = threading.Thread(target=loop, daemon=True)
     t.start()
+    logger.info("News worker thread started")
 
 
 def telegram_get_file_info(file_id: str) -> tuple[str, str] | None:
+    """Get file URL from Telegram file_id."""
     try:
         resp = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=10)
         if resp.status_code != 200:
+            logger.warning(f"getFile failed with status={resp.status_code} for file_id={file_id}")
             return None
         data = resp.json()
         if not data.get("ok"):
+            logger.warning(f"getFile returned ok=false for file_id={file_id}")
             return None
         file_path = data.get("result", {}).get("file_path")
         if not file_path:
+            logger.warning(f"getFile returned no file_path for file_id={file_id}")
             return None
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
         return file_url, file_path
-    except Exception:
+    except requests.Timeout as e:
+        logger.error(f"getFile timeout for file_id={file_id}: {e}")
+        return None
+    except requests.RequestException as e:
+        logger.error(f"getFile request error for file_id={file_id}: {e}")
+        return None
+    except (ValueError, KeyError) as e:
+        logger.error(f"getFile JSON parsing error for file_id={file_id}: {e}")
         return None
 
 
 def telegram_polling_loop() -> None:
-    print("[INFO] Telegram long polling enabled.")
+    """Run Telegram long polling loop (for environments without webhook support)."""
+    logger.info("Telegram long polling enabled")
     delete_telegram_webhook(drop_pending=False)
     offset = None
     while True:
@@ -893,10 +981,12 @@ def telegram_polling_loop() -> None:
                 timeout=30,
             )
             if resp.status_code != 200:
+                logger.warning(f"getUpdates failed with status={resp.status_code}")
                 time.sleep(2)
                 continue
             data = resp.json()
             if not data.get("ok"):
+                logger.warning("getUpdates returned ok=false")
                 time.sleep(2)
                 continue
             for update in data.get("result", []):
@@ -910,13 +1000,21 @@ def telegram_polling_loop() -> None:
                         timeout=10,
                     )
                     if local_resp.status_code != 200:
-                        print(
-                            f"[WARN] local webhook status={local_resp.status_code} body={local_resp.text}"
+                        logger.warning(
+                            f"Local webhook returned status={local_resp.status_code}"
                         )
-                except Exception as e:
-                    print(f"[WARN] local webhook error: {e}")
+                except requests.Timeout as e:
+                    logger.error(f"Local webhook timeout: {e}")
+                except requests.RequestException as e:
+                    logger.error(f"Local webhook request error: {e}")
+        except requests.Timeout as e:
+            logger.error(f"Telegram polling timeout: {e}")
+            time.sleep(2)
+        except requests.RequestException as e:
+            logger.error(f"Telegram polling request error: {e}")
+            time.sleep(2)
         except Exception as e:
-            print(f"[ERROR] Telegram polling error: {e}")
+            logger.exception(f"Telegram polling unexpected error: {e}")
             time.sleep(2)
 
 
@@ -996,20 +1094,31 @@ async def telegram_webhook(request: Request):
             if file_info:
                 file_url, file_path = file_info
                 try:
-                    img_resp = requests.get(file_url, timeout=20)
-                    if img_resp.status_code != 200:
-                        raise RuntimeError(f"image download failed: {img_resp.status_code}")
-                    day = (msg_ts or datetime.now()).strftime("%Y-%m-%d")
-                    img_dir = DATA_DIR / "inbox" / "images" / day
-                    img_dir.mkdir(parents=True, exist_ok=True)
-                    suffix = Path(file_path).suffix or ".jpg"
-                    filename = f"{chat_id}_{msg_id}_{file_unique_id}{suffix}"
-                    out_path = img_dir / filename
-                    out_path.write_bytes(img_resp.content)
-                    await send_message(chat_id, f"已存檔：{filename}")
-                    return JSONResponse({"ok": True})
-                except Exception:
-                    pass
+                    # Use async HTTP client for downloading image
+                    async with httpx.AsyncClient() as client:
+                        img_resp = await client.get(file_url, timeout=20.0)
+                        if img_resp.status_code != 200:
+                            logger.error(f"Image download failed: status={img_resp.status_code}")
+                            raise RuntimeError(f"image download failed: {img_resp.status_code}")
+
+                        day = (msg_ts or datetime.now()).strftime("%Y-%m-%d")
+                        img_dir = DATA_DIR / "inbox" / "images" / day
+                        img_dir.mkdir(parents=True, exist_ok=True)
+                        suffix = Path(file_path).suffix or ".jpg"
+                        filename = f"{chat_id}_{msg_id}_{file_unique_id}{suffix}"
+                        out_path = img_dir / filename
+                        out_path.write_bytes(img_resp.content)
+                        logger.info(f"Image saved: {filename}")
+                        await send_message(chat_id, f"已存檔：{filename}")
+                        return JSONResponse({"ok": True})
+                except httpx.TimeoutException as e:
+                    logger.error(f"Image download timeout for file_id={file_id}: {e}")
+                except httpx.HTTPError as e:
+                    logger.error(f"Image download HTTP error for file_id={file_id}: {e}")
+                except (OSError, IOError) as e:
+                    logger.error(f"Image file write error for {filename}: {e}")
+                except Exception as e:
+                    logger.exception(f"Unexpected error during image download for file_id={file_id}: {e}")
         await send_message(chat_id, "存檔失敗，請稍後再試。")
         return JSONResponse({"ok": True})
 
@@ -1017,9 +1126,12 @@ async def telegram_webhook(request: Request):
 
 
 def start_slack_socket_mode() -> None:
+    """Start Slack Socket Mode handler for direct messages."""
     if not (SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_USER_ID):
-        print("Slack tokens/user not set; skipping Slack Socket Mode.")
+        logger.info("Slack tokens/user not set; skipping Slack Socket Mode")
         return
+
+    logger.info("Starting Slack Socket Mode")
 
     slack_app = SlackApp(token=SLACK_BOT_TOKEN)
 
@@ -1042,7 +1154,8 @@ def start_slack_socket_mode() -> None:
         if event.get("ts"):
             try:
                 msg_ts = datetime.fromtimestamp(float(event.get("ts")))
-            except Exception:
+            except (ValueError, TypeError, OSError) as e:
+                logger.warning(f"Failed to parse Slack message timestamp: {event.get('ts')}, error: {e}")
                 msg_ts = None
 
         store_message("slack", event.get("channel", ""), "DM", event.get("user", ""), "Jason", text, msg_ts)
