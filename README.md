@@ -26,6 +26,18 @@ Slack (Socket Mode):
 - `SLACK_APP_TOKEN` (xapp-...) with `connections:write`
 - `SLACK_USER_ID` your user id (U...)
 
+AI summary for `/summary`:
+
+- `AI_SUMMARY_ENABLED` set `1` to enable
+- `AI_SUMMARY_PROVIDER` supports `openai`, `gemini`, `anthropic`, `huggingface`, `ollama` (`antropic`, `hf`, `local` aliases also work)
+- `AI_SUMMARY_TIMEOUT_SECONDS` request timeout for all providers
+- `AI_SUMMARY_MAX_CHARS` max context size sent to model
+- OpenAI: `OPENAI_API_KEY`, `OPENAI_MODEL`
+- Gemini: `GEMINI_API_KEY`, `GEMINI_MODEL`
+- Anthropic: `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`
+- Hugging Face: `HUGGINGFACE_API_KEY`, `HUGGINGFACE_MODEL`, `HUGGINGFACE_BASE_URL`
+- Ollama: `OLLAMA_BASE_URL`, `OLLAMA_MODEL`
+
 ## Run
 
 ```powershell
