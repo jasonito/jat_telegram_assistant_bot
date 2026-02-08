@@ -240,22 +240,33 @@ def delete_telegram_webhook(drop_pending: bool = False) -> None:
 
 def handle_command(text: str) -> str:
     text = text.strip()
+    text_lower = text.lower()
 
-    if text.lower().startswith("open "):
+    if text_lower.startswith("/summary_weekly"):
+        day = _parse_day_arg(text)
+        parts = summary_weekly(day)
+        return "\n".join(parts)
+
+    if text_lower.startswith("/summary"):
+        day = _parse_day_arg(text)
+        parts = summary_ai(day)
+        return "\n".join(parts)
+
+    if text_lower.startswith("open "):
         url = text[5:].strip()
         if not re.match(r"^https?://", url, re.I):
             url = "https://" + url
         webbrowser.open(url)
         return f"Opened: {url}"
 
-    if text.lower() in {"notepad", "open notepad"}:
+    if text_lower in {"notepad", "open notepad"}:
         open_notepad()
         return "Opened Notepad."
 
-    if text.lower() == "sort downloads":
+    if text_lower == "sort downloads":
         return sort_downloads()
 
-    if text.lower() in {"help", "/help"}:
+    if text_lower in {"help", "/help"}:
         return "Commands: open <url>, notepad, sort downloads"
 
     return "已成功紀錄"
@@ -1018,6 +1029,63 @@ def _normalize_notes_output(text: str) -> str:
     if not out:
         return insufficient
     return "\n".join(out[:15])
+
+
+def _parse_day_arg(text: str) -> str:
+    tokens = text.strip().split()
+    if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]):
+        return tokens[1]
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def summary_weekly(day: str) -> list[str]:
+    end_day = datetime.strptime(day, "%Y-%m-%d")
+    days = [(end_day - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+
+    daily_sections: list[str] = []
+    for d in days:
+        parts = summary_ai(d)
+        if len(parts) >= 6 and parts[0].endswith("(AI)"):
+            daily_sections.append(
+                "\n".join(
+                    [
+                        f"## {d}",
+                        parts[1],
+                        parts[2],
+                        parts[4],
+                        parts[5],
+                    ]
+                )
+            )
+            continue
+
+        fallback = merge_all(d)
+        fallback_text = "\n".join(fallback)
+        daily_sections.append(f"## {d}\n{fallback_text[:600]}")
+
+    context_text = "\n\n".join(daily_sections)
+    if len(context_text) > AI_SUMMARY_MAX_CHARS:
+        context_text = context_text[:AI_SUMMARY_MAX_CHARS]
+
+    system_prompt = (
+        "Use only provided content. Do not invent facts. "
+        "Output must be in Traditional Chinese."
+    )
+    weekly_prompt = (
+        f"請針對截至 {day} 的近 7 天內容產出週摘要。\n"
+        "輸出格式：\n"
+        "A. 新聞\n"
+        "- 5-10 點：重要趨勢、關鍵公司與事件，若有網址請保留。\n\n"
+        "B. 筆記\n"
+        "- 5-10 點：決策、待辦、風險與下週行動。\n\n"
+        "請勿編造資訊。\n\n"
+        f"{context_text}"
+    )
+    weekly = _run_ai_chat(system_prompt, weekly_prompt)
+
+    if not weekly:
+        return [f"{day} summary_weekly", context_text]
+    return [f"{day} summary_weekly (AI)", weekly]
 
 
 def summary_ai(day: str) -> list[str]:
@@ -1905,6 +1973,14 @@ def start_slack_socket_mode() -> None:
         parts = summary_ai(day)
         respond("\n".join(parts))
 
+    @slack_app.command("/summary_weekly")
+    def handle_slack_summary_weekly(ack, respond, command):
+        ack()
+        text = (command.get("text") or "").strip()
+        day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
+        parts = summary_weekly(day)
+        respond("\n".join(parts))
+
     @slack_app.event("message")
     def handle_slack_message(event, say):
         if SLACK_DEBUG:
@@ -1975,6 +2051,12 @@ def start_slack_socket_mode() -> None:
             tokens = text.split()
             day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
             parts = merge_all(day)
+            say("\n".join(parts))
+            return
+        if text.startswith("/summary_weekly"):
+            tokens = text.split()
+            day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
+            parts = summary_weekly(day)
             say("\n".join(parts))
             return
         if text.startswith("/summary"):

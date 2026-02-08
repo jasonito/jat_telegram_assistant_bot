@@ -44,6 +44,12 @@
     }
   }
 
+  function Is-Truthy($value) {
+    if ($null -eq $value) { return $false }
+    $v = $value.ToString().Trim().ToLower()
+    return $v -in @('1', 'true', 'yes')
+  }
+
   try {
     Ensure-Command 'python'
 
@@ -70,6 +76,16 @@
     $last4 = if ($tokenLen -ge 4) { $token.Substring($tokenLen - 4, 4) } else { $token }
     Write-Info "Token loaded (length: $tokenLen, last4: $last4)"
 
+    # Ensure current process uses .env AI settings (override inherited system env).
+    $aiSummaryEnabled = Get-EnvValueFromFile -path $envFile -key 'AI_SUMMARY_ENABLED'
+    if ($null -ne $aiSummaryEnabled) { $env:AI_SUMMARY_ENABLED = $aiSummaryEnabled }
+    $aiSummaryProvider = Get-EnvValueFromFile -path $envFile -key 'AI_SUMMARY_PROVIDER'
+    if ($null -ne $aiSummaryProvider) { $env:AI_SUMMARY_PROVIDER = $aiSummaryProvider }
+    $ollamaBaseUrl = Get-EnvValueFromFile -path $envFile -key 'OLLAMA_BASE_URL'
+    if ($null -ne $ollamaBaseUrl) { $env:OLLAMA_BASE_URL = $ollamaBaseUrl }
+    $ollamaModel = Get-EnvValueFromFile -path $envFile -key 'OLLAMA_MODEL'
+    if ($null -ne $ollamaModel) { $env:OLLAMA_MODEL = $ollamaModel }
+
     $enableNgrok = if ($env:ENABLE_NGROK -ne $null) { $env:ENABLE_NGROK } else { '1' }
     $enableWebhook = if ($env:ENABLE_WEBHOOK -ne $null) { $env:ENABLE_WEBHOOK } else { '1' }
     $enableLongPolling = if ($env:TELEGRAM_LONG_POLLING -ne $null) { $env:TELEGRAM_LONG_POLLING } else { '0' }
@@ -90,6 +106,41 @@
 
     Write-Info 'Installing Python dependencies...'
     & $pythonExe -m pip install -r $requirements
+
+    $effectiveProvider = if ($env:AI_SUMMARY_PROVIDER) { $env:AI_SUMMARY_PROVIDER.ToLower().Trim() } else { '' }
+    $needsOllama = (Is-Truthy $env:AI_SUMMARY_ENABLED) -and ($effectiveProvider -in @('ollama', 'local'))
+    if ($needsOllama) {
+      Ensure-Command 'ollama'
+      $base = if ($env:OLLAMA_BASE_URL) { $env:OLLAMA_BASE_URL.TrimEnd('/') } else { 'http://127.0.0.1:11434' }
+      $tagsUrl = "$base/api/tags"
+      $ollamaReady = $false
+      try {
+        $null = Invoke-RestMethod -Method Get -Uri $tagsUrl -TimeoutSec 2
+        $ollamaReady = $true
+        Write-Info 'Ollama service already running.'
+      } catch {
+        Write-Info 'Starting Ollama service...'
+        Start-Process -FilePath 'ollama' -ArgumentList 'serve'
+      }
+
+      if (-not $ollamaReady) {
+        $deadlineOllama = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadlineOllama) {
+          try {
+            $null = Invoke-RestMethod -Method Get -Uri $tagsUrl -TimeoutSec 2
+            $ollamaReady = $true
+            break
+          } catch {
+            Start-Sleep -Seconds 1
+          }
+        }
+      }
+
+      if (-not $ollamaReady) {
+        throw "Ollama service did not become ready at $tagsUrl"
+      }
+      Write-Info "Ollama ready: $base (model: $($env:OLLAMA_MODEL))"
+    }
 
     if ($enableNgrok -ne '0') {
       Ensure-Command 'ngrok'
