@@ -90,9 +90,60 @@ try:
 except ZoneInfoNotFoundError:
     # Fallback for Windows without tzdata installed.
     NEWS_TZ = timezone(timedelta(hours=8))
-    print("[WARN] tzdata not found; falling back to fixed UTC+08:00")
+    logging.warning("tzdata not found; falling back to fixed UTC+08:00")
+
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+
+# ---------------------------------------------------------------------------
+# Retry helper for external HTTP calls
+# ---------------------------------------------------------------------------
+def _request_with_retry(
+    method: str,
+    url: str,
+    *,
+    max_retries: int = 3,
+    backoff_base: float = 2.0,
+    retry_on_status: tuple[int, ...] = (429, 500, 502, 503, 504),
+    **kwargs,
+) -> requests.Response:
+    """HTTP request with exponential backoff retry.
+
+    Retries on network errors and specified HTTP status codes.
+    Non-retryable HTTP errors (4xx except 429) are returned immediately.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code not in retry_on_status or attempt == max_retries:
+                return resp
+            wait = backoff_base ** attempt
+            logger.warning(
+                "Retryable HTTP %d from %s (attempt %d/%d, wait %.1fs)",
+                resp.status_code, url, attempt + 1, max_retries + 1, wait,
+            )
+            time.sleep(wait)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+            if attempt == max_retries:
+                raise
+            wait = backoff_base ** attempt
+            logger.warning(
+                "Network error on %s (attempt %d/%d, wait %.1fs): %s",
+                url, attempt + 1, max_retries + 1, wait, exc,
+            )
+            time.sleep(wait)
+    raise last_exc  # type: ignore[misc]
 
 
 def init_storage() -> None:
@@ -222,20 +273,24 @@ def sort_downloads() -> str:
 
 async def send_message(chat_id: int, text: str) -> None:
     payload = {"chat_id": chat_id, "text": text}
-    resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    print(f"sendMessage status={resp.status_code} body={resp.text}")
+    try:
+        resp = _request_with_retry("POST", f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+        logger.info("sendMessage status=%d body=%s", resp.status_code, resp.text[:200])
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        logger.error("sendMessage failed after retries: %s", exc)
 
 
 def delete_telegram_webhook(drop_pending: bool = False) -> None:
     try:
-        resp = requests.post(
+        resp = _request_with_retry(
+            "POST",
             f"{TELEGRAM_API}/deleteWebhook",
             json={"drop_pending_updates": drop_pending},
             timeout=10,
         )
-        print(f"deleteWebhook status={resp.status_code} body={resp.text}")
-    except Exception as e:
-        print(f"deleteWebhook error: {e}")
+        logger.info("deleteWebhook status=%d body=%s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        logger.error("deleteWebhook error: %s", exc)
 
 
 def handle_command(text: str) -> str:
@@ -521,13 +576,7 @@ def generate_ai_summary(
     if not AI_SUMMARY_ENABLED:
         return None
 
-    provider = AI_SUMMARY_PROVIDER
-    if provider == "antropic":
-        provider = "anthropic"
-    if provider == "hf":
-        provider = "huggingface"
-    if provider == "local":
-        provider = "ollama"
+    provider = _resolve_ai_provider()
 
     def clip(text: str, max_len: int = 180) -> str:
         t = re.sub(r"\s+", " ", str(text or "").strip())
@@ -630,145 +679,7 @@ def generate_ai_summary(
     else:
         user_prompt = SLACK_DAILY_PROMPT
 
-    try:
-        if provider == "openai":
-            if not OPENAI_API_KEY:
-                print("[WARN] AI summary enabled but OPENAI_API_KEY is empty; using fallback summary")
-                return None
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": OPENAI_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.2,
-                },
-                timeout=AI_SUMMARY_TIMEOUT_SECONDS,
-            )
-            if resp.status_code >= 300:
-                print(f"[WARN] OpenAI summary API failed: status={resp.status_code} body={resp.text[:300]}")
-                return None
-            data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            return content or None
-
-        if provider == "gemini":
-            if not GEMINI_API_KEY:
-                print("[WARN] AI summary enabled but GEMINI_API_KEY is empty; using fallback summary")
-                return None
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-            resp = requests.post(
-                url,
-                params={"key": GEMINI_API_KEY},
-                headers={"Content-Type": "application/json"},
-                json={
-                    "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
-                    "generationConfig": {"temperature": 0.2},
-                },
-                timeout=AI_SUMMARY_TIMEOUT_SECONDS,
-            )
-            if resp.status_code >= 300:
-                print(f"[WARN] Gemini summary API failed: status={resp.status_code} body={resp.text[:300]}")
-                return None
-            data = resp.json()
-            candidates = data.get("candidates") or []
-            if not candidates:
-                return None
-            parts = candidates[0].get("content", {}).get("parts") or []
-            content = "\n".join((part.get("text") or "").strip() for part in parts if part.get("text"))
-            return content.strip() or None
-
-        if provider == "anthropic":
-            if not ANTHROPIC_API_KEY:
-                print("[WARN] AI summary enabled but ANTHROPIC_API_KEY is empty; using fallback summary")
-                return None
-            resp = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": ANTHROPIC_MODEL,
-                    "max_tokens": 800,
-                    "temperature": 0.2,
-                    "system": system_prompt,
-                    "messages": [{"role": "user", "content": user_prompt}],
-                },
-                timeout=AI_SUMMARY_TIMEOUT_SECONDS,
-            )
-            if resp.status_code >= 300:
-                print(f"[WARN] Anthropic summary API failed: status={resp.status_code} body={resp.text[:300]}")
-                return None
-            data = resp.json()
-            blocks = data.get("content") or []
-            content = "\n".join((b.get("text") or "").strip() for b in blocks if b.get("type") == "text")
-            return content.strip() or None
-
-        if provider == "huggingface":
-            if not HUGGINGFACE_API_KEY:
-                print("[WARN] AI summary enabled but HUGGINGFACE_API_KEY is empty; using fallback summary")
-                return None
-            url = f"{HUGGINGFACE_BASE_URL.rstrip('/')}/chat/completions"
-            resp = requests.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {HUGGINGFACE_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": HUGGINGFACE_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.2,
-                },
-                timeout=AI_SUMMARY_TIMEOUT_SECONDS,
-            )
-            if resp.status_code >= 300:
-                print(f"[WARN] HuggingFace summary API failed: status={resp.status_code} body={resp.text[:300]}")
-                return None
-            data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            return content or None
-
-        if provider == "ollama":
-            url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat"
-            resp = requests.post(
-                url,
-                headers={"Content-Type": "application/json"},
-                json={
-                    "model": OLLAMA_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "stream": False,
-                    "options": {"temperature": 0.2},
-                },
-                timeout=AI_SUMMARY_TIMEOUT_SECONDS,
-            )
-            if resp.status_code >= 300:
-                print(f"[WARN] Ollama summary API failed: status={resp.status_code} body={resp.text[:300]}")
-                return None
-            data = resp.json()
-            content = data.get("message", {}).get("content", "").strip()
-            return content or None
-
-        print(f"[WARN] unsupported AI_SUMMARY_PROVIDER={AI_SUMMARY_PROVIDER}; using fallback summary")
-        return None
-
-    except Exception as e:
-        print(f"[WARN] AI summary exception provider={provider}: {e}")
-        return None
+    return _call_ai_provider(provider, system_prompt, user_prompt, verbose=True)
 
 
 def merge_all(day: str) -> list[str]:
@@ -826,13 +737,21 @@ def _resolve_ai_provider() -> str:
     return provider
 
 
-def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
-    provider = _resolve_ai_provider()
+def _call_ai_provider(
+    provider: str, system_prompt: str, user_prompt: str, *, verbose: bool = False,
+) -> str | None:
+    """Unified AI provider call with retry and structured error handling.
+
+    Returns the generated text or None on failure.
+    """
     try:
         if provider == "openai":
             if not OPENAI_API_KEY:
+                if verbose:
+                    logger.warning("AI summary enabled but OPENAI_API_KEY is empty")
                 return None
-            resp = requests.post(
+            resp = _request_with_retry(
+                "POST",
                 "https://api.openai.com/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -849,14 +768,19 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
             if resp.status_code >= 300:
+                if verbose:
+                    logger.warning("OpenAI API failed: status=%d body=%s", resp.status_code, resp.text[:300])
                 return None
             data = resp.json()
             return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
 
         if provider == "gemini":
             if not GEMINI_API_KEY:
+                if verbose:
+                    logger.warning("AI summary enabled but GEMINI_API_KEY is empty")
                 return None
-            resp = requests.post(
+            resp = _request_with_retry(
+                "POST",
                 f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
                 params={"key": GEMINI_API_KEY},
                 headers={"Content-Type": "application/json"},
@@ -867,6 +791,8 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
             if resp.status_code >= 300:
+                if verbose:
+                    logger.warning("Gemini API failed: status=%d body=%s", resp.status_code, resp.text[:300])
                 return None
             data = resp.json()
             candidates = data.get("candidates") or []
@@ -877,8 +803,11 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
 
         if provider == "anthropic":
             if not ANTHROPIC_API_KEY:
+                if verbose:
+                    logger.warning("AI summary enabled but ANTHROPIC_API_KEY is empty")
                 return None
-            resp = requests.post(
+            resp = _request_with_retry(
+                "POST",
                 "https://api.anthropic.com/v1/messages",
                 headers={
                     "x-api-key": ANTHROPIC_API_KEY,
@@ -895,6 +824,8 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
             if resp.status_code >= 300:
+                if verbose:
+                    logger.warning("Anthropic API failed: status=%d body=%s", resp.status_code, resp.text[:300])
                 return None
             data = resp.json()
             blocks = data.get("content") or []
@@ -902,8 +833,11 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
 
         if provider == "huggingface":
             if not HUGGINGFACE_API_KEY:
+                if verbose:
+                    logger.warning("AI summary enabled but HUGGINGFACE_API_KEY is empty")
                 return None
-            resp = requests.post(
+            resp = _request_with_retry(
+                "POST",
                 f"{HUGGINGFACE_BASE_URL.rstrip('/')}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {HUGGINGFACE_API_KEY}",
@@ -920,12 +854,15 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
             if resp.status_code >= 300:
+                if verbose:
+                    logger.warning("HuggingFace API failed: status=%d body=%s", resp.status_code, resp.text[:300])
                 return None
             data = resp.json()
             return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
 
         if provider == "ollama":
-            resp = requests.post(
+            resp = _request_with_retry(
+                "POST",
                 f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat",
                 headers={"Content-Type": "application/json"},
                 json={
@@ -940,12 +877,27 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
             if resp.status_code >= 300:
+                if verbose:
+                    logger.warning("Ollama API failed: status=%d body=%s", resp.status_code, resp.text[:300])
                 return None
             data = resp.json()
             return data.get("message", {}).get("content", "").strip() or None
-    except Exception:
+
+        if verbose:
+            logger.warning("Unsupported AI_SUMMARY_PROVIDER=%s", provider)
         return None
-    return None
+
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        logger.warning("AI provider %s network error: %s", provider, exc)
+        return None
+    except Exception as exc:
+        logger.warning("AI provider %s unexpected error: %s", provider, exc)
+        return None
+
+
+def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
+    provider = _resolve_ai_provider()
+    return _call_ai_provider(provider, system_prompt, user_prompt)
 
 
 def _strip_markdown_noise(text: str) -> str:
@@ -1190,17 +1142,17 @@ def normalize_title(title: str) -> str:
     if not t:
         return ""
     t = re.sub(
-        r"^\\s*(reuters|bloomberg|nikkei|nikkei asia|asia nikkei|semianalysis)\\s*[-:|]\\s*",
+        r"^\s*(reuters|bloomberg|nikkei|nikkei asia|asia nikkei|semianalysis)\s*[-:|]\s*",
         "",
         t,
     )
     t = re.sub(
-        r"\\s*[-:|]\\s*(reuters|bloomberg|nikkei|nikkei asia|asia nikkei|semianalysis)\\s*$",
+        r"\s*[-:|]\s*(reuters|bloomberg|nikkei|nikkei asia|asia nikkei|semianalysis)\s*$",
         "",
         t,
     )
-    t = re.sub(r"[^a-z0-9\\u4e00-\\u9fff\\s]", " ", t)
-    t = re.sub(r"\\s+", " ", t).strip()
+    t = re.sub(r"[^a-z0-9\u4e00-\u9fff\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
     return t
 
 
@@ -1659,20 +1611,24 @@ def set_telegram_commands() -> None:
         {"command": "news_help", "description": "指令說明"},
     ]
     try:
-        resp = requests.post(
+        resp = _request_with_retry(
+            "POST",
             f"{TELEGRAM_API}/setMyCommands",
             json={"commands": commands},
             timeout=10,
         )
-        print(f"setMyCommands status={resp.status_code} body={resp.text}")
-    except Exception as e:
-        print(f"setMyCommands error: {e}")
+        logger.info("setMyCommands status=%d body=%s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        logger.error("setMyCommands error: %s", exc)
 
 
 def send_message_sync(chat_id: str, text: str) -> None:
     payload = {"chat_id": chat_id, "text": text}
-    resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    print(f"sendMessage status={resp.status_code} body={resp.text}")
+    try:
+        resp = _request_with_retry("POST", f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+        logger.info("sendMessage status=%d body=%s", resp.status_code, resp.text[:200])
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        logger.error("sendMessage failed after retries: %s", exc)
 
 
 def push_news_to_subscribers() -> None:
@@ -1739,7 +1695,7 @@ def start_news_thread() -> None:
                 fetch_and_store_news()
                 push_news_to_subscribers()
             except Exception as e:
-                print(f"news worker error: {e}")
+                logger.error("news worker error: %s", e)
             time.sleep(max(1, NEWS_FETCH_INTERVAL_MINUTES) * 60)
 
     t = threading.Thread(target=loop, daemon=True)
@@ -1748,7 +1704,7 @@ def start_news_thread() -> None:
 
 def telegram_get_file_info(file_id: str) -> tuple[str, str] | None:
     try:
-        resp = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=10)
+        resp = _request_with_retry("GET", f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=10)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -1764,7 +1720,7 @@ def telegram_get_file_info(file_id: str) -> tuple[str, str] | None:
 
 
 def telegram_polling_loop() -> None:
-    print("[INFO] Telegram long polling enabled.")
+    logger.info("Telegram long polling enabled.")
     delete_telegram_webhook(drop_pending=False)
     offset = None
     while True:
@@ -1795,13 +1751,13 @@ def telegram_polling_loop() -> None:
                         timeout=10,
                     )
                     if local_resp.status_code != 200:
-                        print(
-                            f"[WARN] local webhook status={local_resp.status_code} body={local_resp.text}"
+                        logger.warning(
+                            "local webhook status=%d body=%s", local_resp.status_code, local_resp.text[:200]
                         )
                 except Exception as e:
-                    print(f"[WARN] local webhook error: {e}")
+                    logger.warning("local webhook error: %s", e)
         except Exception as e:
-            print(f"[ERROR] Telegram polling error: {e}")
+            logger.error("Telegram polling error: %s", e)
             time.sleep(2)
 
 
@@ -1903,12 +1859,12 @@ async def telegram_webhook(request: Request):
 
 def start_slack_socket_mode() -> None:
     if not (SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_USER_ID):
-        print("Slack tokens/user not set; skipping Slack Socket Mode.")
+        logger.info("Slack tokens/user not set; skipping Slack Socket Mode.")
         return
 
     slack_app = SlackApp(token=SLACK_BOT_TOKEN)
     if SLACK_DEBUG:
-        print("[SLACK] Socket Mode starting...")
+        logger.info("Slack Socket Mode starting...")
 
     @slack_app.command("/n")
     def handle_slack_note(ack, respond, command):
@@ -1984,23 +1940,23 @@ def start_slack_socket_mode() -> None:
     @slack_app.event("message")
     def handle_slack_message(event, say):
         if SLACK_DEBUG:
-            print(f"[SLACK] event received: keys={list(event.keys())}")
+            logger.debug("SLACK event received: keys=%s", list(event.keys()))
         if event.get("subtype"):
             if SLACK_DEBUG:
-                print("[SLACK] ignored: subtype present")
+                logger.debug("SLACK ignored: subtype present")
             return
         if event.get("bot_id"):
             if SLACK_DEBUG:
-                print("[SLACK] ignored: bot message")
+                logger.debug("SLACK ignored: bot message")
             return
         channel_type = event.get("channel_type")
         if channel_type and channel_type != "im":
             if SLACK_DEBUG:
-                print(f"[SLACK] ignored: channel_type={channel_type}")
+                logger.debug("SLACK ignored: channel_type=%s", channel_type)
             return
         if event.get("user") != SLACK_USER_ID:
             if SLACK_DEBUG:
-                print(f"[SLACK] ignored: user mismatch {event.get('user')}")
+                logger.debug("SLACK ignored: user mismatch %s", event.get("user"))
             return
 
         text = event.get("text")
