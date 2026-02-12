@@ -8,6 +8,12 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+## Deployment Docs
+
+- Server deployment (24/7): `docs/DEPLOY_SERVER.md`
+- Preflight checklist: `docs/PREFLIGHT_CHECKLIST.md`
+- systemd template: `deploy/jat-bot.service.example`
+
 
 ## Env
 
@@ -24,7 +30,13 @@ Copy `.env.example` to `.env` and set your tokens. Optional group logging:
 
 Dropbox sync:
 
-- `DROPBOX_ACCESS_TOKEN` API token
+- `DROPBOX_ACCESS_TOKEN` API token (legacy/fallback mode)
+- `DROPBOX_REFRESH_TOKEN` long-lived refresh token (recommended)
+- `DROPBOX_APP_KEY` Dropbox app key (required with refresh token)
+- `DROPBOX_APP_SECRET` Dropbox app secret (required with refresh token)
+- `DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS` refresh-ahead buffer in seconds (default: `300`)
+- `DROPBOX_TRANSCRIPTS_PATH` Dropbox transcripts folder to import locally (default: `/Transcripts`)
+- `DROPBOX_TRANSCRIPTS_SYNC_ENABLED` set `1` to sync transcripts from Dropbox before digest (default: `1`)
 - `DROPBOX_ROOT_PATH` cloud root folder (default: `/read`)
 - `DROPBOX_SYNC_ENABLED` set `1` to enable sync worker
 - `DROPBOX_SYNC_TIME` daily sync time in `HH:MM` (default: `00:10`)

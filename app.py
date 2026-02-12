@@ -3,7 +3,7 @@ import asyncio
 import re
 import webbrowser
 from html import unescape
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import shutil
 import sqlite3
@@ -60,6 +60,7 @@ TELEGRAM_MD_DIR = NOTES_DIR / "telegram"
 SLACK_MD_DIR = NOTES_DIR / "slack"
 OCR_MD_DIR = NOTES_DIR / "ocr"
 INBOX_IMAGES_DIR = DATA_DIR / "inbox" / "images"
+TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 ALLOWED_GROUPS = {
     g.strip()
     for g in os.getenv("TELEGRAM_ALLOWED_GROUPS", "").split(",")
@@ -103,6 +104,16 @@ OCR_PROVIDER = os.getenv("OCR_PROVIDER", "google_vision").strip().lower()
 OCR_LANG_HINTS = [x.strip() for x in os.getenv("OCR_LANG_HINTS", "zh-TW,en").split(",") if x.strip()]
 
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
+DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "").strip()
+DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "").strip()
+DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET", "").strip()
+DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS = int(os.getenv("DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS", "300"))
+DROPBOX_TRANSCRIPTS_PATH = os.getenv("DROPBOX_TRANSCRIPTS_PATH", "/Transcripts").strip() or "/Transcripts"
+DROPBOX_TRANSCRIPTS_SYNC_ENABLED = os.getenv("DROPBOX_TRANSCRIPTS_SYNC_ENABLED", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 DROPBOX_ROOT_PATH = os.getenv("DROPBOX_ROOT_PATH", "/read").strip() or "/read"
 DROPBOX_SYNC_ENABLED = os.getenv("DROPBOX_SYNC_ENABLED", "1").lower() in {"1", "true", "yes"}
 DROPBOX_SYNC_TIME = os.getenv("DROPBOX_SYNC_TIME", "00:10").strip() or "00:10"
@@ -128,6 +139,9 @@ except ZoneInfoNotFoundError:
 app = FastAPI()
 _vision_client = None
 _dropbox_client = None
+_dropbox_token_lock = threading.Lock()
+_dropbox_access_token = DROPBOX_ACCESS_TOKEN
+_dropbox_access_token_expires_at = 0.0
 
 
 def init_storage() -> None:
@@ -138,6 +152,7 @@ def init_storage() -> None:
     OCR_MD_DIR.mkdir(parents=True, exist_ok=True)
     NEWS_MD_DIR.mkdir(parents=True, exist_ok=True)
     INBOX_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -331,12 +346,12 @@ def handle_command(text: str) -> str:
 
     if text_lower.startswith("/summary_news"):
         day = _parse_day_arg(text)
-        parts = summary_ai(day, scope="news")
+        parts = build_scoped_summary(day, "news")
         return "\n".join(parts)
 
     if text_lower.startswith("/summary_note"):
         day = _parse_day_arg(text)
-        parts = build_note_digest_recent(day, days=3)
+        parts = build_scoped_summary(day, "note", recent_days=3)
         return "\n".join(parts)
 
     if text_lower.startswith("/summary_weekly"):
@@ -348,6 +363,9 @@ def handle_command(text: str) -> str:
         scope, day = _parse_summary_args(text)
         parts = summary_ai(day, scope=scope)
         return "\n".join(parts)
+
+    if text_lower.startswith("/status"):
+        return build_status_report()
 
     if text_lower.startswith("open "):
         url = text[5:].strip()
@@ -364,11 +382,37 @@ def handle_command(text: str) -> str:
         return sort_downloads()
 
     if text_lower in {"help", "/help"}:
-        return "Commands: open <url>, notepad, sort downloads"
+        return "Commands: open <url>, notepad, sort downloads, /status"
 
     if text.startswith("/"):
         return "Unsupported command."
     return "已成功紀錄"
+
+
+def route_user_text_command(text: str, chat_id: str) -> tuple[list[str], str | None, bool | None]:
+    cmd_text = (text or "").strip()
+    lower = cmd_text.lower()
+
+    if lower.startswith("/news"):
+        replies = handle_news_command(cmd_text, chat_id)
+        tokens = cmd_text.split()
+        sub = tokens[1].lower() if len(tokens) > 1 else "latest"
+        parse_mode = "Markdown" if sub == "latest" else None
+        disable_preview = True if sub == "latest" else None
+        return replies, parse_mode, disable_preview
+
+    reply = handle_command(cmd_text)
+    parse_mode = None
+    disable_preview = None
+    if lower.startswith("/summary_news"):
+        parse_mode = "Markdown"
+        disable_preview = True
+    elif lower.startswith("/summary"):
+        scope, _ = _parse_summary_args(cmd_text)
+        if scope == "news":
+            parse_mode = "Markdown"
+            disable_preview = True
+    return [reply], parse_mode, disable_preview
 
 
 def store_message(
@@ -543,6 +587,107 @@ def iter_sync_files() -> Iterator[tuple[str, Path, str]]:
             yield category, p, rel
 
 
+TRANSCRIPT_TEXT_EXTENSIONS = {
+    ".md",
+    ".markdown",
+    ".txt",
+    ".srt",
+    ".vtt",
+    ".ass",
+    ".ssa",
+    ".json",
+}
+
+
+def _is_transcript_text_file(path: str) -> bool:
+    return Path(path).suffix.lower() in TRANSCRIPT_TEXT_EXTENSIONS
+
+
+def _dropbox_list_folder_entries_recursive(remote_path: str) -> list[object]:
+    root = normalize_dropbox_path(remote_path)
+    result = _dropbox_call_with_retry(lambda dbx: dbx.files_list_folder(root, recursive=True))
+    entries = list(result.entries or [])
+    while getattr(result, "has_more", False):
+        cursor = result.cursor
+        result = _dropbox_call_with_retry(lambda dbx, c=cursor: dbx.files_list_folder_continue(c))
+        entries.extend(result.entries or [])
+    return entries
+
+
+def _safe_transcript_relpath(root_path: str, remote_path: str) -> str:
+    root = normalize_dropbox_path(root_path).rstrip("/")
+    full = normalize_dropbox_path(remote_path)
+    rel = full[len(root) :].lstrip("/") if full.startswith(f"{root}/") else full.lstrip("/")
+    parts = [p for p in PurePosixPath(rel).parts if p not in {"", ".", ".."}]
+    return "/".join(parts)
+
+
+def _transcript_fingerprint(entry) -> str:
+    rev = str(getattr(entry, "rev", "") or "")
+    content_hash = str(getattr(entry, "content_hash", "") or "")
+    modified = getattr(entry, "server_modified", None)
+    modified_text = modified.isoformat() if modified else ""
+    return f"{rev}:{content_hash}:{modified_text}"
+
+
+def sync_dropbox_transcripts_to_local(full_scan: bool = False) -> dict[str, int]:
+    stats = {
+        "transcripts_scanned": 0,
+        "transcripts_downloaded": 0,
+        "transcripts_skipped": 0,
+        "transcripts_failed": 0,
+    }
+    if not DROPBOX_TRANSCRIPTS_SYNC_ENABLED:
+        return stats
+
+    remote_root = normalize_dropbox_path(DROPBOX_TRANSCRIPTS_PATH)
+    try:
+        entries = _dropbox_list_folder_entries_recursive(remote_root)
+    except Exception as e:
+        print(f"[WARN] Dropbox transcript listing failed for {remote_root}: {e}")
+        return stats
+
+    for entry in entries:
+        if not getattr(entry, "is_file", False):
+            continue
+
+        remote_path = str(getattr(entry, "path_display", "") or getattr(entry, "path_lower", "") or "")
+        if not remote_path or not _is_transcript_text_file(remote_path):
+            continue
+
+        stats["transcripts_scanned"] += 1
+        rel = _safe_transcript_relpath(remote_root, remote_path)
+        if not rel:
+            stats["transcripts_skipped"] += 1
+            continue
+
+        local_path = TRANSCRIPTS_DIR / Path(rel)
+        state_key = normalize_dropbox_path(str(getattr(entry, "path_lower", "") or remote_path))
+        fingerprint = _transcript_fingerprint(entry)
+        last_fp = get_sync_state("dropbox_transcripts", state_key)
+        if not full_scan and last_fp == fingerprint and local_path.exists():
+            stats["transcripts_skipped"] += 1
+            continue
+
+        try:
+            data = _dropbox_call_with_retry(
+                lambda dbx, p=remote_path: dbx.files_download(p)[1].content
+            )
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(data)
+            server_modified = getattr(entry, "server_modified", None)
+            if server_modified:
+                ts = float(server_modified.timestamp())
+                os.utime(local_path, (ts, ts))
+            upsert_sync_state("dropbox_transcripts", state_key, fingerprint)
+            stats["transcripts_downloaded"] += 1
+        except Exception as e:
+            stats["transcripts_failed"] += 1
+            print(f"[WARN] Dropbox transcript download failed for {remote_path}: {e}")
+
+    return stats
+
+
 def compute_file_fingerprint(path: Path) -> str:
     st = path.stat()
     raw = f"{st.st_size}:{st.st_mtime_ns}"
@@ -578,43 +723,125 @@ def upsert_sync_state(provider: str, local_path: str, fingerprint: str) -> None:
         conn.commit()
 
 
+def _dropbox_can_refresh_token() -> bool:
+    return bool(DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET)
+
+
+def _dropbox_is_auth_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "invalid_access_token" in msg or "expired_access_token" in msg or "401" in msg
+
+
+def _dropbox_fetch_access_token() -> tuple[str, float]:
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": DROPBOX_REFRESH_TOKEN,
+        "client_id": DROPBOX_APP_KEY,
+        "client_secret": DROPBOX_APP_SECRET,
+    }
+    resp = requests.post("https://api.dropboxapi.com/oauth2/token", data=payload, timeout=20)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Dropbox token refresh failed ({resp.status_code}): {resp.text[:200]}")
+    data = resp.json()
+    access_token = (data.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("Dropbox token refresh response missing access_token")
+    expires_in = int(data.get("expires_in", 14400))
+    # Refresh a bit earlier to avoid racing against token expiry during long operations.
+    expires_at = time.time() + max(60, expires_in - max(0, DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS))
+    return access_token, expires_at
+
+
+def _dropbox_refresh_access_token(force: bool = False) -> str:
+    global _dropbox_access_token, _dropbox_access_token_expires_at, _dropbox_client
+    if not _dropbox_can_refresh_token():
+        if _dropbox_access_token:
+            return _dropbox_access_token
+        raise RuntimeError(
+            "Dropbox credential missing: set DROPBOX_ACCESS_TOKEN or "
+            "(DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET)."
+        )
+
+    with _dropbox_token_lock:
+        if not force and _dropbox_access_token and time.time() < _dropbox_access_token_expires_at:
+            return _dropbox_access_token
+        token, expires_at = _dropbox_fetch_access_token()
+        _dropbox_access_token = token
+        _dropbox_access_token_expires_at = expires_at
+        _dropbox_client = None
+        return _dropbox_access_token
+
+
+def _dropbox_rebuild_client() -> None:
+    global _dropbox_client
+    token = _dropbox_refresh_access_token(force=False)
+    _dropbox_client = dropbox.Dropbox(token, timeout=30)
+
+
 def _get_dropbox_client():
     global _dropbox_client
     if _dropbox_client is not None:
         return _dropbox_client
     if dropbox is None:
         raise RuntimeError("dropbox SDK is not installed")
-    if not DROPBOX_ACCESS_TOKEN:
-        raise RuntimeError("DROPBOX_ACCESS_TOKEN is not set")
-    _dropbox_client = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN, timeout=30)
+    if not (_dropbox_access_token or _dropbox_can_refresh_token()):
+        raise RuntimeError(
+            "Dropbox credential missing: set DROPBOX_ACCESS_TOKEN or "
+            "(DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET)."
+        )
+    _dropbox_rebuild_client()
     return _dropbox_client
 
 
-def sync_file_to_dropbox(dbx, local_path: Path, remote_path: str) -> None:
+def _dropbox_call_with_retry(func):
+    try:
+        return func(_get_dropbox_client())
+    except Exception as e:
+        if not _dropbox_can_refresh_token() or not _dropbox_is_auth_error(e):
+            raise
+        _dropbox_refresh_access_token(force=True)
+        _dropbox_rebuild_client()
+        return func(_get_dropbox_client())
+
+
+def sync_file_to_dropbox(local_path: Path, remote_path: str) -> None:
     content = local_path.read_bytes()
-    dbx.files_upload(
-        content,
-        remote_path,
-        mode=dropbox.files.WriteMode.overwrite,
-        mute=True,
-    )
+    def _upload(dbx):
+        dbx.files_upload(
+            content,
+            remote_path,
+            mode=dropbox.files.WriteMode.overwrite,
+            mute=True,
+        )
+    _dropbox_call_with_retry(_upload)
 
 
 def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
-    stats = {"scanned": 0, "uploaded": 0, "skipped": 0, "failed": 0}
+    stats = {
+        "scanned": 0,
+        "uploaded": 0,
+        "skipped": 0,
+        "failed": 0,
+        "transcripts_scanned": 0,
+        "transcripts_downloaded": 0,
+        "transcripts_skipped": 0,
+        "transcripts_failed": 0,
+    }
     if not DROPBOX_SYNC_ENABLED:
         return stats
     try:
-        dbx = _get_dropbox_client()
+        _get_dropbox_client()
     except Exception as e:
         print(f"[WARN] Dropbox sync unavailable: {e}")
         return stats
     root = normalize_dropbox_path(DROPBOX_ROOT_PATH)
     try:
-        ensure_dropbox_folders(dbx, root)
+        _dropbox_call_with_retry(lambda dbx: ensure_dropbox_folders(dbx, root))
     except Exception as e:
         print(f"[WARN] Dropbox folder bootstrap failed: {e}")
         return stats
+    transcript_stats = sync_dropbox_transcripts_to_local(full_scan=full_scan)
+    stats.update({k: stats.get(k, 0) + transcript_stats.get(k, 0) for k in transcript_stats})
     for category, local_path, rel in iter_sync_files():
         stats["scanned"] += 1
         local_key = local_path.relative_to(DATA_DIR).as_posix()
@@ -625,7 +852,7 @@ def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
                 stats["skipped"] += 1
                 continue
             remote_path = f"{root}/{category}/{rel}".replace("//", "/")
-            sync_file_to_dropbox(dbx, local_path, remote_path)
+            sync_file_to_dropbox(local_path, remote_path)
             upsert_sync_state("dropbox", local_key, fingerprint)
             stats["uploaded"] += 1
         except Exception as e:
@@ -634,7 +861,11 @@ def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
     print(
         "[INFO] Dropbox sync finished "
         f"scanned={stats['scanned']} uploaded={stats['uploaded']} "
-        f"skipped={stats['skipped']} failed={stats['failed']}"
+        f"skipped={stats['skipped']} failed={stats['failed']} "
+        f"transcripts_scanned={stats['transcripts_scanned']} "
+        f"transcripts_downloaded={stats['transcripts_downloaded']} "
+        f"transcripts_skipped={stats['transcripts_skipped']} "
+        f"transcripts_failed={stats['transcripts_failed']}"
     )
     return stats
 
@@ -1397,12 +1628,67 @@ def _parse_day_arg(text: str) -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def build_scoped_summary(day: str, scope: str, *, recent_days: int | None = None) -> list[str]:
+    scope_norm = (scope or "all").strip().lower()
+    if scope_norm == "notes":
+        scope_norm = "note"
+    days = max(1, int(recent_days or 1))
+    if scope_norm == "news":
+        if days > 1:
+            return build_news_digest_recent(day, days=days)
+        return build_news_digest(day)
+    if scope_norm == "note":
+        if days > 1:
+            return build_note_digest_recent(day, days=days)
+        return build_note_digest(day)
+    return summary_ai(day, scope="all")
+
+
+def _collect_transcript_files_for_day(day: str) -> list[Path]:
+    if not TRANSCRIPTS_DIR.exists():
+        return []
+
+    day_compact = day.replace("-", "")
+    target_date = datetime.strptime(day, "%Y-%m-%d").date()
+    out: list[Path] = []
+    seen: set[str] = set()
+    for fp in TRANSCRIPTS_DIR.rglob("*"):
+        if not fp.is_file():
+            continue
+        if not _is_transcript_text_file(fp.name):
+            continue
+        name = fp.name.lower()
+        include = day in name or day_compact in name
+        if not include:
+            try:
+                local_dt = datetime.fromtimestamp(fp.stat().st_mtime, tz=get_local_tz())
+                include = local_dt.date() == target_date
+            except Exception:
+                include = False
+        if not include:
+            continue
+        key = str(fp)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(fp)
+    out.sort()
+    return out
+
+
 def _summary_files_for_day(day: str) -> tuple[list[Path], list[Path]]:
     notes_files = sorted(NOTES_DIR.rglob(f"{day}*.md"))
     ocr_files = sorted(OCR_MD_DIR.glob(f"{day}*_ocr.md"))
     if ocr_files:
         seen = {str(fp) for fp in notes_files}
         for fp in ocr_files:
+            if str(fp) not in seen:
+                notes_files.append(fp)
+        notes_files.sort()
+    transcript_files = _collect_transcript_files_for_day(day)
+    if transcript_files:
+        seen = {str(fp) for fp in notes_files}
+        for fp in transcript_files:
             if str(fp) not in seen:
                 notes_files.append(fp)
         notes_files.sort()
@@ -1772,7 +2058,7 @@ def build_note_digest(day: str) -> list[str]:
     notes_files, _ = _summary_files_for_day(day)
     notes_raw = _load_raw_summary_files(notes_files)
     if not notes_raw:
-        return [f"{day} 筆記摘要", "當日沒有可用筆記資料。"]
+        return [f"{day} 筆記/逐字稿摘要", "當日沒有可用筆記或逐字稿資料。"]
 
     note_items: list[tuple[str, list[str]]] = []
     tags: list[str] = []
@@ -1783,7 +2069,7 @@ def build_note_digest(day: str) -> list[str]:
             "Output must be in Traditional Chinese."
         )
         user_prompt = (
-            f"Summarize notes for {day} with scan-friendly structure.\n"
+            f"Summarize notes and transcripts for {day} with scan-friendly structure.\n"
             f"- Create 3 to {NOTE_DIGEST_MAX_ITEMS} topics.\n"
             "- Format each topic exactly:\n"
             "Title: <max 22 chars>\n"
@@ -1805,7 +2091,7 @@ def build_note_digest(day: str) -> list[str]:
     if not note_items:
         lines = _extract_note_lines(notes_raw, limit=120)
         if not lines:
-            return [f"{day} 筆記摘要", "沒有可用的筆記文字。"]
+            return [f"{day} 筆記/逐字稿摘要", "沒有可用的筆記或逐字稿文字。"]
         for line in lines[:NOTE_DIGEST_MAX_ITEMS]:
             title = re.sub(r"https?://\S+", "", line).strip()
             if len(title) > 28:
@@ -1819,7 +2105,7 @@ def build_note_digest(day: str) -> list[str]:
 
     point_label = "\u91cd\u9ede"
     tag_label = "標籤"
-    out_lines: list[str] = [f"{day} 筆記摘要"]
+    out_lines: list[str] = [f"{day} 筆記/逐字稿摘要"]
     for title, points in note_items[:NOTE_DIGEST_MAX_ITEMS]:
         out_lines.append(title)
         for idx, p in enumerate(points[:5], start=1):
@@ -1842,9 +2128,9 @@ def build_note_digest_recent(end_day: str, days: int = 3) -> list[str]:
         if day_raw:
             raw_blocks.append(f"[{d}]\n{day_raw}")
 
-    header = f"{start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')} 筆記摘要"
+    header = f"{start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')} 筆記/逐字稿摘要"
     if not raw_blocks:
-        return [header, "指定期間沒有可用筆記資料。"]
+        return [header, "指定期間沒有可用筆記或逐字稿資料。"]
 
     merged_raw = "\n\n".join(raw_blocks)
     note_items: list[tuple[str, list[str]]] = []
@@ -1856,7 +2142,7 @@ def build_note_digest_recent(end_day: str, days: int = 3) -> list[str]:
             "Output must be in Traditional Chinese."
         )
         user_prompt = (
-            f"Summarize notes from {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')} with scan-friendly structure.\n"
+            f"Summarize notes and transcripts from {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')} with scan-friendly structure.\n"
             f"- Create 4 to {max(NOTE_DIGEST_MAX_ITEMS, 6)} topics.\n"
             "- Format each topic exactly:\n"
             "Title: <max 22 chars>\n"
@@ -1878,7 +2164,7 @@ def build_note_digest_recent(end_day: str, days: int = 3) -> list[str]:
     if not note_items:
         lines = _extract_note_lines(merged_raw, limit=180)
         if not lines:
-            return [header, "沒有可用的筆記文字。"]
+            return [header, "沒有可用的筆記或逐字稿文字。"]
         limit_items = max(NOTE_DIGEST_MAX_ITEMS, 6)
         for line in lines[:limit_items]:
             title = re.sub(r"https?://\S+", "", line).strip()
@@ -2201,7 +2487,7 @@ def summary_ai(day: str, scope: str = "all") -> list[str]:
         f"{news_raw or '[no news files]'}"
     )
     b_prompt = (
-        f"Summarize notes for {day}. Output 8-15 key points.\n"
+        f"Summarize notes and transcripts for {day}. Output 8-15 key points.\n"
         "Focus on decisions, TODOs, risks, and next actions.\n"
         "Do NOT use markdown emphasis symbols like **.\n"
         "Do not invent facts.\n\n"
@@ -2209,9 +2495,9 @@ def summary_ai(day: str, scope: str = "all") -> list[str]:
     )
 
     if scope == "news":
-        return build_news_digest(day)
+        return build_scoped_summary(day, "news")
     if scope == "note":
-        return build_note_digest(day)
+        return build_scoped_summary(day, "note")
 
     a = _run_ai_chat(system_prompt, a_prompt) if scope == "all" else None
     b = _run_ai_chat(system_prompt, b_prompt) if scope == "all" else None
@@ -2701,7 +2987,7 @@ def handle_news_command(text: str, chat_id: str) -> list[str]:
         end_day = datetime.now(tz=get_local_tz()).strftime("%Y-%m-%d")
         if len(tokens) >= 3 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[2]):
             end_day = tokens[2]
-        return ["\n".join(build_news_digest_recent(end_day, days=3))]
+        return ["\n".join(build_scoped_summary(end_day, "news", recent_days=3))]
     if sub == "help":
         return [
             "News commands: /news latest [N], /news search <keywords>, /news sources, /news debug"
@@ -2714,6 +3000,7 @@ NEWS_SHORTCUTS = {
     "/news_sources": "/news sources",
     "/news_debug": "/news debug",
     "/news_help": "/news help",
+    "/status": "/status",
 }
 
 
@@ -2724,6 +3011,7 @@ def set_telegram_commands() -> None:
         {"command": "news_sources", "description": "List news sources"},
         {"command": "news_debug", "description": "Debug ingestion"},
         {"command": "news_help", "description": "News command help"},
+        {"command": "status", "description": "Bot health status"},
     ]
     try:
         resp = requests.post(
@@ -2744,6 +3032,86 @@ def send_message_sync(chat_id: str, text: str, parse_mode: str | None = None) ->
     if resp.status_code >= 300 and parse_mode:
         resp = requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=10)
     print(f"sendMessage status={resp.status_code} body={resp.text}")
+
+
+def _resolve_ai_model_name() -> str:
+    provider = AI_SUMMARY_PROVIDER
+    if provider == "openai":
+        return OPENAI_MODEL
+    if provider == "gemini":
+        return GEMINI_MODEL
+    if provider == "anthropic":
+        return ANTHROPIC_MODEL
+    if provider == "huggingface":
+        return HUGGINGFACE_MODEL
+    if provider == "ollama":
+        return OLLAMA_MODEL
+    return "unknown"
+
+
+def _ollama_health() -> str:
+    if AI_SUMMARY_PROVIDER != "ollama":
+        return "n/a"
+    try:
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
+        if resp.status_code != 200:
+            return f"http_{resp.status_code}"
+        data = resp.json() if resp.content else {}
+        models = data.get("models") or []
+        target = (OLLAMA_MODEL or "").strip().lower()
+        found = False
+        for model in models:
+            name = str(model.get("name") or "").strip().lower()
+            if name == target:
+                found = True
+                break
+        return "ready" if found else "model_missing"
+    except Exception as e:
+        return f"error:{type(e).__name__}"
+
+
+def build_status_report() -> str:
+    now = datetime.now(tz=get_local_tz())
+    day = now.strftime("%Y-%m-%d")
+    start_3d = (now - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+    news_24h = 0
+    notes_3d = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM news_clusters
+                WHERE canonical_published_at IS NOT NULL
+                  AND canonical_published_at >= ?
+                """,
+                ((now - timedelta(hours=24)).isoformat(),),
+            ).fetchone()
+            news_24h = int(row[0] if row else 0)
+    except Exception:
+        news_24h = -1
+
+    try:
+        for d in range(3):
+            target_day = (start_3d + timedelta(days=d)).strftime("%Y-%m-%d")
+            day_files, _ = _summary_files_for_day(target_day)
+            notes_3d += len(day_files)
+    except Exception:
+        notes_3d = -1
+
+    lines = [
+        f"status time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"ai summary: {'on' if AI_SUMMARY_ENABLED else 'off'}",
+        f"ai provider/model: {AI_SUMMARY_PROVIDER}/{_resolve_ai_model_name()}",
+        f"ollama health: {_ollama_health()}",
+        f"db path exists: {'yes' if DB_PATH.exists() else 'no'}",
+        f"news clusters (24h): {news_24h}",
+        f"note markdown files (3d): {notes_3d}",
+        f"dropbox sync: {'on' if DROPBOX_SYNC_ENABLED else 'off'} ({DROPBOX_SYNC_TIME} {DROPBOX_SYNC_TZ_NAME})",
+        f"news push: {'on' if NEWS_PUSH_ENABLED else 'off'} (interval={NEWS_FETCH_INTERVAL_MINUTES}m)",
+        f"today: {day}",
+    ]
+    return "\n".join(lines)
 
 
 def push_news_to_subscribers() -> None:
@@ -2825,8 +3193,11 @@ def start_dropbox_sync_thread() -> None:
     if dropbox is None:
         print("[WARN] Dropbox sync disabled: dropbox SDK not installed.")
         return
-    if not DROPBOX_ACCESS_TOKEN:
-        print("[WARN] Dropbox sync disabled: DROPBOX_ACCESS_TOKEN is not set.")
+    if not (_dropbox_access_token or _dropbox_can_refresh_token()):
+        print(
+            "[WARN] Dropbox sync disabled: set DROPBOX_ACCESS_TOKEN "
+            "or (DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET)."
+        )
         return
 
     run_hour, run_minute = parse_hhmm(DROPBOX_SYNC_TIME, default_hour=0, default_minute=10)
@@ -2953,42 +3324,21 @@ async def process_telegram_update(update: dict) -> None:
 
     if is_private and chat_id and text and not has_image:
         text_stripped = text.strip()
-        text_lower = text_stripped.lower()
         cmd_text = text_stripped
         for shortcut, full_cmd in NEWS_SHORTCUTS.items():
-            if text_lower.startswith(shortcut):
+            if text_stripped.lower().startswith(shortcut):
                 cmd_text = full_cmd + text_stripped[len(shortcut) :]
                 break
 
-        if cmd_text.lower().startswith("/news"):
-            replies = handle_news_command(cmd_text, str(chat_id))
-            news_tokens = cmd_text.split()
-            news_sub = news_tokens[1].lower() if len(news_tokens) > 1 else "latest"
-            news_parse_mode = "Markdown" if news_sub == "latest" else None
-            news_disable_preview = True if news_sub == "latest" else None
-            for reply in replies:
-                for chunk in _chunk_text_for_telegram(reply):
-                    await send_message(
-                        chat_id,
-                        chunk,
-                        parse_mode=news_parse_mode,
-                        disable_web_page_preview=news_disable_preview,
-                    )
-        else:
-            reply = handle_command(cmd_text)
-            parse_mode = None
-            disable_preview = None
-            if cmd_text.lower().startswith("/summary"):
-                scope, _ = _parse_summary_args(cmd_text)
-                if scope == "news":
-                    parse_mode = "Markdown"
-                    disable_preview = True
-            await send_message(
-                chat_id,
-                reply,
-                parse_mode=parse_mode,
-                disable_web_page_preview=disable_preview,
-            )
+        replies, parse_mode, disable_preview = route_user_text_command(cmd_text, str(chat_id))
+        for reply in replies:
+            for chunk in _chunk_text_for_telegram(reply):
+                await send_message(
+                    chat_id,
+                    chunk,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=disable_preview,
+                )
         return
 
     if (is_private or is_group) and chat_id and has_image:
@@ -3098,7 +3448,7 @@ def start_slack_socket_mode() -> None:
         ack()
         text = (command.get("text") or "").strip()
         day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
-        parts = summary_ai(day, scope="news")
+        parts = build_scoped_summary(day, "news")
         respond("\n".join(parts))
 
     @slack_app.command("/summary_note")
@@ -3106,8 +3456,13 @@ def start_slack_socket_mode() -> None:
         ack()
         text = (command.get("text") or "").strip()
         day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
-        parts = summary_ai(day, scope="note")
+        parts = build_scoped_summary(day, "note")
         respond("\n".join(parts))
+
+    @slack_app.command("/status")
+    def handle_slack_status(ack, respond, command):
+        ack()
+        respond(build_status_report())
 
     @slack_app.command("/summary_weekly")
     def handle_slack_summary_weekly(ack, respond, command):
@@ -3169,14 +3524,17 @@ def start_slack_socket_mode() -> None:
         if text.startswith("/summary_news"):
             tokens = text.split()
             day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
-            parts = summary_ai(day, scope="news")
+            parts = build_scoped_summary(day, "news")
             say("\n".join(parts))
             return
         if text.startswith("/summary_note"):
             tokens = text.split()
             day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
-            parts = summary_ai(day, scope="note")
+            parts = build_scoped_summary(day, "note")
             say("\n".join(parts))
+            return
+        if text.startswith("/status"):
+            say(build_status_report())
             return
 
         channel_id = event.get("channel", "")

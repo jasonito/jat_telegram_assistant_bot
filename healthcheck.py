@@ -60,14 +60,31 @@ def check_dropbox() -> tuple[bool, str]:
         return False, f"dropbox SDK import failed: {e}"
 
     token = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
-    if not token:
-        return False, "DROPBOX_ACCESS_TOKEN not set"
+    refresh_token = os.getenv("DROPBOX_REFRESH_TOKEN", "").strip()
+    app_key = os.getenv("DROPBOX_APP_KEY", "").strip()
+    app_secret = os.getenv("DROPBOX_APP_SECRET", "").strip()
+    has_refresh_flow = bool(refresh_token and app_key and app_secret)
+    if not token and not has_refresh_flow:
+        return False, (
+            "Dropbox credential not set. "
+            "Use DROPBOX_ACCESS_TOKEN or "
+            "(DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET)."
+        )
 
     try:
-        dbx = dropbox.Dropbox(token, timeout=20)
+        if has_refresh_flow:
+            dbx = dropbox.Dropbox(
+                oauth2_refresh_token=refresh_token,
+                app_key=app_key,
+                app_secret=app_secret,
+                timeout=20,
+            )
+        else:
+            dbx = dropbox.Dropbox(token, timeout=20)
         account = dbx.users_get_current_account()
         name = getattr(account.name, "display_name", "") if account else ""
-        return True, f"Dropbox API reachable (account: {name or 'ok'}, token: {mask_secret(token)})"
+        credential = "refresh_token" if has_refresh_flow else f"token: {mask_secret(token)}"
+        return True, f"Dropbox API reachable (account: {name or 'ok'}, {credential})"
     except Exception as e:
         return False, f"Dropbox check failed: {e}"
 
