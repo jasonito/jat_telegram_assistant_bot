@@ -17,8 +17,19 @@ Copy `.env.example` to `.env` and set your tokens. Optional group logging:
 - `DATA_DIR` location for SQLite + Markdown
 - `TELEGRAM_LONG_POLLING` set `1` to enable getUpdates instead of webhook
 - `TELEGRAM_LOCAL_WEBHOOK_URL` local URL for polling to forward updates (default: `http://127.0.0.1:8000/telegram`)
-- `TESSERACT_CMD` full path to `tesseract.exe` if not on PATH (optional)
-- `TESSERACT_LANG` OCR languages (default: `chi_tra+eng`)
+- OCR (Google Vision):
+- `OCR_PROVIDER` set `google_vision`
+- `OCR_LANG_HINTS` OCR language hints (default: `zh-TW,en`)
+- `GOOGLE_APPLICATION_CREDENTIALS` full path to Google service-account JSON key
+
+Dropbox sync:
+
+- `DROPBOX_ACCESS_TOKEN` API token
+- `DROPBOX_ROOT_PATH` cloud root folder (default: `/read`)
+- `DROPBOX_SYNC_ENABLED` set `1` to enable sync worker
+- `DROPBOX_SYNC_TIME` daily sync time in `HH:MM` (default: `00:10`)
+- `DROPBOX_SYNC_TZ` sync timezone (default: `Asia/Taipei`)
+- `DROPBOX_SYNC_ON_STARTUP` set `1` to run one full backfill at startup
 
 Slack (Socket Mode):
 
@@ -32,11 +43,18 @@ AI summary for `/summary`:
 - `AI_SUMMARY_PROVIDER` supports `openai`, `gemini`, `anthropic`, `huggingface`, `ollama` (`antropic`, `hf`, `local` aliases also work)
 - `AI_SUMMARY_TIMEOUT_SECONDS` request timeout for all providers
 - `AI_SUMMARY_MAX_CHARS` max context size sent to model
+- `NEWS_URL_FETCH_MAX_ARTICLES` max news URLs to deep-read for `/summary news` (default: `3`)
+- `NEWS_URL_FETCH_MAX_CHARS` max extracted text chars per URL (default: `3000`)
+- `NEWS_URL_FETCH_TIMEOUT_SECONDS` timeout per URL fetch (default: `6`)
+- `NEWS_DIGEST_MAX_ITEMS` max items rendered in `/summary news` digest (default: `6`)
+- `NEWS_DIGEST_AI_ITEMS` number of items using AI deep-summary in `/summary news` (default: `2`)
+- `NEWS_DIGEST_FETCH_ARTICLE_ITEMS` number of items fetching URL full-text in `/summary news` (default: `1`)
 - OpenAI: `OPENAI_API_KEY`, `OPENAI_MODEL`
 - Gemini: `GEMINI_API_KEY`, `GEMINI_MODEL`
 - Anthropic: `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`
 - Hugging Face: `HUGGINGFACE_API_KEY`, `HUGGINGFACE_MODEL`, `HUGGINGFACE_BASE_URL`
 - Ollama: `OLLAMA_BASE_URL`, `OLLAMA_MODEL`
+  - `start.ps1` will auto-pull `OLLAMA_MODEL` if missing locally.
 
 ## Run
 
@@ -74,6 +92,14 @@ Private chat commands:
 open https://google.com
 notepad
 sort downloads
+/news latest
+/news latest 2026-02-12
+/summary
+/summary 2026-02-12
+/summary note
+/summary note 2026-02-12
+/summary news
+/summary news 2026-02-12
 ```
 
 Group logging (no reply):
@@ -86,3 +112,12 @@ Slack DM logging (no reply):
 
 - DMs from the configured `SLACK_USER_ID` are stored in the same SQLite/Markdown.
 - Run uvicorn, then send a DM to your bot.
+
+Image OCR and cloud sync:
+
+- Telegram private image uploads are saved to `DATA_DIR\\inbox\\images\\YYYY-MM-DD\\`.
+- OCR output is appended to `DATA_DIR\\notes\\ocr\\YYYY-MM-DD_ocr.md`.
+- A Dropbox worker syncs local `news`, `notes`, and `inbox/images` to:
+  - `/read/news`
+  - `/read/notes`
+  - `/read/images`

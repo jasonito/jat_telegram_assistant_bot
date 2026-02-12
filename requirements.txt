@@ -6,3 +6,5 @@ slack_bolt
 feedparser
 rapidfuzz
 tzdata
+dropbox
+google-cloud-vision

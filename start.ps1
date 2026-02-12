@@ -1,3 +1,7 @@
+param(
+  [switch]$HealthCheck
+)
+
  $ErrorActionPreference = 'Stop'
 
   function Write-Info($msg) {
@@ -6,6 +10,10 @@
 
   function Write-Err($msg) {
     Write-Host "[ERROR] $msg" -ForegroundColor Red
+  }
+
+  function Write-Warn($msg) {
+    Write-Host "[WARN] $msg" -ForegroundColor Yellow
   }
 
   function Get-EnvValueFromFile($path, $key) {
@@ -85,6 +93,24 @@
     if ($null -ne $ollamaBaseUrl) { $env:OLLAMA_BASE_URL = $ollamaBaseUrl }
     $ollamaModel = Get-EnvValueFromFile -path $envFile -key 'OLLAMA_MODEL'
     if ($null -ne $ollamaModel) { $env:OLLAMA_MODEL = $ollamaModel }
+    $ocrProvider = Get-EnvValueFromFile -path $envFile -key 'OCR_PROVIDER'
+    if ($null -ne $ocrProvider) { $env:OCR_PROVIDER = $ocrProvider }
+    $ocrLangHints = Get-EnvValueFromFile -path $envFile -key 'OCR_LANG_HINTS'
+    if ($null -ne $ocrLangHints) { $env:OCR_LANG_HINTS = $ocrLangHints }
+    $googleCredPath = Get-EnvValueFromFile -path $envFile -key 'GOOGLE_APPLICATION_CREDENTIALS'
+    if ($null -ne $googleCredPath) { $env:GOOGLE_APPLICATION_CREDENTIALS = $googleCredPath }
+    $dropboxToken = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_ACCESS_TOKEN'
+    if ($null -ne $dropboxToken) { $env:DROPBOX_ACCESS_TOKEN = $dropboxToken }
+    $dropboxRoot = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_ROOT_PATH'
+    if ($null -ne $dropboxRoot) { $env:DROPBOX_ROOT_PATH = $dropboxRoot }
+    $dropboxSyncEnabled = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_SYNC_ENABLED'
+    if ($null -ne $dropboxSyncEnabled) { $env:DROPBOX_SYNC_ENABLED = $dropboxSyncEnabled }
+    $dropboxSyncTime = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_SYNC_TIME'
+    if ($null -ne $dropboxSyncTime) { $env:DROPBOX_SYNC_TIME = $dropboxSyncTime }
+    $dropboxSyncTz = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_SYNC_TZ'
+    if ($null -ne $dropboxSyncTz) { $env:DROPBOX_SYNC_TZ = $dropboxSyncTz }
+    $dropboxSyncOnStartup = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_SYNC_ON_STARTUP'
+    if ($null -ne $dropboxSyncOnStartup) { $env:DROPBOX_SYNC_ON_STARTUP = $dropboxSyncOnStartup }
 
     $enableNgrok = if ($env:ENABLE_NGROK -ne $null) { $env:ENABLE_NGROK } else { '1' }
     $enableWebhook = if ($env:ENABLE_WEBHOOK -ne $null) { $env:ENABLE_WEBHOOK } else { '1' }
@@ -106,6 +132,20 @@
 
     Write-Info 'Installing Python dependencies...'
     & $pythonExe -m pip install -r $requirements
+
+    if ($HealthCheck) {
+      Write-Info 'Running health check (Google Vision + Dropbox)...'
+      $healthScript = Join-Path $PSScriptRoot 'healthcheck.py'
+      if (-not (Test-Path -Path $healthScript)) {
+        throw "healthcheck.py not found: $healthScript"
+      }
+      & $pythonExe $healthScript
+      if ($LASTEXITCODE -ne 0) {
+        throw "Health check failed with exit code $LASTEXITCODE"
+      }
+      Write-Info 'Health check passed.'
+      exit 0
+    }
 
     $effectiveProvider = if ($env:AI_SUMMARY_PROVIDER) { $env:AI_SUMMARY_PROVIDER.ToLower().Trim() } else { '' }
     $needsOllama = (Is-Truthy $env:AI_SUMMARY_ENABLED) -and ($effectiveProvider -in @('ollama', 'local'))
@@ -139,76 +179,109 @@
       if (-not $ollamaReady) {
         throw "Ollama service did not become ready at $tagsUrl"
       }
-      Write-Info "Ollama ready: $base (model: $($env:OLLAMA_MODEL))"
+      $modelName = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL.Trim() } else { 'qwen2.5:7b' }
+      if ($modelName) {
+        $tagsResp = Invoke-RestMethod -Method Get -Uri $tagsUrl -TimeoutSec 5
+        $modelExists = $false
+        if ($tagsResp -and $tagsResp.models) {
+          foreach ($m in $tagsResp.models) {
+            $tagName = ''
+            if ($m.name) {
+              $tagName = $m.name
+            } elseif ($m.model) {
+              $tagName = $m.model
+            }
+            if ($tagName -eq $modelName) {
+              $modelExists = $true
+              break
+            }
+          }
+        }
+        if (-not $modelExists) {
+          Write-Info "Ollama model not found locally, pulling: $modelName"
+          & ollama pull $modelName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to pull Ollama model: $modelName (exit code $LASTEXITCODE)"
+          }
+          Write-Info "Ollama model pull completed: $modelName"
+        }
+      }
+      Write-Info "Ollama ready: $base (model: $modelName)"
     }
+
+    $fallbackToLongPolling = $false
 
     if ($enableNgrok -ne '0') {
       Ensure-Command 'ngrok'
+      Write-Info 'Starting ngrok...'
+      Start-Process -FilePath 'ngrok' -ArgumentList 'http 8000'
+
+      if ($enableWebhook -ne '0') {
+        $deadline = (Get-Date).AddSeconds(30)
+        $publicUrl = $null
+
+        Write-Info 'Waiting for ngrok public URL...'
+        while ((Get-Date) -lt $deadline) {
+          try {
+            $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -Method Get -TimeoutSec 2
+            foreach ($t in $resp.tunnels) {
+              if ($t.public_url -and $t.public_url.StartsWith('https://')) {
+                $publicUrl = $t.public_url
+                break
+              }
+            }
+            if ($publicUrl) { break }
+          } catch {
+            Start-Sleep -Seconds 1
+            continue
+          }
+          Start-Sleep -Seconds 1
+        }
+
+        if (-not $publicUrl) {
+          Write-Warn 'Timeout waiting for ngrok public URL. Falling back to long polling.'
+          $fallbackToLongPolling = $true
+        } else {
+          Write-Info "ngrok URL: $publicUrl"
+          $webhookUrl = "$publicUrl/telegram"
+          try {
+            Write-Info 'Setting Telegram webhook...'
+            $setResp = Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$token/setWebhook" -Body @{ url = $webhookUrl } -TimeoutSec 10
+            if (-not $setResp.ok) {
+              throw "Telegram setWebhook failed: $($setResp | ConvertTo-Json -Depth 10)"
+            }
+
+            Write-Info 'Verifying Telegram webhook...'
+            $infoResp = Invoke-RestMethod -Method Get -Uri "https://api.telegram.org/bot$token/getWebhookInfo" -TimeoutSec 10
+            if (-not $infoResp.ok) {
+              throw "Telegram getWebhookInfo failed: $($infoResp | ConvertTo-Json -Depth 10)"
+            }
+
+            $resultUrl = $infoResp.result.url
+            if ($resultUrl -ne $webhookUrl) {
+              throw "Webhook mismatch. Expected: $webhookUrl, Got: $resultUrl"
+            }
+            Write-Info 'Webhook set and verified.'
+          } catch {
+            Write-Warn "Webhook setup failed: $($_.Exception.Message)"
+            Write-Warn 'Falling back to long polling.'
+            $fallbackToLongPolling = $true
+          }
+        }
+      } else {
+        Write-Info 'ENABLE_WEBHOOK=0, skipping webhook setup.'
+      }
+    } else {
+      Write-Info 'ENABLE_NGROK=0, skipping ngrok and webhook.'
+    }
+
+    if ($fallbackToLongPolling) {
+      $env:TELEGRAM_LONG_POLLING = '1'
+      Write-Info 'TELEGRAM_LONG_POLLING forced to 1 due to fallback.'
     }
 
     Write-Info 'Starting uvicorn...'
     Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn','app:app','--host','0.0.0.0','--port','8000'
-
-    if ($enableNgrok -eq '0') {
-      Write-Info 'ENABLE_NGROK=0, skipping ngrok and webhook.'
-      exit 0
-    }
-
-    Write-Info 'Starting ngrok...'
-    Start-Process -FilePath 'ngrok' -ArgumentList 'http 8000'
-
-    if ($enableWebhook -eq '0') {
-      Write-Info 'ENABLE_WEBHOOK=0, skipping webhook setup.'
-      exit 0
-    }
-
-    $deadline = (Get-Date).AddSeconds(30)
-    $publicUrl = $null
-
-    Write-Info 'Waiting for ngrok public URL...'
-    while ((Get-Date) -lt $deadline) {
-      try {
-        $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -Method Get -TimeoutSec 2
-        foreach ($t in $resp.tunnels) {
-          if ($t.public_url -and $t.public_url.StartsWith('https://')) {
-            $publicUrl = $t.public_url
-            break
-          }
-        }
-        if ($publicUrl) { break }
-      } catch {
-        Start-Sleep -Seconds 1
-        continue
-      }
-      Start-Sleep -Seconds 1
-    }
-
-    if (-not $publicUrl) {
-      throw 'Timeout waiting for ngrok public URL (check ngrok and 4040).'
-    }
-
-    Write-Info "ngrok URL: $publicUrl"
-
-    $webhookUrl = "$publicUrl/telegram"
-    Write-Info 'Setting Telegram webhook...'
-    $setResp = Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$token/setWebhook" -Body @{ url =
-  $webhookUrl } -TimeoutSec 10
-    if (-not $setResp.ok) {
-      throw "Telegram setWebhook failed: $($setResp | ConvertTo-Json -Depth 10)"
-    }
-
-    Write-Info 'Verifying Telegram webhook...'
-    $infoResp = Invoke-RestMethod -Method Get -Uri "https://api.telegram.org/bot$token/getWebhookInfo" -TimeoutSec 10
-    if (-not $infoResp.ok) {
-      throw "Telegram getWebhookInfo failed: $($infoResp | ConvertTo-Json -Depth 10)"
-    }
-
-    $resultUrl = $infoResp.result.url
-    if ($resultUrl -ne $webhookUrl) {
-      throw "Webhook mismatch. Expected: $webhookUrl, Got: $resultUrl"
-    }
-
-    Write-Info 'Webhook set and verified.'
   } catch {
     Write-Err $_.Exception.Message
     exit 1
