@@ -122,6 +122,7 @@ DROPBOX_SYNC_ON_STARTUP = os.getenv("DROPBOX_SYNC_ON_STARTUP", "1").lower() in {
 
 NEWS_RSS_URLS_ENV = os.getenv("NEWS_RSS_URLS", "")
 NEWS_RSS_URLS_FILE = os.getenv("NEWS_RSS_URLS_FILE", "")
+NEWS_ENABLED = os.getenv("NEWS_ENABLED", "1").lower() in {"1", "true", "yes"}
 NEWS_FETCH_INTERVAL_MINUTES = int(os.getenv("NEWS_FETCH_INTERVAL_MINUTES", "180"))
 NEWS_PUSH_MAX_ITEMS = int(os.getenv("NEWS_PUSH_MAX_ITEMS", "10"))
 NEWS_PUSH_ENABLED = os.getenv("NEWS_PUSH_ENABLED", "0").lower() in {"1", "true", "yes"}
@@ -150,7 +151,8 @@ def init_storage() -> None:
     TELEGRAM_MD_DIR.mkdir(parents=True, exist_ok=True)
     SLACK_MD_DIR.mkdir(parents=True, exist_ok=True)
     OCR_MD_DIR.mkdir(parents=True, exist_ok=True)
-    NEWS_MD_DIR.mkdir(parents=True, exist_ok=True)
+    if NEWS_ENABLED:
+        NEWS_MD_DIR.mkdir(parents=True, exist_ok=True)
     INBOX_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
@@ -567,16 +569,17 @@ def _dropbox_create_folder_if_missing(dbx, path: str) -> None:
 def ensure_dropbox_folders(dbx, root_path: str) -> None:
     root = normalize_dropbox_path(root_path)
     _dropbox_create_folder_if_missing(dbx, root)
-    for folder in ("news", "notes", "images"):
+    folders = ["notes", "images"]
+    if NEWS_ENABLED:
+        folders.insert(0, "news")
+    for folder in folders:
         _dropbox_create_folder_if_missing(dbx, f"{root}/{folder}")
 
 
 def iter_sync_files() -> Iterator[tuple[str, Path, str]]:
-    roots = [
-        ("news", NEWS_MD_DIR),
-        ("notes", NOTES_DIR),
-        ("images", INBOX_IMAGES_DIR),
-    ]
+    roots = [("notes", NOTES_DIR), ("images", INBOX_IMAGES_DIR)]
+    if NEWS_ENABLED:
+        roots.insert(0, ("news", NEWS_MD_DIR))
     for category, root in roots:
         if not root.exists():
             continue
@@ -2951,6 +2954,9 @@ def format_cluster_list(rows: list[tuple]) -> str:
 
 
 def handle_news_command(text: str, chat_id: str) -> list[str]:
+    if not NEWS_ENABLED:
+        return ["News feature disabled."]
+
     tokens = text.strip().split()
     sub = tokens[1].lower() if len(tokens) > 1 else "latest"
     if sub == "sources":
@@ -3005,14 +3011,17 @@ NEWS_SHORTCUTS = {
 
 
 def set_telegram_commands() -> None:
-    commands = [
-        {"command": "summary_note", "description": "3-day note digest"},
-        {"command": "news_latest", "description": "Latest digest (3 days)"},
-        {"command": "news_sources", "description": "List news sources"},
-        {"command": "news_debug", "description": "Debug ingestion"},
-        {"command": "news_help", "description": "News command help"},
-        {"command": "status", "description": "Bot health status"},
-    ]
+    commands = [{"command": "summary_note", "description": "3-day note digest"}]
+    if NEWS_ENABLED:
+        commands.extend(
+            [
+                {"command": "news_latest", "description": "Latest digest (3 days)"},
+                {"command": "news_sources", "description": "List news sources"},
+                {"command": "news_debug", "description": "Debug ingestion"},
+                {"command": "news_help", "description": "News command help"},
+            ]
+        )
+    commands.append({"command": "status", "description": "Bot health status"})
     try:
         resp = requests.post(
             f"{TELEGRAM_API}/setMyCommands",
@@ -3174,6 +3183,10 @@ def push_news_to_subscribers() -> None:
 
 
 def start_news_thread() -> None:
+    if not NEWS_ENABLED:
+        print("[INFO] News worker disabled by NEWS_ENABLED=0")
+        return
+
     def loop():
         while True:
             try:

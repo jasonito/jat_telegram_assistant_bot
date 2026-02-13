@@ -13,6 +13,7 @@ pip install -r requirements.txt
 - Server deployment (24/7): `docs/DEPLOY_SERVER.md`
 - Preflight checklist: `docs/PREFLIGHT_CHECKLIST.md`
 - systemd template: `deploy/jat-bot.service.example`
+- Server operation runbook: `docs/SERVER_RUNBOOK.md`
 
 
 ## Env
@@ -23,6 +24,7 @@ Copy `.env.example` to `.env` and set your tokens. Optional group logging:
 - `DATA_DIR` location for SQLite + Markdown
 - `TELEGRAM_LONG_POLLING` set `1` to enable getUpdates instead of webhook
 - `TELEGRAM_LOCAL_WEBHOOK_URL` local URL for polling to forward updates (default: `http://127.0.0.1:8000/telegram`)
+- `NEWS_ENABLED` set `0` to disable all news ingest/worker/commands for this bot instance
 - OCR (Google Vision):
 - `OCR_PROVIDER` set `google_vision`
 - `OCR_LANG_HINTS` OCR language hints (default: `zh-TW,en`)
@@ -80,6 +82,13 @@ Set `TELEGRAM_LONG_POLLING=1`, then run:
 
 ```powershell
 .\start.ps1
+```
+
+Run with a specific env file and port (useful for running multiple bots on one machine):
+
+```powershell
+.\start.ps1 -EnvFile .env.main -Port 8000
+.\start.ps1 -EnvFile .env.chitchat -Port 8001
 ```
 
 ## Expose with ngrok

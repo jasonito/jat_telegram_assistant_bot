@@ -1,5 +1,7 @@
 param(
-  [switch]$HealthCheck
+  [switch]$HealthCheck,
+  [string]$EnvFile = ".env",
+  [int]$Port = 8000
 )
 
  $ErrorActionPreference = 'Stop'
@@ -52,6 +54,33 @@ param(
     }
   }
 
+  function Import-EnvFile($path) {
+    if (-not (Test-Path -Path $path)) {
+      throw "Env file not found: $path"
+    }
+
+    $lines = Get-Content -Path $path -ErrorAction Stop
+    foreach ($line in $lines) {
+      $trim = $line.Trim()
+      if ($trim.Length -eq 0) { continue }
+      if ($trim.StartsWith('#')) { continue }
+
+      $parts = $trim -split '=', 2
+      if ($parts.Count -lt 2) { continue }
+
+      $k = $parts[0].Trim()
+      if (-not $k) { continue }
+
+      $v = $parts[1].Trim()
+      if ($v.StartsWith('"') -and $v.EndsWith('"') -and $v.Length -ge 2) {
+        $v = $v.Substring(1, $v.Length - 2)
+      } elseif ($v.StartsWith("'") -and $v.EndsWith("'") -and $v.Length -ge 2) {
+        $v = $v.Substring(1, $v.Length - 2)
+      }
+      Set-Item -Path "Env:$k" -Value $v
+    }
+  }
+
   function Is-Truthy($value) {
     if ($null -eq $value) { return $false }
     $v = $value.ToString().Trim().ToLower()
@@ -73,63 +102,28 @@ param(
       throw "Virtualenv creation failed. Expected: $venvPython"
     }
 
-    $envFile = Join-Path $PSScriptRoot '.env'
+    if ([System.IO.Path]::IsPathRooted($EnvFile)) {
+      $envFile = $EnvFile
+    } else {
+      $envFile = Join-Path $PSScriptRoot $EnvFile
+    }
+    Import-EnvFile -path $envFile
     $token = Get-EnvValueFromFile -path $envFile -key 'TELEGRAM_BOT_TOKEN'
 
     if (-not $token) {
-      throw 'TELEGRAM_BOT_TOKEN not found in .env'
+      throw "TELEGRAM_BOT_TOKEN not found in $envFile"
     }
 
     $tokenLen = $token.Length
     $last4 = if ($tokenLen -ge 4) { $token.Substring($tokenLen - 4, 4) } else { $token }
     Write-Info "Token loaded (length: $tokenLen, last4: $last4)"
 
-    # Ensure current process uses .env AI settings (override inherited system env).
-    $aiSummaryEnabled = Get-EnvValueFromFile -path $envFile -key 'AI_SUMMARY_ENABLED'
-    if ($null -ne $aiSummaryEnabled) { $env:AI_SUMMARY_ENABLED = $aiSummaryEnabled }
-    $aiSummaryProvider = Get-EnvValueFromFile -path $envFile -key 'AI_SUMMARY_PROVIDER'
-    if ($null -ne $aiSummaryProvider) { $env:AI_SUMMARY_PROVIDER = $aiSummaryProvider }
-    $ollamaBaseUrl = Get-EnvValueFromFile -path $envFile -key 'OLLAMA_BASE_URL'
-    if ($null -ne $ollamaBaseUrl) { $env:OLLAMA_BASE_URL = $ollamaBaseUrl }
-    $ollamaModel = Get-EnvValueFromFile -path $envFile -key 'OLLAMA_MODEL'
-    if ($null -ne $ollamaModel) { $env:OLLAMA_MODEL = $ollamaModel }
-    $ocrProvider = Get-EnvValueFromFile -path $envFile -key 'OCR_PROVIDER'
-    if ($null -ne $ocrProvider) { $env:OCR_PROVIDER = $ocrProvider }
-    $ocrLangHints = Get-EnvValueFromFile -path $envFile -key 'OCR_LANG_HINTS'
-    if ($null -ne $ocrLangHints) { $env:OCR_LANG_HINTS = $ocrLangHints }
-    $googleCredPath = Get-EnvValueFromFile -path $envFile -key 'GOOGLE_APPLICATION_CREDENTIALS'
-    if ($null -ne $googleCredPath) { $env:GOOGLE_APPLICATION_CREDENTIALS = $googleCredPath }
-    $dropboxToken = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_ACCESS_TOKEN'
-    if ($null -ne $dropboxToken) { $env:DROPBOX_ACCESS_TOKEN = $dropboxToken }
-    $dropboxRefreshToken = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_REFRESH_TOKEN'
-    if ($null -ne $dropboxRefreshToken) { $env:DROPBOX_REFRESH_TOKEN = $dropboxRefreshToken }
-    $dropboxAppKey = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_APP_KEY'
-    if ($null -ne $dropboxAppKey) { $env:DROPBOX_APP_KEY = $dropboxAppKey }
-    $dropboxAppSecret = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_APP_SECRET'
-    if ($null -ne $dropboxAppSecret) { $env:DROPBOX_APP_SECRET = $dropboxAppSecret }
-    $dropboxTokenRefreshLeeway = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS'
-    if ($null -ne $dropboxTokenRefreshLeeway) { $env:DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS = $dropboxTokenRefreshLeeway }
-    $dropboxTranscriptsPath = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_TRANSCRIPTS_PATH'
-    if ($null -ne $dropboxTranscriptsPath) { $env:DROPBOX_TRANSCRIPTS_PATH = $dropboxTranscriptsPath }
-    $dropboxTranscriptsSyncEnabled = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_TRANSCRIPTS_SYNC_ENABLED'
-    if ($null -ne $dropboxTranscriptsSyncEnabled) { $env:DROPBOX_TRANSCRIPTS_SYNC_ENABLED = $dropboxTranscriptsSyncEnabled }
-    $dropboxRoot = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_ROOT_PATH'
-    if ($null -ne $dropboxRoot) { $env:DROPBOX_ROOT_PATH = $dropboxRoot }
-    $dropboxSyncEnabled = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_SYNC_ENABLED'
-    if ($null -ne $dropboxSyncEnabled) { $env:DROPBOX_SYNC_ENABLED = $dropboxSyncEnabled }
-    $dropboxSyncTime = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_SYNC_TIME'
-    if ($null -ne $dropboxSyncTime) { $env:DROPBOX_SYNC_TIME = $dropboxSyncTime }
-    $dropboxSyncTz = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_SYNC_TZ'
-    if ($null -ne $dropboxSyncTz) { $env:DROPBOX_SYNC_TZ = $dropboxSyncTz }
-    $dropboxSyncOnStartup = Get-EnvValueFromFile -path $envFile -key 'DROPBOX_SYNC_ON_STARTUP'
-    if ($null -ne $dropboxSyncOnStartup) { $env:DROPBOX_SYNC_ON_STARTUP = $dropboxSyncOnStartup }
-
     $enableNgrok = if ($env:ENABLE_NGROK -ne $null) { $env:ENABLE_NGROK } else { '1' }
     $enableWebhook = if ($env:ENABLE_WEBHOOK -ne $null) { $env:ENABLE_WEBHOOK } else { '1' }
     $enableLongPolling = if ($env:TELEGRAM_LONG_POLLING -ne $null) { $env:TELEGRAM_LONG_POLLING } else { '0' }
     if ($enableLongPolling -ne '0') {
       Write-Info 'TELEGRAM_LONG_POLLING=1, using getUpdates (no ngrok/webhook).'
-      Write-Info 'Polling forwards updates to http://127.0.0.1:8000/telegram by default.'
+      Write-Info 'Polling forwards updates to TELEGRAM_LOCAL_WEBHOOK_URL (default: http://127.0.0.1:8000/telegram).'
       $enableNgrok = '0'
       $enableWebhook = '0'
     }
@@ -226,7 +220,7 @@ param(
     if ($enableNgrok -ne '0') {
       Ensure-Command 'ngrok'
       Write-Info 'Starting ngrok...'
-      Start-Process -FilePath 'ngrok' -ArgumentList 'http 8000'
+      Start-Process -FilePath 'ngrok' -ArgumentList "http $Port"
 
       if ($enableWebhook -ne '0') {
         $deadline = (Get-Date).AddSeconds(30)
@@ -293,7 +287,9 @@ param(
     }
 
     Write-Info 'Starting uvicorn...'
-    Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn','app:app','--host','0.0.0.0','--port','8000'
+    Write-Info "Using env file: $envFile"
+    Write-Info "Starting on port: $Port"
+    Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn','app:app','--host','0.0.0.0','--port',"$Port"
   } catch {
     Write-Err $_.Exception.Message
     exit 1
