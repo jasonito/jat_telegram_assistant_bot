@@ -1,3 +1,11 @@
 .env
 __pycache__
 *.pyc
+.env.main
+.env.chitchat
+.venv/
+keys/
+data/
+chitchat/
+youtubeconverter/downloads/
+youtubeconverter/transcripts/

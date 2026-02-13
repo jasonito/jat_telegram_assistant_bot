@@ -1,7 +1,8 @@
 param(
   [switch]$HealthCheck,
   [string]$EnvFile = ".env",
-  [int]$Port = 8000
+  [int]$Port = 8000,
+  [switch]$ShowWindow
 )
 
  $ErrorActionPreference = 'Stop'
@@ -109,6 +110,10 @@ param(
     }
     Import-EnvFile -path $envFile
     $token = Get-EnvValueFromFile -path $envFile -key 'TELEGRAM_BOT_TOKEN'
+    $appModule = Get-EnvValueFromFile -path $envFile -key 'APP_MODULE'
+    if (-not $appModule) {
+      $appModule = 'app'
+    }
 
     if (-not $token) {
       throw "TELEGRAM_BOT_TOKEN not found in $envFile"
@@ -136,8 +141,31 @@ param(
       throw "requirements.txt not found: $requirements"
     }
 
-    Write-Info 'Installing Python dependencies...'
-    & $pythonExe -m pip install -r $requirements
+    $requirementsHash = (Get-FileHash -Path $requirements -Algorithm SHA256).Hash
+    $requirementsStamp = Join-Path $venvDir 'requirements.sha256'
+    $installedHash = if (Test-Path -Path $requirementsStamp) {
+      (Get-Content -Path $requirementsStamp -Raw).Trim()
+    } else {
+      ''
+    }
+    $needsInstall = ($installedHash -ne $requirementsHash)
+
+    if ($needsInstall) {
+      $constraints = Join-Path $PSScriptRoot 'constraints.txt'
+      if (Test-Path -Path $constraints) {
+        Write-Info 'Installing Python dependencies (with constraints)...'
+        & $pythonExe -m pip install -r $requirements -c $constraints
+      } else {
+        Write-Info 'Installing Python dependencies...'
+        & $pythonExe -m pip install -r $requirements
+      }
+      if ($LASTEXITCODE -ne 0) {
+        throw "pip install failed with exit code $LASTEXITCODE"
+      }
+      Set-Content -Path $requirementsStamp -Value $requirementsHash -NoNewline
+    } else {
+      Write-Info 'Dependencies unchanged, skipping pip install.'
+    }
 
     if ($HealthCheck) {
       Write-Info 'Running health check (Google Vision + Dropbox)...'
@@ -166,7 +194,11 @@ param(
         Write-Info 'Ollama service already running.'
       } catch {
         Write-Info 'Starting Ollama service...'
-        Start-Process -FilePath 'ollama' -ArgumentList 'serve'
+        if ($ShowWindow) {
+          Start-Process -FilePath 'ollama' -ArgumentList 'serve'
+        } else {
+          Start-Process -FilePath 'ollama' -ArgumentList 'serve' -WindowStyle Hidden
+        }
       }
 
       if (-not $ollamaReady) {
@@ -220,7 +252,11 @@ param(
     if ($enableNgrok -ne '0') {
       Ensure-Command 'ngrok'
       Write-Info 'Starting ngrok...'
-      Start-Process -FilePath 'ngrok' -ArgumentList "http $Port"
+      if ($ShowWindow) {
+        Start-Process -FilePath 'ngrok' -ArgumentList "http $Port"
+      } else {
+        Start-Process -FilePath 'ngrok' -ArgumentList "http $Port" -WindowStyle Hidden
+      }
 
       if ($enableWebhook -ne '0') {
         $deadline = (Get-Date).AddSeconds(30)
@@ -288,8 +324,18 @@ param(
 
     Write-Info 'Starting uvicorn...'
     Write-Info "Using env file: $envFile"
+    Write-Info "App module: $appModule"
     Write-Info "Starting on port: $Port"
-    Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn','app:app','--host','0.0.0.0','--port',"$Port"
+    if ($appModule.Contains(':')) {
+      $appTarget = $appModule
+    } else {
+      $appTarget = "$appModule`:app"
+    }
+    if ($ShowWindow) {
+      Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn',$appTarget,'--host','0.0.0.0','--port',"$Port"
+    } else {
+      Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn',$appTarget,'--host','0.0.0.0','--port',"$Port" -WindowStyle Hidden
+    }
   } catch {
     Write-Err $_.Exception.Message
     exit 1

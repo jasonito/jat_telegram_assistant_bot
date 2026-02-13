@@ -10,6 +10,7 @@ import sqlite3
 import hashlib
 import json
 import time
+import uuid
 from typing import Iterator
 from urllib.parse import quote
 from urllib.parse import urlparse
@@ -38,6 +39,14 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 load_dotenv()
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
@@ -61,6 +70,7 @@ SLACK_MD_DIR = NOTES_DIR / "slack"
 OCR_MD_DIR = NOTES_DIR / "ocr"
 INBOX_IMAGES_DIR = DATA_DIR / "inbox" / "images"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
+TRANSCRIPTS_TMP_DIR = DATA_DIR / "transcripts_tmp"
 ALLOWED_GROUPS = {
     g.strip()
     for g in os.getenv("TELEGRAM_ALLOWED_GROUPS", "").split(",")
@@ -130,6 +140,15 @@ NEWS_GNEWS_QUERY = os.getenv("NEWS_GNEWS_QUERY", "site:reuters.com semiconductor
 NEWS_GNEWS_HL = os.getenv("NEWS_GNEWS_HL", "en-US")
 NEWS_GNEWS_GL = os.getenv("NEWS_GNEWS_GL", "US")
 NEWS_GNEWS_CEID = os.getenv("NEWS_GNEWS_CEID", "US:en")
+FEATURE_NEWS_ENABLED = _env_flag("FEATURE_NEWS_ENABLED", NEWS_ENABLED)
+FEATURE_TRANSCRIBE_ENABLED = _env_flag("FEATURE_TRANSCRIBE_ENABLED", True)
+FEATURE_TRANSCRIBE_AUTO_URL = _env_flag("FEATURE_TRANSCRIBE_AUTO_URL", False)
+FEATURE_OCR_ENABLED = _env_flag("FEATURE_OCR_ENABLED", True)
+FEATURE_OCR_CHOICE_ENABLED = _env_flag("FEATURE_OCR_CHOICE_ENABLED", False)
+OCR_CHOICE_SCOPE = (os.getenv("OCR_CHOICE_SCOPE", "private") or "private").strip().lower()
+OCR_CHOICE_TIMEOUT_SECONDS = int(os.getenv("OCR_CHOICE_TIMEOUT_SECONDS", "60"))
+FEATURE_SLACK_ENABLED = _env_flag("FEATURE_SLACK_ENABLED", True)
+
 try:
     NEWS_TZ = ZoneInfo("Asia/Taipei")
 except ZoneInfoNotFoundError:
@@ -143,6 +162,22 @@ _dropbox_client = None
 _dropbox_token_lock = threading.Lock()
 _dropbox_access_token = DROPBOX_ACCESS_TOKEN
 _dropbox_access_token_expires_at = 0.0
+_startup_lock = threading.Lock()
+_startup_done = False
+
+ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".aac", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".opus"}
+URL_RE = re.compile(r"https?://[^\s<>()]+", flags=re.I)
+OCR_CHOICE_CALLBACK_RE = re.compile(r"^ocr_choice:([a-f0-9-]{8,64}):(run|save)$", flags=re.I)
+
+
+def _load_transcription_module():
+    try:
+        import transcription as tx
+    except Exception as e:
+        raise RuntimeError(
+            "transcription module unavailable. Install dependencies for transcription first."
+        ) from e
+    return tx
 
 
 def init_storage() -> None:
@@ -151,10 +186,11 @@ def init_storage() -> None:
     TELEGRAM_MD_DIR.mkdir(parents=True, exist_ok=True)
     SLACK_MD_DIR.mkdir(parents=True, exist_ok=True)
     OCR_MD_DIR.mkdir(parents=True, exist_ok=True)
-    if NEWS_ENABLED:
-        NEWS_MD_DIR.mkdir(parents=True, exist_ok=True)
     INBOX_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    TRANSCRIPTS_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    if FEATURE_NEWS_ENABLED:
+        NEWS_MD_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -171,49 +207,50 @@ def init_storage() -> None:
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS news_clusters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cluster_date TEXT NOT NULL,
-                cluster_seq INTEGER NOT NULL,
-                canonical_title TEXT,
-                canonical_url TEXT,
-                canonical_source TEXT,
-                canonical_published_at TEXT,
-                canonical_summary TEXT,
-                canonical_summary_source TEXT
+        if FEATURE_NEWS_ENABLED:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS news_clusters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster_date TEXT NOT NULL,
+                    cluster_seq INTEGER NOT NULL,
+                    canonical_title TEXT,
+                    canonical_url TEXT,
+                    canonical_source TEXT,
+                    canonical_published_at TEXT,
+                    canonical_summary TEXT,
+                    canonical_summary_source TEXT
+                )
+                """
             )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS news_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cluster_id INTEGER NOT NULL,
-                source TEXT,
-                title TEXT,
-                title_norm TEXT,
-                url TEXT,
-                summary TEXT,
-                published_at TEXT,
-                hash_url TEXT,
-                hash_title TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (cluster_id) REFERENCES news_clusters(id)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS news_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster_id INTEGER NOT NULL,
+                    source TEXT,
+                    title TEXT,
+                    title_norm TEXT,
+                    url TEXT,
+                    summary TEXT,
+                    published_at TEXT,
+                    hash_url TEXT,
+                    hash_title TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (cluster_id) REFERENCES news_clusters(id)
+                )
+                """
             )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS news_subscriptions (
-                chat_id TEXT PRIMARY KEY,
-                enabled INTEGER NOT NULL,
-                interval_minutes INTEGER,
-                last_sent_at TEXT
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS news_subscriptions (
+                    chat_id TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    interval_minutes INTEGER,
+                    last_sent_at TEXT
+                )
+                """
             )
-            """
-        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS notes (
@@ -230,15 +267,16 @@ def init_storage() -> None:
             )
             """
         )
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_news_items_hash_url ON news_items(hash_url)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_news_items_published_at ON news_items(published_at)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_news_clusters_date_seq ON news_clusters(cluster_date, cluster_seq)"
-        )
+        if FEATURE_NEWS_ENABLED:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_news_items_hash_url ON news_items(hash_url)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_news_items_published_at ON news_items(published_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_news_clusters_date_seq ON news_clusters(cluster_date, cluster_seq)"
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sync_state (
@@ -249,6 +287,26 @@ def init_storage() -> None:
                 PRIMARY KEY(provider, local_path)
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ocr_pending_choices (
+                job_id TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                prompt_message_id INTEGER,
+                image_path TEXT NOT NULL,
+                file_unique_id TEXT,
+                source_msg_id INTEGER,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                ocr_done INTEGER NOT NULL DEFAULT 0,
+                ocr_md_saved INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ocr_pending_status_expires ON ocr_pending_choices(status, expires_at)"
         )
         conn.commit()
 
@@ -290,17 +348,232 @@ async def send_message(
     text: str,
     parse_mode: str | None = None,
     disable_web_page_preview: bool | None = None,
-) -> None:
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if disable_web_page_preview is not None:
-        payload["disable_web_page_preview"] = disable_web_page_preview
-    resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    if resp.status_code >= 300 and parse_mode:
-        fallback_payload = {"chat_id": chat_id, "text": text}
-        resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=fallback_payload, timeout=10)
-    print(f"sendMessage status={resp.status_code} body={resp.text}")
+    reply_markup: dict | None = None,
+) -> int | None:
+    def _send() -> int | None:
+        payload = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if disable_web_page_preview is not None:
+            payload["disable_web_page_preview"] = disable_web_page_preview
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+        if resp.status_code >= 300 and parse_mode:
+            fallback_payload = {"chat_id": chat_id, "text": text}
+            resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=fallback_payload, timeout=10)
+        try:
+            data = resp.json() if resp.content else {}
+        except Exception:
+            data = {}
+        print(f"sendMessage status={resp.status_code} ok={bool(data.get('ok'))}")
+        if data.get("ok"):
+            return data.get("result", {}).get("message_id")
+        return None
+
+    return await asyncio.to_thread(_send)
+
+
+async def edit_message(chat_id: int, message_id: int, text: str) -> bool:
+    def _edit() -> bool:
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        try:
+            resp = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload, timeout=10)
+            data = resp.json() if resp.content else {}
+            print(f"editMessageText status={resp.status_code} ok={bool(data.get('ok'))}")
+            return bool(resp.status_code < 300 and data.get("ok"))
+        except Exception:
+            return False
+
+    return await asyncio.to_thread(_edit)
+
+
+async def send_document(chat_id: int, file_path: Path, caption: str | None = None) -> bool:
+    def _send() -> bool:
+        data = {"chat_id": str(chat_id)}
+        if caption:
+            data["caption"] = caption
+        try:
+            with file_path.open("rb") as fh:
+                resp = requests.post(
+                    f"{TELEGRAM_API}/sendDocument",
+                    data=data,
+                    files={"document": (file_path.name, fh, "text/markdown")},
+                    timeout=60,
+                )
+            body = resp.json() if resp.content else {}
+            print(f"sendDocument status={resp.status_code} ok={bool(body.get('ok'))}")
+            return bool(resp.status_code < 300 and body.get("ok"))
+        except Exception:
+            return False
+
+    return await asyncio.to_thread(_send)
+
+
+async def answer_callback_query(callback_query_id: str, text: str = "", show_alert: bool = False) -> bool:
+    def _answer() -> bool:
+        payload = {"callback_query_id": callback_query_id, "text": text, "show_alert": show_alert}
+        try:
+            resp = requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json=payload, timeout=10)
+            body = resp.json() if resp.content else {}
+            print(f"answerCallbackQuery status={resp.status_code} ok={bool(body.get('ok'))}")
+            return bool(resp.status_code < 300 and body.get("ok"))
+        except Exception:
+            return False
+
+    return await asyncio.to_thread(_answer)
+
+
+def _is_ocr_choice_enabled_for_chat(is_private: bool, is_group: bool) -> bool:
+    if not (FEATURE_OCR_ENABLED and FEATURE_OCR_CHOICE_ENABLED):
+        return False
+    scope = OCR_CHOICE_SCOPE
+    if scope == "private":
+        return is_private
+    if scope in {"all", "private_group", "both"}:
+        return is_private or is_group
+    return is_private
+
+
+def _save_telegram_image(
+    *,
+    file_id: str,
+    file_unique_id: str,
+    chat_id: int,
+    msg_id: int,
+    msg_ts: datetime | None,
+) -> tuple[Path, bytes]:
+    file_info = telegram_get_file_info(file_id)
+    if not file_info:
+        raise RuntimeError("image file info not found")
+    file_url, file_path = file_info
+    img_resp = requests.get(file_url, timeout=20)
+    if img_resp.status_code != 200:
+        raise RuntimeError(f"image download failed: {img_resp.status_code}")
+    day = (msg_ts or datetime.now()).strftime("%Y-%m-%d")
+    img_dir = INBOX_IMAGES_DIR / day
+    img_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(file_path).suffix or ".jpg"
+    filename = f"{chat_id}_{msg_id}_{file_unique_id}{suffix}"
+    out_path = img_dir / filename
+    out_path.write_bytes(img_resp.content)
+    return out_path, img_resp.content
+
+
+def _run_ocr_on_image(
+    *,
+    chat_id: int | str,
+    msg_id: int | str,
+    image_path: Path,
+    msg_ts: datetime | None,
+) -> tuple[bool, bool]:
+    ocr_ok = False
+    md_saved = False
+    ocr_text = ""
+    try:
+        image_bytes = image_path.read_bytes()
+    except Exception as e:
+        ocr_text = f"[OCR failed] cannot read image: {e}"
+    else:
+        try:
+            ocr_text = extract_text_from_image(image_bytes)
+            if ocr_text.strip():
+                ocr_ok = True
+            else:
+                ocr_text = "[OCR failed] no text detected"
+        except Exception as e:
+            ocr_text = f"[OCR failed] {e}"
+            print(f"[WARN] OCR failed for {image_path}: {e}")
+    try:
+        append_ocr_markdown(str(chat_id), msg_id, image_path, ocr_text, msg_ts)
+        md_saved = True
+    except Exception as e:
+        print(f"[WARN] OCR markdown save failed for {image_path}: {e}")
+    return ocr_ok, md_saved
+
+
+def _create_ocr_choice_job(
+    *,
+    job_id: str,
+    chat_id: int,
+    prompt_message_id: int | None,
+    image_path: Path,
+    file_unique_id: str,
+    source_msg_id: int | None,
+) -> str:
+    now = datetime.now()
+    expires = now + timedelta(seconds=max(5, OCR_CHOICE_TIMEOUT_SECONDS))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO ocr_pending_choices
+            (job_id, chat_id, prompt_message_id, image_path, file_unique_id, source_msg_id,
+             created_at, expires_at, status, ocr_done, ocr_md_saved)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0)
+            """,
+            (
+                job_id,
+                str(chat_id),
+                prompt_message_id,
+                str(image_path),
+                file_unique_id,
+                source_msg_id,
+                now.isoformat(timespec="seconds"),
+                expires.isoformat(timespec="seconds"),
+            ),
+        )
+        conn.commit()
+    return job_id
+
+
+def _get_ocr_choice_job(job_id: str) -> tuple | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            """
+            SELECT job_id, chat_id, prompt_message_id, image_path, source_msg_id,
+                   expires_at, status, ocr_done, ocr_md_saved
+            FROM ocr_pending_choices
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+
+
+def _update_ocr_choice_job_status(job_id: str, status: str, ocr_done: int = 0, ocr_md_saved: int = 0) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            UPDATE ocr_pending_choices
+            SET status = ?, ocr_done = ?, ocr_md_saved = ?
+            WHERE job_id = ?
+            """,
+            (status, int(ocr_done), int(ocr_md_saved), job_id),
+        )
+        conn.commit()
+
+
+def _list_expired_ocr_choice_jobs(now_dt: datetime | None = None) -> list[tuple]:
+    now = (now_dt or datetime.now()).isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            """
+            SELECT job_id, chat_id, prompt_message_id
+            FROM ocr_pending_choices
+            WHERE status = 'pending' AND expires_at <= ?
+            """,
+            (now,),
+        ).fetchall()
+
+
+def _build_ocr_choice_keyboard(job_id: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "進行 OCR", "callback_data": f"ocr_choice:{job_id}:run"},
+                {"text": "只存圖", "callback_data": f"ocr_choice:{job_id}:save"},
+            ]
+        ]
+    }
 
 
 def _chunk_text_for_telegram(text: str, limit: int = 3500) -> list[str]:
@@ -342,11 +615,328 @@ def delete_telegram_webhook(drop_pending: bool = False) -> None:
         print(f"deleteWebhook error: {e}")
 
 
+def _extract_transcribe_target(text: str) -> str:
+    m = re.match(r"^/transcribe(?:@\w+)?\s*(.*)$", (text or "").strip(), flags=re.I | re.S)
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
+def _extract_supported_transcribe_url(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    try:
+        tx = _load_transcription_module()
+    except Exception:
+        return ""
+    for match in URL_RE.findall(raw):
+        candidate = match.rstrip(").,;!?")
+        _url_type, error = tx.classify_url(candidate)
+        if not error:
+            return candidate
+    return ""
+
+
+def _build_transcript_ai_summary(transcript_path: Path) -> str | None:
+    try:
+        content = transcript_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if not content.strip():
+        return None
+
+    transcript_text = content
+    if "\n---\n" in transcript_text:
+        transcript_text = transcript_text.split("\n---\n", 1)[1]
+    transcript_text = transcript_text.strip()
+    if not transcript_text:
+        return None
+
+    clipped = transcript_text[: min(len(transcript_text), AI_SUMMARY_MAX_CHARS)]
+    fallback = _fallback_three_points(clipped)
+    if not AI_SUMMARY_ENABLED:
+        return fallback
+
+    system_prompt = (
+        "Use only provided transcript content. Do not invent facts. "
+        "Output must be in Traditional Chinese."
+    )
+    user_prompt = (
+        "請根據以下逐字稿輸出重點摘要：\n"
+        "1. 先用 3-5 點條列重點\n"
+        "2. 補一段 2-3 句的整體結論\n\n"
+        f"{clipped}"
+    )
+    ai = _run_ai_chat(system_prompt, user_prompt)
+    return ai or fallback
+
+
+def _prepend_summary_to_transcript(transcript_path: Path, summary_text: str) -> None:
+    summary = (summary_text or "").strip()
+    if not summary:
+        return
+    raw = transcript_path.read_text(encoding="utf-8", errors="replace")
+    if raw.lstrip().startswith("## AI 摘要"):
+        return
+    block = f"## AI 摘要\n\n{summary}\n\n---\n\n"
+    transcript_path.write_text(block + raw, encoding="utf-8")
+
+
+def _localize_transcribe_status(status: str) -> str:
+    s = (status or "").strip()
+    if not s:
+        return ""
+    lower = s.lower()
+    if lower.startswith("checking video info"):
+        return "進度：正在檢查影片資訊..."
+    if lower.startswith("downloading"):
+        return "進度：正在下載音訊..."
+    if lower.startswith("preparing"):
+        return "進度：正在準備音訊..."
+    if lower.startswith("transcribing segment"):
+        m = re.search(r"(\d+)\s*/\s*(\d+)", s)
+        if m:
+            return f"進度：正在轉錄分段 {m.group(1)}/{m.group(2)}..."
+        return "進度：正在轉錄分段..."
+    if lower.startswith("transcribing") and "segments" in lower:
+        m = re.search(r"(\d+)", s)
+        if m:
+            return f"進度：開始分段轉錄，共 {m.group(1)} 段..."
+        return "進度：開始分段轉錄..."
+    if lower.startswith("transcribing"):
+        return "進度：正在轉錄文字..."
+    return f"進度：{s}"
+
+
+def _build_transcribe_status_message(intro_text: str, status_text: str, title: str | None = None) -> str:
+    lines = [intro_text.strip(), status_text.strip()]
+    if title:
+        lines.append(f"轉錄完成：{title}")
+    return "\n".join(x for x in lines if x)
+
+
+async def _run_transcribe_job_with_progress(chat_id: int, worker, intro_text: str):
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[str] = asyncio.Queue()
+
+    def on_status(msg: str) -> None:
+        text = (msg or "").strip()
+        if not text:
+            return
+        loop.call_soon_threadsafe(queue.put_nowait, text)
+
+    progress_text = _build_transcribe_status_message(intro_text, "進度：準備中...")
+    progress_message_id = await send_message(chat_id, progress_text)
+    job = asyncio.create_task(asyncio.to_thread(worker, on_status))
+    last_status = ""
+    last_sent_at = 0.0
+    while True:
+        if job.done() and queue.empty():
+            break
+        try:
+            raw_status = await asyncio.wait_for(queue.get(), timeout=0.8)
+        except asyncio.TimeoutError:
+            continue
+        localized = _localize_transcribe_status(raw_status)
+        now = time.time()
+        if not localized:
+            continue
+        if localized == last_status and (now - last_sent_at) < 4:
+            continue
+        if (now - last_sent_at) < 1.2:
+            continue
+        if progress_message_id:
+            text = _build_transcribe_status_message(intro_text, localized)
+            ok = await edit_message(chat_id, progress_message_id, text)
+            if not ok:
+                progress_message_id = await send_message(chat_id, text)
+        else:
+            progress_message_id = await send_message(chat_id, _build_transcribe_status_message(intro_text, localized))
+        last_status = localized
+        last_sent_at = now
+
+    result = await job
+    return result, progress_message_id
+
+
+async def _run_transcribe_url_flow(chat_id: int, target: str) -> bool:
+    try:
+        tx = _load_transcription_module()
+    except Exception as e:
+        await send_message(chat_id, f"轉錄模組不可用：{e}")
+        return True
+    _url_type, error = tx.classify_url(target)
+    if error:
+        await send_message(chat_id, f"URL 不支援：{error}")
+        return True
+
+    intro_text = ""
+    try:
+        (title, out_path), progress_msg_id = await _run_transcribe_job_with_progress(
+            chat_id,
+            lambda on_status: tx.transcribe_url_to_markdown(
+                target,
+                TRANSCRIPTS_DIR,
+                TRANSCRIPTS_TMP_DIR,
+                on_status=on_status,
+            ),
+            intro_text,
+        )
+        summary = await asyncio.to_thread(_build_transcript_ai_summary, out_path)
+        if summary:
+            await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
+        if progress_msg_id:
+            done_text = _build_transcribe_status_message(intro_text, f"轉錄完成：{title}")
+            await edit_message(chat_id, progress_msg_id, done_text)
+        if summary:
+            for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
+                await send_message(chat_id, chunk)
+        sent = await send_document(chat_id, out_path)
+        if not sent:
+            await send_message(chat_id, "檔案上傳失敗，請稍後重試。")
+    except Exception as e:
+        err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
+        if 'progress_msg_id' in locals() and progress_msg_id:
+            ok = await edit_message(chat_id, progress_msg_id, err_text)
+            if not ok:
+                await send_message(chat_id, err_text)
+        else:
+            await send_message(chat_id, err_text)
+    return True
+
+
+def _extract_audio_attachment(message: dict) -> tuple[str, str] | None:
+    audio = message.get("audio") or {}
+    if audio.get("file_id"):
+        name = audio.get("file_name") or f"audio_{audio.get('file_unique_id', 'upload')}.mp3"
+        return audio["file_id"], name
+
+    voice = message.get("voice") or {}
+    if voice.get("file_id"):
+        return voice["file_id"], f"voice_{voice.get('file_unique_id', 'upload')}.ogg"
+
+    doc = message.get("document") or {}
+    file_id = doc.get("file_id")
+    if not file_id:
+        return None
+    mime_type = (doc.get("mime_type") or "").lower()
+    filename = doc.get("file_name") or f"audio_{doc.get('file_unique_id', 'upload')}"
+    ext = Path(filename).suffix.lower()
+    if mime_type.startswith("audio/") or ext in ALLOWED_AUDIO_EXTENSIONS:
+        if not ext:
+            filename = f"{filename}.mp3"
+        return file_id, filename
+    return None
+
+
+def _download_telegram_file(file_id: str, dest_path: Path) -> None:
+    file_info = telegram_get_file_info(file_id)
+    if not file_info:
+        raise RuntimeError("Cannot fetch Telegram file info.")
+    file_url, _file_path = file_info
+    resp = requests.get(file_url, timeout=300)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Telegram file download failed: {resp.status_code}")
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_path.write_bytes(resp.content)
+
+
+async def handle_transcribe_text_command(chat_id: int, text: str) -> bool:
+    if not FEATURE_TRANSCRIBE_ENABLED:
+        return False
+    target = _extract_transcribe_target(text)
+    if not target:
+        if (text or "").strip().lower().startswith("/transcribe"):
+            await send_message(chat_id, "用法：/transcribe <YouTube URL | Podcast URL | 音訊 URL>")
+            return True
+        return False
+    return await _run_transcribe_url_flow(chat_id, target)
+
+
+async def handle_transcribe_auto_url_message(chat_id: int, text: str) -> bool:
+    if not FEATURE_TRANSCRIBE_ENABLED or not FEATURE_TRANSCRIBE_AUTO_URL:
+        return False
+    raw = (text or "").strip()
+    if not raw or raw.startswith("/"):
+        return False
+    target = _extract_supported_transcribe_url(raw)
+    if not target:
+        return False
+    return await _run_transcribe_url_flow(chat_id, target)
+
+
+async def handle_transcribe_audio_message(chat_id: int, message: dict) -> bool:
+    if not FEATURE_TRANSCRIBE_ENABLED:
+        return False
+    extracted = _extract_audio_attachment(message)
+    if not extracted:
+        return False
+
+    file_id, original_filename = extracted
+    ext = Path(original_filename).suffix.lower() or ".mp3"
+    if ext not in ALLOWED_AUDIO_EXTENSIONS:
+        await send_message(
+            chat_id,
+            f"不支援的檔案格式：{ext}\n支援：{', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}",
+        )
+        return True
+
+    temp_input = TRANSCRIPTS_TMP_DIR / f"{uuid.uuid4()}{ext}"
+    intro_text = ""
+    try:
+        tx = _load_transcription_module()
+        await asyncio.to_thread(_download_telegram_file, file_id, temp_input)
+        if not temp_input.exists() or temp_input.stat().st_size == 0:
+            raise RuntimeError("下載到的音訊檔為空。")
+
+        (title, out_path), progress_msg_id = await _run_transcribe_job_with_progress(
+            chat_id,
+            lambda on_status: tx.transcribe_upload_to_markdown(
+                temp_input,
+                original_filename,
+                TRANSCRIPTS_DIR,
+                TRANSCRIPTS_TMP_DIR,
+                on_status=on_status,
+            ),
+            intro_text,
+        )
+        summary = await asyncio.to_thread(_build_transcript_ai_summary, out_path)
+        if summary:
+            await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
+        if progress_msg_id:
+            done_text = _build_transcribe_status_message(intro_text, f"轉錄完成：{title}")
+            await edit_message(chat_id, progress_msg_id, done_text)
+        if summary:
+            for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
+                await send_message(chat_id, chunk)
+        sent = await send_document(chat_id, out_path)
+        if not sent:
+            await send_message(chat_id, "檔案上傳失敗，請稍後重試。")
+    except Exception as e:
+        err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
+        if 'progress_msg_id' in locals() and progress_msg_id:
+            ok = await edit_message(chat_id, progress_msg_id, err_text)
+            if not ok:
+                await send_message(chat_id, err_text)
+        else:
+            await send_message(chat_id, err_text)
+    finally:
+        try:
+            if temp_input.exists():
+                temp_input.unlink()
+        except Exception:
+            pass
+    return True
+
+
 def handle_command(text: str) -> str:
     text = text.strip()
     text_lower = text.lower()
 
     if text_lower.startswith("/summary_news"):
+        if not FEATURE_NEWS_ENABLED:
+            return "新聞功能已關閉。"
         day = _parse_day_arg(text)
         parts = build_scoped_summary(day, "news")
         return "\n".join(parts)
@@ -369,6 +959,21 @@ def handle_command(text: str) -> str:
     if text_lower.startswith("/status"):
         return build_status_report()
 
+    if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_latest"):
+        suffix = text.strip()[len("/news_latest") :].strip()
+        return "\n".join(handle_news_command(f"/news latest {suffix}".strip(), ""))
+    if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_sources"):
+        return "\n".join(handle_news_command("/news sources", ""))
+    if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_debug"):
+        return "\n".join(handle_news_command("/news debug", ""))
+    if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_help"):
+        return "\n".join(handle_news_command("/news help", ""))
+
+    if text_lower.startswith("/news"):
+        if not FEATURE_NEWS_ENABLED:
+            return "新聞功能已關閉。"
+        return "用法：/news latest | /news search <keywords> | /news sources | /news help"
+
     if text_lower.startswith("open "):
         url = text[5:].strip()
         if not re.match(r"^https?://", url, re.I):
@@ -384,7 +989,12 @@ def handle_command(text: str) -> str:
         return sort_downloads()
 
     if text_lower in {"help", "/help"}:
-        return "Commands: open <url>, notepad, sort downloads, /status"
+        cmds = ["open <url>", "notepad", "sort downloads", "/status", "/summary", "/summary_note"]
+        if FEATURE_NEWS_ENABLED:
+            cmds.extend(["/news latest", "/summary news"])
+        if FEATURE_TRANSCRIBE_ENABLED:
+            cmds.append("/transcribe <url>")
+        return "Commands: " + ", ".join(cmds)
 
     if text.startswith("/"):
         return "Unsupported command."
@@ -395,7 +1005,7 @@ def route_user_text_command(text: str, chat_id: str) -> tuple[list[str], str | N
     cmd_text = (text or "").strip()
     lower = cmd_text.lower()
 
-    if lower.startswith("/news"):
+    if FEATURE_NEWS_ENABLED and lower.startswith("/news"):
         replies = handle_news_command(cmd_text, chat_id)
         tokens = cmd_text.split()
         sub = tokens[1].lower() if len(tokens) > 1 else "latest"
@@ -406,14 +1016,9 @@ def route_user_text_command(text: str, chat_id: str) -> tuple[list[str], str | N
     reply = handle_command(cmd_text)
     parse_mode = None
     disable_preview = None
-    if lower.startswith("/summary_news"):
+    if FEATURE_NEWS_ENABLED and lower.startswith("/summary_news"):
         parse_mode = "Markdown"
         disable_preview = True
-    elif lower.startswith("/summary"):
-        scope, _ = _parse_summary_args(cmd_text)
-        if scope == "news":
-            parse_mode = "Markdown"
-            disable_preview = True
     return [reply], parse_mode, disable_preview
 
 
@@ -570,7 +1175,7 @@ def ensure_dropbox_folders(dbx, root_path: str) -> None:
     root = normalize_dropbox_path(root_path)
     _dropbox_create_folder_if_missing(dbx, root)
     folders = ["notes", "images"]
-    if NEWS_ENABLED:
+    if FEATURE_NEWS_ENABLED:
         folders.insert(0, "news")
     for folder in folders:
         _dropbox_create_folder_if_missing(dbx, f"{root}/{folder}")
@@ -578,7 +1183,7 @@ def ensure_dropbox_folders(dbx, root_path: str) -> None:
 
 def iter_sync_files() -> Iterator[tuple[str, Path, str]]:
     roots = [("notes", NOTES_DIR), ("images", INBOX_IMAGES_DIR)]
-    if NEWS_ENABLED:
+    if FEATURE_NEWS_ENABLED:
         roots.insert(0, ("news", NEWS_MD_DIR))
     for category, root in roots:
         if not root.exists():
@@ -1320,16 +1925,6 @@ def generate_ai_summary(
 def merge_all(day: str) -> list[str]:
     notes_files = sorted(NOTES_DIR.rglob(f"{day}*.md"))
 
-    day_compact = day.replace("-", "")
-    news_candidates = [
-        NEWS_MD_DIR / f"{day}_news.md",
-        NEWS_MD_DIR / f"{day_compact}.md",
-        NEWS_MD_DIR / f"{day_compact}_news.md",
-    ]
-    news_files = [fp for fp in news_candidates if fp.exists()]
-    if not news_files:
-        news_files = sorted(NEWS_MD_DIR.glob(f"{day_compact}*.md"))
-
     parts: list[str] = [f"{day} merged raw data"]
 
     if notes_files:
@@ -1344,19 +1939,6 @@ def merge_all(day: str) -> list[str]:
     else:
         parts.append("== Notes ==")
         parts.append("[no notes files]")
-
-    if news_files:
-        parts.append("== News ==")
-        for fp in news_files:
-            parts.append(f"# file: {fp}")
-            try:
-                content = fp.read_text(encoding="utf-8", errors="replace").strip()
-            except Exception as e:
-                content = f"[read error] {e}"
-            parts.append(content if content else "[empty]")
-    else:
-        parts.append("== News ==")
-        parts.append("[no news files]")
 
     return parts
 
@@ -1637,6 +2219,8 @@ def build_scoped_summary(day: str, scope: str, *, recent_days: int | None = None
         scope_norm = "note"
     days = max(1, int(recent_days or 1))
     if scope_norm == "news":
+        if not FEATURE_NEWS_ENABLED:
+            return ["新聞功能已關閉。"]
         if days > 1:
             return build_news_digest_recent(day, days=days)
         return build_news_digest(day)
@@ -1696,15 +2280,18 @@ def _summary_files_for_day(day: str) -> tuple[list[Path], list[Path]]:
                 notes_files.append(fp)
         notes_files.sort()
 
-    day_compact = day.replace("-", "")
-    news_candidates = [
-        NEWS_MD_DIR / f"{day}_news.md",
-        NEWS_MD_DIR / f"{day_compact}.md",
-        NEWS_MD_DIR / f"{day_compact}_news.md",
-    ]
-    news_files = [fp for fp in news_candidates if fp.exists()]
-    if not news_files:
-        news_files = sorted(NEWS_MD_DIR.glob(f"{day_compact}*.md"))
+    news_files: list[Path] = []
+    if FEATURE_NEWS_ENABLED:
+        day_compact = day.replace("-", "")
+        news_candidates = [
+            NEWS_MD_DIR / f"{day}_news.md",
+            NEWS_MD_DIR / f"{day_compact}.md",
+            NEWS_MD_DIR / f"{day_compact}_news.md",
+        ]
+        news_files = [fp for fp in news_candidates if fp.exists()]
+        if not news_files:
+            news_files = sorted(NEWS_MD_DIR.glob(f"{day_compact}*.md"))
+
     return notes_files, news_files
 
 
@@ -2465,60 +3052,13 @@ def summary_ai(day: str, scope: str = "all") -> list[str]:
     scope = (scope or "all").strip().lower()
     if scope == "notes":
         scope = "note"
-
-    notes_files, news_files = _summary_files_for_day(day)
-    news_raw = _load_raw_summary_files(news_files)
-    notes_raw = _load_raw_summary_files(notes_files)
-
-    if not AI_SUMMARY_ENABLED:
-        if scope == "news":
-            return [f"{day} summary news", news_raw or "[no news files]"]
-        if scope == "note":
-            return build_note_digest(day)
-        return merge_all(day)
-
-    system_prompt = (
-        "Use only provided content. Do not invent facts. "
-        "Output must be in Traditional Chinese."
-    )
-
-    a_prompt = (
-        f"Summarize news for {day}. Output 8-12 items. If source is limited, output all available items and prioritize at least 6.\n"
-        "Each item must contain title and URL. If URL is missing, write URL: ?.\n"
-        "Do NOT use title(url) inline parenthesis style.\n"
-        "Do not invent facts.\n\n"
-        f"{news_raw or '[no news files]'}"
-    )
-    b_prompt = (
-        f"Summarize notes and transcripts for {day}. Output 8-15 key points.\n"
-        "Focus on decisions, TODOs, risks, and next actions.\n"
-        "Do NOT use markdown emphasis symbols like **.\n"
-        "Do not invent facts.\n\n"
-        f"{notes_raw or '[no notes files]'}"
-    )
-
     if scope == "news":
+        if not FEATURE_NEWS_ENABLED:
+            return ["新聞功能已關閉。"]
         return build_scoped_summary(day, "news")
-    if scope == "note":
-        return build_scoped_summary(day, "note")
-
-    a = _run_ai_chat(system_prompt, a_prompt) if scope == "all" else None
-    b = _run_ai_chat(system_prompt, b_prompt) if scope == "all" else None
-
-
-    if not a and not b:
-        return merge_all(day)
-
-    a_fmt = _normalize_news_output(a or "")
-    b_fmt = _normalize_notes_output(b or "")
-    return [
-        f"{day} summary (AI)",
-        "A. ?啗?",
-        a_fmt,
-        "",
-        "B. 蝑?",
-        b_fmt,
-    ]
+    if scope not in {"all", "note"}:
+        return ["不支援的摘要範圍，請使用 /summary、/summary note 或 /summary news。"]
+    return build_note_digest(day)
 
 
 def get_local_tz():
@@ -2954,8 +3494,8 @@ def format_cluster_list(rows: list[tuple]) -> str:
 
 
 def handle_news_command(text: str, chat_id: str) -> list[str]:
-    if not NEWS_ENABLED:
-        return ["News feature disabled."]
+    if not FEATURE_NEWS_ENABLED:
+        return ["新聞功能已關閉。"]
 
     tokens = text.strip().split()
     sub = tokens[1].lower() if len(tokens) > 1 else "latest"
@@ -2980,8 +3520,9 @@ def handle_news_command(text: str, chat_id: str) -> list[str]:
                 WHERE published_at >= ?
                 GROUP BY source
                 ORDER BY cnt DESC
-                """
-            , (cutoff_iso,)).fetchall()
+                """,
+                (cutoff_iso,),
+            ).fetchall()
         if not rows:
             return ["No news items ingested in the last 12 hours."]
         lines = ["News items by source (last 12 hours):"]
@@ -2996,23 +3537,14 @@ def handle_news_command(text: str, chat_id: str) -> list[str]:
         return ["\n".join(build_scoped_summary(end_day, "news", recent_days=3))]
     if sub == "help":
         return [
-            "News commands: /news latest [N], /news search <keywords>, /news sources, /news debug"
+            "News commands: /news latest [YYYY-MM-DD], /news search <keywords>, /news sources, /news debug"
         ]
     return ["Unknown /news subcommand. Use /news help."]
 
 
-NEWS_SHORTCUTS = {
-    "/news_latest": "/news latest",
-    "/news_sources": "/news sources",
-    "/news_debug": "/news debug",
-    "/news_help": "/news help",
-    "/status": "/status",
-}
-
-
 def set_telegram_commands() -> None:
     commands = [{"command": "summary_note", "description": "3-day note digest"}]
-    if NEWS_ENABLED:
+    if FEATURE_NEWS_ENABLED:
         commands.extend(
             [
                 {"command": "news_latest", "description": "Latest digest (3 days)"},
@@ -3021,6 +3553,8 @@ def set_telegram_commands() -> None:
                 {"command": "news_help", "description": "News command help"},
             ]
         )
+    if FEATURE_TRANSCRIBE_ENABLED:
+        commands.append({"command": "transcribe", "description": "Transcribe url/audio to markdown"})
     commands.append({"command": "status", "description": "Bot health status"})
     try:
         resp = requests.post(
@@ -3040,7 +3574,11 @@ def send_message_sync(chat_id: str, text: str, parse_mode: str | None = None) ->
     resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     if resp.status_code >= 300 and parse_mode:
         resp = requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=10)
-    print(f"sendMessage status={resp.status_code} body={resp.text}")
+    try:
+        data = resp.json() if resp.content else {}
+    except Exception:
+        data = {}
+    print(f"sendMessage status={resp.status_code} ok={bool(data.get('ok'))}")
 
 
 def _resolve_ai_model_name() -> str:
@@ -3083,22 +3621,8 @@ def build_status_report() -> str:
     now = datetime.now(tz=get_local_tz())
     day = now.strftime("%Y-%m-%d")
     start_3d = (now - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
-    news_24h = 0
     notes_3d = 0
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            row = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM news_clusters
-                WHERE canonical_published_at IS NOT NULL
-                  AND canonical_published_at >= ?
-                """,
-                ((now - timedelta(hours=24)).isoformat(),),
-            ).fetchone()
-            news_24h = int(row[0] if row else 0)
-    except Exception:
-        news_24h = -1
+    news_24h = 0
 
     try:
         for d in range(3):
@@ -3108,23 +3632,41 @@ def build_status_report() -> str:
     except Exception:
         notes_3d = -1
 
+    if FEATURE_NEWS_ENABLED:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM news_clusters
+                    WHERE canonical_published_at IS NOT NULL
+                      AND canonical_published_at >= ?
+                    """,
+                    ((now - timedelta(hours=24)).isoformat(),),
+                ).fetchone()
+                news_24h = int(row[0] if row else 0)
+        except Exception:
+            news_24h = -1
+
     lines = [
         f"status time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
         f"ai summary: {'on' if AI_SUMMARY_ENABLED else 'off'}",
         f"ai provider/model: {AI_SUMMARY_PROVIDER}/{_resolve_ai_model_name()}",
         f"ollama health: {_ollama_health()}",
         f"db path exists: {'yes' if DB_PATH.exists() else 'no'}",
-        f"news clusters (24h): {news_24h}",
+    ]
+    if FEATURE_NEWS_ENABLED:
+        lines.append(f"news clusters (24h): {news_24h}")
+    lines.extend([
         f"note markdown files (3d): {notes_3d}",
         f"dropbox sync: {'on' if DROPBOX_SYNC_ENABLED else 'off'} ({DROPBOX_SYNC_TIME} {DROPBOX_SYNC_TZ_NAME})",
-        f"news push: {'on' if NEWS_PUSH_ENABLED else 'off'} (interval={NEWS_FETCH_INTERVAL_MINUTES}m)",
         f"today: {day}",
-    ]
+    ])
     return "\n".join(lines)
 
 
 def push_news_to_subscribers() -> None:
-    if not NEWS_PUSH_ENABLED:
+    if not FEATURE_NEWS_ENABLED or not NEWS_PUSH_ENABLED:
         return
     with sqlite3.connect(DB_PATH) as conn:
         subs = conn.execute(
@@ -3183,8 +3725,8 @@ def push_news_to_subscribers() -> None:
 
 
 def start_news_thread() -> None:
-    if not NEWS_ENABLED:
-        print("[INFO] News worker disabled by NEWS_ENABLED=0")
+    if not FEATURE_NEWS_ENABLED:
+        print("[INFO] News worker disabled by FEATURE_NEWS_ENABLED=0")
         return
 
     def loop():
@@ -3231,6 +3773,111 @@ def start_dropbox_sync_thread() -> None:
             except Exception as e:
                 print(f"[WARN] Dropbox sync worker error: {e}")
             time.sleep(60)
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
+async def handle_ocr_choice_callback(callback: dict) -> None:
+    callback_id = callback.get("id") or ""
+    data = (callback.get("data") or "").strip()
+    msg = callback.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    m = OCR_CHOICE_CALLBACK_RE.match(data)
+    if not m:
+        await answer_callback_query(callback_id, "無效操作", show_alert=False)
+        return
+    job_id, action = m.group(1), m.group(2).lower()
+
+    job = _get_ocr_choice_job(job_id)
+    if not job:
+        await answer_callback_query(callback_id, "任務不存在或已過期", show_alert=False)
+        return
+
+    _job_id, job_chat_id, prompt_message_id, image_path_raw, source_msg_id, expires_at, status, _ocr_done, _ocr_md = job
+    if str(chat_id or "") != str(job_chat_id):
+        await answer_callback_query(callback_id, "無效操作", show_alert=False)
+        return
+
+    now = datetime.now()
+    try:
+        expire_dt = datetime.fromisoformat(str(expires_at))
+    except Exception:
+        expire_dt = now
+
+    if status != "pending":
+        await answer_callback_query(callback_id, "此圖片已處理", show_alert=False)
+        return
+    if now >= expire_dt:
+        _update_ocr_choice_job_status(job_id, "expired", ocr_done=0, ocr_md_saved=0)
+        if prompt_message_id:
+            await edit_message(int(job_chat_id), int(prompt_message_id), "圖片已逾時，已自動只存圖。")
+        await answer_callback_query(callback_id, "已逾時", show_alert=False)
+        return
+
+    if action == "save":
+        _update_ocr_choice_job_status(job_id, "save", ocr_done=0, ocr_md_saved=0)
+        if prompt_message_id:
+            await edit_message(int(job_chat_id), int(prompt_message_id), "已存圖（未執行 OCR）。")
+        await answer_callback_query(callback_id, "已選擇只存圖", show_alert=False)
+        return
+
+    image_path = Path(image_path_raw)
+    if not image_path.exists():
+        _update_ocr_choice_job_status(job_id, "ocr_failed", ocr_done=0, ocr_md_saved=0)
+        if prompt_message_id:
+            await edit_message(int(job_chat_id), int(prompt_message_id), "OCR 失敗：找不到圖片檔案。")
+        await answer_callback_query(callback_id, "OCR 失敗", show_alert=False)
+        return
+
+    ocr_ok, md_saved = await asyncio.to_thread(
+        _run_ocr_on_image,
+        chat_id=int(job_chat_id),
+        msg_id=source_msg_id or "",
+        image_path=image_path,
+        msg_ts=datetime.now(),
+    )
+    if ocr_ok and md_saved:
+        _update_ocr_choice_job_status(job_id, "run", ocr_done=1, ocr_md_saved=1)
+        if prompt_message_id:
+            await edit_message(int(job_chat_id), int(prompt_message_id), "已完成 OCR 並存檔。")
+        await answer_callback_query(callback_id, "OCR 完成", show_alert=False)
+    else:
+        _update_ocr_choice_job_status(job_id, "ocr_failed", ocr_done=int(ocr_ok), ocr_md_saved=int(md_saved))
+        if prompt_message_id:
+            await edit_message(int(job_chat_id), int(prompt_message_id), "OCR 失敗，已保留圖片。")
+        await answer_callback_query(callback_id, "OCR 失敗", show_alert=False)
+
+
+def expire_ocr_choice_jobs_once() -> None:
+    for job_id, chat_id, prompt_message_id in _list_expired_ocr_choice_jobs():
+        _update_ocr_choice_job_status(job_id, "expired", ocr_done=0, ocr_md_saved=0)
+        if prompt_message_id:
+            try:
+                requests.post(
+                    f"{TELEGRAM_API}/editMessageText",
+                    json={
+                        "chat_id": int(chat_id),
+                        "message_id": int(prompt_message_id),
+                        "text": "圖片已逾時，已自動只存圖。",
+                    },
+                    timeout=10,
+                )
+            except Exception as e:
+                print(f"[WARN] OCR choice expire edit failed: {e}")
+
+
+def start_ocr_choice_expire_thread() -> None:
+    if not (FEATURE_OCR_ENABLED and FEATURE_OCR_CHOICE_ENABLED):
+        return
+
+    def loop():
+        while True:
+            try:
+                expire_ocr_choice_jobs_once()
+            except Exception as e:
+                print(f"[WARN] OCR choice expire worker error: {e}")
+            time.sleep(10)
 
     t = threading.Thread(target=loop, daemon=True)
     t.start()
@@ -3295,6 +3942,11 @@ def start_telegram_polling_thread() -> None:
 
 
 async def process_telegram_update(update: dict) -> None:
+    callback = update.get("callback_query") or {}
+    if callback:
+        await handle_ocr_choice_callback(callback)
+        return
+
     message = update.get("message") or update.get("edited_message") or {}
     if not message:
         return
@@ -3330,18 +3982,24 @@ async def process_telegram_update(update: dict) -> None:
     doc = message.get("document") or {}
     is_image_doc = doc.get("mime_type", "").startswith("image/")
     has_image = bool(message.get("photo") or is_image_doc)
+    has_audio_attachment = FEATURE_TRANSCRIBE_ENABLED and (_extract_audio_attachment(message) is not None)
 
     if (is_group or is_private) and chat_id and text:
         store_message("telegram", str(chat_id), chat_title or chat_type or "", user_id, user_name, text, msg_ts)
         append_markdown("telegram", chat_title or ("private" if is_private else str(chat_id)), user_name, text, msg_ts)
 
-    if is_private and chat_id and text and not has_image:
-        text_stripped = text.strip()
-        cmd_text = text_stripped
-        for shortcut, full_cmd in NEWS_SHORTCUTS.items():
-            if text_stripped.lower().startswith(shortcut):
-                cmd_text = full_cmd + text_stripped[len(shortcut) :]
-                break
+    if is_private and chat_id and has_audio_attachment and not has_image:
+        handled = await handle_transcribe_audio_message(chat_id, message)
+        if handled:
+            return
+
+    if is_private and chat_id and text and not has_image and not has_audio_attachment:
+        cmd_text = text.strip()
+
+        if await handle_transcribe_text_command(chat_id, cmd_text):
+            return
+        if await handle_transcribe_auto_url_message(chat_id, cmd_text):
+            return
 
         replies, parse_mode, disable_preview = route_user_text_command(cmd_text, str(chat_id))
         for reply in replies:
@@ -3354,7 +4012,7 @@ async def process_telegram_update(update: dict) -> None:
                 )
         return
 
-    if (is_private or is_group) and chat_id and has_image:
+    if FEATURE_OCR_ENABLED and (is_private or is_group) and chat_id and has_image:
         file_id = None
         file_unique_id = None
         msg_id = message.get("message_id")
@@ -3369,52 +4027,59 @@ async def process_telegram_update(update: dict) -> None:
             file_unique_id = doc.get("file_unique_id")
 
         if file_id and file_unique_id and msg_id:
-            file_info = telegram_get_file_info(file_id)
-            if file_info:
-                file_url, file_path = file_info
-                try:
-                    img_resp = requests.get(file_url, timeout=20)
-                    if img_resp.status_code != 200:
-                        raise RuntimeError(f"image download failed: {img_resp.status_code}")
+            try:
+                out_path, _img_bytes = await asyncio.to_thread(
+                    _save_telegram_image,
+                    file_id=file_id,
+                    file_unique_id=file_unique_id,
+                    chat_id=chat_id,
+                    msg_id=msg_id,
+                    msg_ts=msg_ts,
+                )
+            except Exception as e:
+                print(f"[WARN] Telegram image save failed: {e}")
+                if is_private:
+                    await send_message(chat_id, "Image save failed. Please retry.")
+                return
 
-                    day = (msg_ts or datetime.now()).strftime("%Y-%m-%d")
-                    img_dir = INBOX_IMAGES_DIR / day
-                    img_dir.mkdir(parents=True, exist_ok=True)
-                    suffix = Path(file_path).suffix or ".jpg"
-                    filename = f"{chat_id}_{msg_id}_{file_unique_id}{suffix}"
-                    out_path = img_dir / filename
-                    out_path.write_bytes(img_resp.content)
-
-                    ocr_ok = False
-                    md_saved = False
-                    ocr_text = ""
-                    try:
-                        ocr_text = extract_text_from_image(img_resp.content)
-                        if ocr_text.strip():
-                            ocr_ok = True
-                        else:
-                            ocr_text = "[OCR failed] no text detected"
-                    except Exception as e:
-                        ocr_text = f"[OCR failed] {e}"
-                        print(f"[WARN] OCR failed for {out_path}: {e}")
-                    try:
-                        append_ocr_markdown(str(chat_id), msg_id, out_path, ocr_text, msg_ts)
-                        md_saved = True
-                    except Exception as e:
-                        print(f"[WARN] OCR markdown save failed for {out_path}: {e}")
-
-                    is_ocr_success = ocr_ok and md_saved
-                    if is_private:
-                        if is_ocr_success:
-                            await send_message(chat_id, "img saved, ocr succeed")
-                        else:
-                            await send_message(chat_id, "img saved, but ocr failed")
-                    else:
-                        group_status = "ocr succeed" if is_ocr_success else "ocr failed"
-                        print(f"[INFO] Telegram group image saved: {out_path} ({group_status})")
+            if _is_ocr_choice_enabled_for_chat(is_private=is_private, is_group=is_group):
+                job_id = str(uuid.uuid4())
+                prompt_text = "圖片已儲存，請選擇是否進行 OCR。"
+                keyboard = _build_ocr_choice_keyboard(job_id)
+                prompt_message_id = await send_message(chat_id, prompt_text, reply_markup=keyboard)
+                if not prompt_message_id:
+                    await send_message(chat_id, "圖片已儲存（未執行 OCR）。")
                     return
-                except Exception as e:
-                    print(f"[WARN] Telegram image save failed: {e}")
+                created_job_id = await asyncio.to_thread(
+                    _create_ocr_choice_job,
+                    job_id=job_id,
+                    chat_id=chat_id,
+                    prompt_message_id=prompt_message_id,
+                    image_path=out_path,
+                    file_unique_id=file_unique_id,
+                    source_msg_id=msg_id,
+                )
+                if created_job_id != job_id:
+                    print(f"[WARN] OCR choice job id mismatch: generated={job_id} stored={created_job_id}")
+                return
+
+            ocr_ok, md_saved = await asyncio.to_thread(
+                _run_ocr_on_image,
+                chat_id=chat_id,
+                msg_id=msg_id,
+                image_path=out_path,
+                msg_ts=msg_ts,
+            )
+            is_ocr_success = ocr_ok and md_saved
+            if is_private:
+                if is_ocr_success:
+                    await send_message(chat_id, "img saved, ocr succeed")
+                else:
+                    await send_message(chat_id, "img saved, but ocr failed")
+            else:
+                group_status = "ocr succeed" if is_ocr_success else "ocr failed"
+                print(f"[INFO] Telegram group image saved: {out_path} ({group_status})")
+            return
 
         if is_private:
             await send_message(chat_id, "Image save failed. Please retry.")
@@ -3455,14 +4120,6 @@ def start_slack_socket_mode() -> None:
                 msg_ts = None
         ok, msg = process_slack_note(channel_id, user_id, user_name, text, msg_ts)
         respond(msg)
-
-    @slack_app.command("/summary_news")
-    def handle_slack_summary_news(ack, respond, command):
-        ack()
-        text = (command.get("text") or "").strip()
-        day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
-        parts = build_scoped_summary(day, "news")
-        respond("\n".join(parts))
 
     @slack_app.command("/summary_note")
     def handle_slack_summary_note(ack, respond, command):
@@ -3534,12 +4191,6 @@ def start_slack_socket_mode() -> None:
             parts = summary_weekly(day)
             say("\n".join(parts))
             return
-        if text.startswith("/summary_news"):
-            tokens = text.split()
-            day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
-            parts = build_scoped_summary(day, "news")
-            say("\n".join(parts))
-            return
         if text.startswith("/summary_note"):
             tokens = text.split()
             day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
@@ -3562,12 +4213,27 @@ def start_slack_socket_mode() -> None:
 
 
 def start_slack_thread() -> None:
+    if not FEATURE_SLACK_ENABLED:
+        print("[INFO] Slack worker disabled by FEATURE_SLACK_ENABLED=0")
+        return
     t = threading.Thread(target=start_slack_socket_mode, daemon=True)
     t.start()
 
 
-set_telegram_commands()
-start_news_thread()
-start_slack_thread()
-start_dropbox_sync_thread()
-start_telegram_polling_thread()
+def start_background_workers_once() -> None:
+    global _startup_done
+    with _startup_lock:
+        if _startup_done:
+            return
+        set_telegram_commands()
+        start_news_thread()
+        start_slack_thread()
+        start_dropbox_sync_thread()
+        start_ocr_choice_expire_thread()
+        start_telegram_polling_thread()
+        _startup_done = True
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    start_background_workers_once()
