@@ -27,6 +27,7 @@ from typing import Callable
 
 import whisper
 import yt_dlp
+import feedparser
 from slugify import slugify
 
 MAX_DURATION_SECONDS = int(os.getenv("TRANSCRIBE_MAX_DURATION_SECONDS", "10800"))
@@ -34,17 +35,52 @@ CHUNK_MINUTES = int(os.getenv("TRANSCRIBE_CHUNK_MINUTES", "25"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip() or "base"
 FFMPEG_LOCATION = os.getenv("FFMPEG_LOCATION", "").strip()
 
-ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".aac", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".opus"}
+ALLOWED_AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".aac",
+    ".wav",
+    ".flac",
+    ".m4a",
+    ".m4b",
+    ".ogg",
+    ".wma",
+    ".opus",
+    ".webm",
+    ".mp4",
+}
 
 YOUTUBE_RE = re.compile(
     r"^https?://((www|m)\.)?(youtube\.com/(watch\?v=[\w-]+|shorts/[\w-]+)|youtu\.be/[\w-]+)(?:[/?#].*)?$"
 )
 APPLE_RE = re.compile(r"^https?://podcasts\.apple\.com/.+/id(\d+)")
-DIRECT_AUDIO_RE = re.compile(r"\.(mp3|m4a|wav|ogg|aac|flac|wma|opus)(\?|$)", re.IGNORECASE)
+DIRECT_AUDIO_RE = re.compile(r"\.(mp3|m4a|m4b|wav|ogg|aac|flac|wma|opus|webm|mp4)(\?|$)", re.IGNORECASE)
 SPOTIFY_RE = re.compile(r"^https?://open\.spotify\.com/")
 
 _model = None
 _model_lock = threading.Lock()
+
+
+def _safe_str(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            text = _safe_str(item).strip()
+            if text:
+                return text
+        return ""
+    if isinstance(value, dict):
+        for key in ("href", "url", "link", "value"):
+            if key in value:
+                text = _safe_str(value.get(key)).strip()
+                if text:
+                    return text
+        return ""
+    return str(value)
 
 
 def _resolve_media_tool(tool: str) -> str:
@@ -120,22 +156,107 @@ def fetch_apple_podcast_episodes(url: str) -> list[dict]:
     if not data.get("results"):
         return []
 
+    query = urllib.parse.urlparse(url).query
+    query_i = _safe_str(urllib.parse.parse_qs(query).get("i", [""])[0]).strip()
+    target_track_id = int(query_i) if query_i.isdigit() else None
+    show_feed_url = ""
+    for entry in data["results"]:
+        if entry.get("wrapperType") == "podcast":
+            show_feed_url = _safe_str(entry.get("feedUrl")).strip()
+            break
+
+    def _pick_audio_url(entry: dict) -> str | None:
+        # Prefer fields that are usually direct media links.
+        for key in ("previewUrl", "enclosureUrl", "assetUrl", "episodeUrl"):
+            val = _safe_str(entry.get(key)).strip()
+            if val:
+                return val
+        return None
+
     out = []
     for entry in data["results"]:
         if entry.get("wrapperType") != "podcastEpisode":
             continue
-        episode_url = entry.get("episodeUrl")
+        episode_url = _pick_audio_url(entry)
         if not episode_url:
             continue
         out.append(
             {
                 "title": entry.get("trackName", "Unknown Episode"),
                 "audio_url": episode_url,
-                "show_name": entry.get("collectionName", ""),
-                "publish_date": entry.get("releaseDate", ""),
+                "show_name": _safe_str(entry.get("collectionName")),
+                "publish_date": _safe_str(entry.get("releaseDate")),
+                "track_id": entry.get("trackId"),
+                "feed_url": show_feed_url,
             }
         )
-    return out[:3]
+    if target_track_id is not None:
+        exact = []
+        for ep in out:
+            ep_track_raw = _safe_str(ep.get("track_id")).strip()
+            ep_track_id = int(ep_track_raw) if ep_track_raw.isdigit() else 0
+            if ep_track_id == target_track_id:
+                exact.append(ep)
+        if exact:
+            return exact
+    return out[:5]
+
+
+def _get_rss_enclosure_url(feed_url: str, episode_title: str = "", episode_page_url: str = "") -> str | None:
+    if not feed_url:
+        return None
+    try:
+        feed = feedparser.parse(feed_url)
+    except Exception:
+        return None
+
+    entries = list(getattr(feed, "entries", []) or [])
+    if not entries:
+        return None
+
+    norm_title = _safe_str(episode_title).strip().lower()
+    norm_page = _safe_str(episode_page_url).strip()
+
+    def _extract_entry_audio(entry) -> str | None:
+        for enc in getattr(entry, "enclosures", []) or []:
+            href = _safe_str(enc.get("href")).strip()
+            if href:
+                return href
+        for link in getattr(entry, "links", []) or []:
+            href = _safe_str(link.get("href")).strip()
+            rel = _safe_str(link.get("rel")).strip().lower()
+            typ = _safe_str(link.get("type")).strip().lower()
+            if href and (rel == "enclosure" or typ.startswith("audio/")):
+                return href
+        return None
+
+    if norm_page:
+        for entry in entries:
+            entry_link = _safe_str(getattr(entry, "link", "")).strip()
+            if entry_link and entry_link == norm_page:
+                audio = _extract_entry_audio(entry)
+                if audio:
+                    return audio
+
+    if norm_title:
+        for entry in entries:
+            entry_title = _safe_str(getattr(entry, "title", "")).strip().lower()
+            if entry_title and entry_title == norm_title:
+                audio = _extract_entry_audio(entry)
+                if audio:
+                    return audio
+        for entry in entries:
+            entry_title = _safe_str(getattr(entry, "title", "")).strip().lower()
+            if entry_title and norm_title in entry_title:
+                audio = _extract_entry_audio(entry)
+                if audio:
+                    return audio
+
+    for entry in entries:
+        audio = _extract_entry_audio(entry)
+        if audio:
+            return audio
+    return None
 
 
 def cleanup_files(temp_dir: Path, job_id: str) -> None:
@@ -250,7 +371,7 @@ def transcribe_audio(
 
     if duration <= CHUNK_MINUTES * 60:
         result = model.transcribe(str(audio_path))
-        return (result.get("text") or "").strip()
+        return _safe_str(result.get("text")).strip()
 
     chunks = split_audio(audio_path, temp_dir, job_id)
     if on_status:
@@ -261,7 +382,7 @@ def transcribe_audio(
         if on_status:
             on_status(f"Transcribing segment {idx}/{len(chunks)}...")
         result = model.transcribe(str(chunk))
-        txt = (result.get("text") or "").strip()
+        txt = _safe_str(result.get("text")).strip()
         if txt:
             texts.append(txt)
     return " ".join(texts).strip()
@@ -373,8 +494,66 @@ def _pipeline_podcast(
     transcript_dir: Path,
     temp_dir: Path,
     job_id: str,
+    fallback_audio_urls: list[str] | None = None,
     on_status: Callable[[str], None] | None = None,
 ) -> tuple[str, Path]:
+    def _download_via_ytdlp(target_url: str, out_base: Path) -> Path:
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": str(out_base),
+            "quiet": True,
+            "no_warnings": True,
+            "retries": 3,
+            "fragment_retries": 3,
+            "noplaylist": True,
+        }
+        if FFMPEG_LOCATION:
+            ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([target_url])
+        files = sorted(temp_dir.glob(f"{job_id}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for f in files:
+            if f.is_file() and not str(f).endswith(".part") and f.suffix.lower() in ALLOWED_AUDIO_EXTENSIONS:
+                return f
+        raise FileNotFoundError("Failed to download audio via yt-dlp.")
+
+    def _looks_like_html(file_path: Path) -> bool:
+        try:
+            with file_path.open("rb") as fh:
+                head = fh.read(512).lower()
+            return b"<html" in head or b"<!doctype html" in head
+        except OSError:
+            return False
+
+    def _download_direct(target_url: str, out_path: Path) -> Path:
+        req = urllib.request.Request(target_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            with out_path.open("wb") as fh:
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+        return out_path
+
+    def _try_fallback_audio_urls() -> Path | None:
+        for idx, candidate in enumerate(fallback_audio_urls or [], start=1):
+            if not candidate or candidate == audio_url:
+                continue
+            ext_match2 = re.search(r"\.(mp3|m4a|m4b|wav|ogg|aac|flac|wma|opus|webm|mp4)", candidate, re.IGNORECASE)
+            ext2 = ext_match2.group(1).lower() if ext_match2 else "mp3"
+            candidate_file = temp_dir / f"{job_id}_fb{idx}.{ext2}"
+            try:
+                if on_status:
+                    on_status(f"Trying fallback audio source #{idx}...")
+                _download_direct(candidate, candidate_file)
+                if candidate_file.exists() and candidate_file.stat().st_size >= 1024:
+                    if not _looks_like_html(candidate_file) and get_audio_duration(candidate_file) > 0.1:
+                        return candidate_file
+            except Exception:
+                continue
+        return None
+
     try:
         if on_status:
             on_status(f"Downloading '{title}'...")
@@ -383,15 +562,8 @@ def _pipeline_podcast(
         ext = ext_match.group(1).lower() if ext_match else "mp3"
         audio_file = temp_dir / f"{job_id}.{ext}"
 
-        req = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                with audio_file.open("wb") as fh:
-                    while True:
-                        chunk = resp.read(8192)
-                        if not chunk:
-                            break
-                        fh.write(chunk)
+            _download_direct(audio_url, audio_file)
         except urllib.error.HTTPError as e:
             raise ValueError(f"Failed to download audio (HTTP {e.code}).") from e
 
@@ -399,6 +571,26 @@ def _pipeline_podcast(
             raise FileNotFoundError("Failed to download audio.")
         if audio_file.stat().st_size < 1024:
             raise ValueError("Downloaded audio file is too small.")
+        if _looks_like_html(audio_file):
+            if on_status:
+                on_status("Direct link is a webpage, trying RSS/fallback sources...")
+            fallback_file = _try_fallback_audio_urls()
+            if fallback_file is not None:
+                audio_file = fallback_file
+            else:
+                if on_status:
+                    on_status("Fallback sources failed, retrying with yt-dlp...")
+                audio_file = _download_via_ytdlp(source_url, temp_dir / job_id)
+        elif get_audio_duration(audio_file) <= 0.1:
+            if on_status:
+                on_status("Direct audio probe failed, trying RSS/fallback sources...")
+            fallback_file = _try_fallback_audio_urls()
+            if fallback_file is not None:
+                audio_file = fallback_file
+            else:
+                if on_status:
+                    on_status("Fallback sources failed, retrying with yt-dlp...")
+                audio_file = _download_via_ytdlp(source_url, temp_dir / job_id)
 
         normalized = normalize_audio(audio_file, temp_dir, job_id)
         if on_status:
@@ -433,6 +625,12 @@ def transcribe_url_to_markdown(
         title = episode["title"]
         if episode.get("show_name"):
             title = f"{episode['show_name']} - {episode['title']}"
+        rss_audio_url = _get_rss_enclosure_url(
+            _safe_str(episode.get("feed_url")).strip(),
+            episode_title=episode.get("title", ""),
+            episode_page_url=episode.get("audio_url", ""),
+        )
+        fallback_audio_urls = [u for u in [rss_audio_url] if u]
         return _pipeline_podcast(
             episode["audio_url"],
             title,
@@ -441,6 +639,7 @@ def transcribe_url_to_markdown(
             transcript_dir=transcript_dir,
             temp_dir=temp_dir,
             job_id=job_id,
+            fallback_audio_urls=fallback_audio_urls,
             on_status=on_status,
         )
 
@@ -477,6 +676,7 @@ def transcribe_upload_to_markdown(
         if on_status:
             on_status(f"Transcribing '{original_filename}'...")
         text = transcribe_audio(normalized, temp_dir, job_id, on_status=on_status)
+        text = _safe_str(text)
         if not text:
             raise ValueError("Transcription produced no text.")
 

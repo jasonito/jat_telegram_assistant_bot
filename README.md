@@ -64,6 +64,51 @@ Notes:
 - `start.ps1` also uses this constraints file automatically when it installs dependencies.
 - Ollama is not installed by `pip install -r requirements.txt`; it must be installed as a system CLI.
 
+## Required Tools Checklist
+
+These are required/optional system tools for this project on Windows:
+
+- Required: Python 3.11 (`py -0p`)
+- Required for transcription: `ffmpeg` + `ffprobe`
+- Optional (AI summary with local model): Ollama CLI/service
+
+Quick verification:
+
+```powershell
+python --version
+ffmpeg -version
+ffprobe -version
+```
+
+If `ffmpeg`/`ffprobe` are not in PATH, set `FFMPEG_LOCATION` in your env file to the ffmpeg `bin` folder.
+After code changes, always restart bot processes:
+
+```powershell
+.\stop-both.ps1
+.\start-both.ps1
+```
+
+## Transcription Troubleshooting (Apple Podcasts)
+
+If Apple Podcasts transcription fails, check in this order:
+
+1. Confirm bot is running latest code (restart with `stop-both/start-both`).
+2. Confirm `yt-dlp` in `.venv` is latest:
+
+```powershell
+python -m pip install -U yt-dlp
+```
+
+3. Confirm `ffmpeg` and `ffprobe` are available.
+4. Retry the same URL. Current fallback order is:
+- direct audio URL from Apple metadata
+- RSS `enclosure` audio URL
+- `yt-dlp` as last fallback
+
+Known transient error:
+- `ERROR: [ApplePodcasts] ... Unable to extract server data`
+- This is from upstream Apple page parsing in `yt-dlp`; bot now tries RSS/direct sources first, but if all sources fail, retry later or test a different episode URL.
+
 ## Deployment Docs
 
 - Server deployment (24/7): `docs/DEPLOY_SERVER.md`
