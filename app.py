@@ -21,6 +21,7 @@ from threading import Event
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import requests
+import httpx
 from dotenv import load_dotenv
 import feedparser
 from rapidfuzz import fuzz
@@ -154,7 +155,7 @@ try:
 except ZoneInfoNotFoundError:
     # Fallback for Windows without tzdata installed.
     NEWS_TZ = timezone(timedelta(hours=8))
-    print("[WARN] tzdata not found; falling back to fixed UTC+08:00")
+    logger.warning("tzdata not found; falling back to fixed UTC+08:00")
 
 app = FastAPI()
 _vision_client = None
@@ -337,7 +338,8 @@ def sort_downloads() -> str:
         try:
             shutil.move(str(item), str(dest_path))
             moved += 1
-        except Exception:
+        except (OSError, IOError, PermissionError) as e:
+            logger.error(f"Failed to move {item.name}: {e}")
             continue
 
     return f"Sorted {moved} file(s) into {sorted_root}."
@@ -3562,9 +3564,13 @@ def set_telegram_commands() -> None:
             json={"commands": commands},
             timeout=10,
         )
-        print(f"setMyCommands status={resp.status_code} body={resp.text}")
-    except Exception as e:
-        print(f"setMyCommands error: {e}")
+        logger.info(f"setMyCommands status={resp.status_code}")
+        if resp.status_code != 200:
+            logger.error(f"setMyCommands failed: {resp.text}")
+    except requests.Timeout as e:
+        logger.error(f"setMyCommands timeout: {e}")
+    except requests.RequestException as e:
+        logger.error(f"setMyCommands request error: {e}")
 
 
 def send_message_sync(chat_id: str, text: str, parse_mode: str | None = None) -> None:
@@ -3686,7 +3692,8 @@ def push_news_to_subscribers() -> None:
                 last_dt = datetime.fromisoformat(last_sent_at)
                 if last_dt < datetime.fromisoformat(cutoff_iso):
                     effective_last = cutoff_iso
-            except Exception:
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Invalid last_sent_at for chat_id={chat_id}: {last_sent_at}, error: {e}")
                 effective_last = cutoff_iso
         with sqlite3.connect(DB_PATH) as conn:
             if effective_last:
@@ -3735,11 +3742,12 @@ def start_news_thread() -> None:
                 fetch_and_store_news()
                 push_news_to_subscribers()
             except Exception as e:
-                print(f"news worker error: {e}")
+                logger.exception(f"News worker error: {e}")
             time.sleep(max(1, NEWS_FETCH_INTERVAL_MINUTES) * 60)
 
     t = threading.Thread(target=loop, daemon=True)
     t.start()
+    logger.info("News worker thread started")
 
 
 def start_dropbox_sync_thread() -> None:
@@ -3884,24 +3892,36 @@ def start_ocr_choice_expire_thread() -> None:
 
 
 def telegram_get_file_info(file_id: str) -> tuple[str, str] | None:
+    """Get file URL from Telegram file_id."""
     try:
         resp = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=10)
         if resp.status_code != 200:
+            logger.warning(f"getFile failed with status={resp.status_code} for file_id={file_id}")
             return None
         data = resp.json()
         if not data.get("ok"):
+            logger.warning(f"getFile returned ok=false for file_id={file_id}")
             return None
         file_path = data.get("result", {}).get("file_path")
         if not file_path:
+            logger.warning(f"getFile returned no file_path for file_id={file_id}")
             return None
         file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
         return file_url, file_path
-    except Exception:
+    except requests.Timeout as e:
+        logger.error(f"getFile timeout for file_id={file_id}: {e}")
+        return None
+    except requests.RequestException as e:
+        logger.error(f"getFile request error for file_id={file_id}: {e}")
+        return None
+    except (ValueError, KeyError) as e:
+        logger.error(f"getFile JSON parsing error for file_id={file_id}: {e}")
         return None
 
 
 def telegram_polling_loop() -> None:
-    print("[INFO] Telegram long polling enabled.")
+    """Run Telegram long polling loop (for environments without webhook support)."""
+    logger.info("Telegram long polling enabled")
     delete_telegram_webhook(drop_pending=False)
     offset = None
     while True:
@@ -3915,10 +3935,12 @@ def telegram_polling_loop() -> None:
                 timeout=30,
             )
             if resp.status_code != 200:
+                logger.warning(f"getUpdates failed with status={resp.status_code}")
                 time.sleep(2)
                 continue
             data = resp.json()
             if not data.get("ok"):
+                logger.warning("getUpdates returned ok=false")
                 time.sleep(2)
                 continue
             for update in data.get("result", []):
@@ -3930,7 +3952,7 @@ def telegram_polling_loop() -> None:
                 except Exception as e:
                     print(f"[WARN] telegram update process error: {e}")
         except Exception as e:
-            print(f"[ERROR] Telegram polling error: {e}")
+            logger.exception(f"Telegram polling unexpected error: {e}")
             time.sleep(2)
 
 
@@ -4094,9 +4116,12 @@ async def telegram_webhook(request: Request):
 
 
 def start_slack_socket_mode() -> None:
+    """Start Slack Socket Mode handler for direct messages."""
     if not (SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_USER_ID):
-        print("Slack tokens/user not set; skipping Slack Socket Mode.")
+        logger.info("Slack tokens/user not set; skipping Slack Socket Mode")
         return
+
+    logger.info("Starting Slack Socket Mode")
 
     slack_app = SlackApp(token=SLACK_BOT_TOKEN)
     if SLACK_DEBUG:
@@ -4172,7 +4197,8 @@ def start_slack_socket_mode() -> None:
         if event.get("ts"):
             try:
                 msg_ts = datetime.fromtimestamp(float(event.get("ts")))
-            except Exception:
+            except (ValueError, TypeError, OSError) as e:
+                logger.warning(f"Failed to parse Slack message timestamp: {event.get('ts')}, error: {e}")
                 msg_ts = None
 
         # DM text commands fallback (when slash commands are not configured)
