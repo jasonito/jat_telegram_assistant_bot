@@ -1,3 +1,10 @@
+param(
+  [switch]$HealthCheck,
+  [string]$EnvFile = ".env",
+  [int]$Port = 8000,
+  [switch]$ShowWindow
+)
+
  $ErrorActionPreference = 'Stop'
 
   function Write-Info($msg) {
@@ -6,6 +13,10 @@
 
   function Write-Err($msg) {
     Write-Host "[ERROR] $msg" -ForegroundColor Red
+  }
+
+  function Write-Warn($msg) {
+    Write-Host "[WARN] $msg" -ForegroundColor Yellow
   }
 
   function Get-EnvValueFromFile($path, $key) {
@@ -44,6 +55,39 @@
     }
   }
 
+  function Import-EnvFile($path) {
+    if (-not (Test-Path -Path $path)) {
+      throw "Env file not found: $path"
+    }
+
+    $lines = Get-Content -Path $path -ErrorAction Stop
+    foreach ($line in $lines) {
+      $trim = $line.Trim()
+      if ($trim.Length -eq 0) { continue }
+      if ($trim.StartsWith('#')) { continue }
+
+      $parts = $trim -split '=', 2
+      if ($parts.Count -lt 2) { continue }
+
+      $k = $parts[0].Trim()
+      if (-not $k) { continue }
+
+      $v = $parts[1].Trim()
+      if ($v.StartsWith('"') -and $v.EndsWith('"') -and $v.Length -ge 2) {
+        $v = $v.Substring(1, $v.Length - 2)
+      } elseif ($v.StartsWith("'") -and $v.EndsWith("'") -and $v.Length -ge 2) {
+        $v = $v.Substring(1, $v.Length - 2)
+      }
+      Set-Item -Path "Env:$k" -Value $v
+    }
+  }
+
+  function Is-Truthy($value) {
+    if ($null -eq $value) { return $false }
+    $v = $value.ToString().Trim().ToLower()
+    return $v -in @('1', 'true', 'yes')
+  }
+
   try {
     Ensure-Command 'python'
 
@@ -59,11 +103,20 @@
       throw "Virtualenv creation failed. Expected: $venvPython"
     }
 
-    $envFile = Join-Path $PSScriptRoot '.env'
+    if ([System.IO.Path]::IsPathRooted($EnvFile)) {
+      $envFile = $EnvFile
+    } else {
+      $envFile = Join-Path $PSScriptRoot $EnvFile
+    }
+    Import-EnvFile -path $envFile
     $token = Get-EnvValueFromFile -path $envFile -key 'TELEGRAM_BOT_TOKEN'
+    $appModule = Get-EnvValueFromFile -path $envFile -key 'APP_MODULE'
+    if (-not $appModule) {
+      $appModule = 'app'
+    }
 
     if (-not $token) {
-      throw 'TELEGRAM_BOT_TOKEN not found in .env'
+      throw "TELEGRAM_BOT_TOKEN not found in $envFile"
     }
 
     $tokenLen = $token.Length
@@ -75,7 +128,7 @@
     $enableLongPolling = if ($env:TELEGRAM_LONG_POLLING -ne $null) { $env:TELEGRAM_LONG_POLLING } else { '0' }
     if ($enableLongPolling -ne '0') {
       Write-Info 'TELEGRAM_LONG_POLLING=1, using getUpdates (no ngrok/webhook).'
-      Write-Info 'Polling forwards updates to http://127.0.0.1:8000/telegram by default.'
+      Write-Info 'Polling forwards updates to TELEGRAM_LOCAL_WEBHOOK_URL (default: http://127.0.0.1:8000/telegram).'
       $enableNgrok = '0'
       $enableWebhook = '0'
     }
@@ -88,76 +141,201 @@
       throw "requirements.txt not found: $requirements"
     }
 
-    Write-Info 'Installing Python dependencies...'
-    & $pythonExe -m pip install -r $requirements
+    $requirementsHash = (Get-FileHash -Path $requirements -Algorithm SHA256).Hash
+    $requirementsStamp = Join-Path $venvDir 'requirements.sha256'
+    $installedHash = if (Test-Path -Path $requirementsStamp) {
+      (Get-Content -Path $requirementsStamp -Raw).Trim()
+    } else {
+      ''
+    }
+    $needsInstall = ($installedHash -ne $requirementsHash)
+
+    if ($needsInstall) {
+      $constraints = Join-Path $PSScriptRoot 'constraints.txt'
+      if (Test-Path -Path $constraints) {
+        Write-Info 'Installing Python dependencies (with constraints)...'
+        & $pythonExe -m pip install -r $requirements -c $constraints
+      } else {
+        Write-Info 'Installing Python dependencies...'
+        & $pythonExe -m pip install -r $requirements
+      }
+      if ($LASTEXITCODE -ne 0) {
+        throw "pip install failed with exit code $LASTEXITCODE"
+      }
+      Set-Content -Path $requirementsStamp -Value $requirementsHash -NoNewline
+    } else {
+      Write-Info 'Dependencies unchanged, skipping pip install.'
+    }
+
+    if ($HealthCheck) {
+      Write-Info 'Running health check (Google Vision + Dropbox)...'
+      $healthScript = Join-Path $PSScriptRoot 'healthcheck.py'
+      if (-not (Test-Path -Path $healthScript)) {
+        throw "healthcheck.py not found: $healthScript"
+      }
+      & $pythonExe $healthScript
+      if ($LASTEXITCODE -ne 0) {
+        throw "Health check failed with exit code $LASTEXITCODE"
+      }
+      Write-Info 'Health check passed.'
+      exit 0
+    }
+
+    $effectiveProvider = if ($env:AI_SUMMARY_PROVIDER) { $env:AI_SUMMARY_PROVIDER.ToLower().Trim() } else { '' }
+    $needsOllama = (Is-Truthy $env:AI_SUMMARY_ENABLED) -and ($effectiveProvider -in @('ollama', 'local'))
+    if ($needsOllama) {
+      Ensure-Command 'ollama'
+      $base = if ($env:OLLAMA_BASE_URL) { $env:OLLAMA_BASE_URL.TrimEnd('/') } else { 'http://127.0.0.1:11434' }
+      $tagsUrl = "$base/api/tags"
+      $ollamaReady = $false
+      try {
+        $null = Invoke-RestMethod -Method Get -Uri $tagsUrl -TimeoutSec 2
+        $ollamaReady = $true
+        Write-Info 'Ollama service already running.'
+      } catch {
+        Write-Info 'Starting Ollama service...'
+        if ($ShowWindow) {
+          Start-Process -FilePath 'ollama' -ArgumentList 'serve'
+        } else {
+          Start-Process -FilePath 'ollama' -ArgumentList 'serve' -WindowStyle Hidden
+        }
+      }
+
+      if (-not $ollamaReady) {
+        $deadlineOllama = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadlineOllama) {
+          try {
+            $null = Invoke-RestMethod -Method Get -Uri $tagsUrl -TimeoutSec 2
+            $ollamaReady = $true
+            break
+          } catch {
+            Start-Sleep -Seconds 1
+          }
+        }
+      }
+
+      if (-not $ollamaReady) {
+        throw "Ollama service did not become ready at $tagsUrl"
+      }
+      $modelName = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL.Trim() } else { 'qwen2.5:7b' }
+      if ($modelName) {
+        $tagsResp = Invoke-RestMethod -Method Get -Uri $tagsUrl -TimeoutSec 5
+        $modelExists = $false
+        if ($tagsResp -and $tagsResp.models) {
+          foreach ($m in $tagsResp.models) {
+            $tagName = ''
+            if ($m.name) {
+              $tagName = $m.name
+            } elseif ($m.model) {
+              $tagName = $m.model
+            }
+            if ($tagName -eq $modelName) {
+              $modelExists = $true
+              break
+            }
+          }
+        }
+        if (-not $modelExists) {
+          Write-Info "Ollama model not found locally, pulling: $modelName"
+          & ollama pull $modelName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to pull Ollama model: $modelName (exit code $LASTEXITCODE)"
+          }
+          Write-Info "Ollama model pull completed: $modelName"
+        }
+      }
+      Write-Info "Ollama ready: $base (model: $modelName)"
+    }
+
+    $fallbackToLongPolling = $false
 
     if ($enableNgrok -ne '0') {
       Ensure-Command 'ngrok'
+      Write-Info 'Starting ngrok...'
+      if ($ShowWindow) {
+        Start-Process -FilePath 'ngrok' -ArgumentList "http $Port"
+      } else {
+        Start-Process -FilePath 'ngrok' -ArgumentList "http $Port" -WindowStyle Hidden
+      }
+
+      if ($enableWebhook -ne '0') {
+        $deadline = (Get-Date).AddSeconds(30)
+        $publicUrl = $null
+
+        Write-Info 'Waiting for ngrok public URL...'
+        while ((Get-Date) -lt $deadline) {
+          try {
+            $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -Method Get -TimeoutSec 2
+            foreach ($t in $resp.tunnels) {
+              if ($t.public_url -and $t.public_url.StartsWith('https://')) {
+                $publicUrl = $t.public_url
+                break
+              }
+            }
+            if ($publicUrl) { break }
+          } catch {
+            Start-Sleep -Seconds 1
+            continue
+          }
+          Start-Sleep -Seconds 1
+        }
+
+        if (-not $publicUrl) {
+          Write-Warn 'Timeout waiting for ngrok public URL. Falling back to long polling.'
+          $fallbackToLongPolling = $true
+        } else {
+          Write-Info "ngrok URL: $publicUrl"
+          $webhookUrl = "$publicUrl/telegram"
+          try {
+            Write-Info 'Setting Telegram webhook...'
+            $setResp = Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$token/setWebhook" -Body @{ url = $webhookUrl } -TimeoutSec 10
+            if (-not $setResp.ok) {
+              throw "Telegram setWebhook failed: $($setResp | ConvertTo-Json -Depth 10)"
+            }
+
+            Write-Info 'Verifying Telegram webhook...'
+            $infoResp = Invoke-RestMethod -Method Get -Uri "https://api.telegram.org/bot$token/getWebhookInfo" -TimeoutSec 10
+            if (-not $infoResp.ok) {
+              throw "Telegram getWebhookInfo failed: $($infoResp | ConvertTo-Json -Depth 10)"
+            }
+
+            $resultUrl = $infoResp.result.url
+            if ($resultUrl -ne $webhookUrl) {
+              throw "Webhook mismatch. Expected: $webhookUrl, Got: $resultUrl"
+            }
+            Write-Info 'Webhook set and verified.'
+          } catch {
+            Write-Warn "Webhook setup failed: $($_.Exception.Message)"
+            Write-Warn 'Falling back to long polling.'
+            $fallbackToLongPolling = $true
+          }
+        }
+      } else {
+        Write-Info 'ENABLE_WEBHOOK=0, skipping webhook setup.'
+      }
+    } else {
+      Write-Info 'ENABLE_NGROK=0, skipping ngrok and webhook.'
+    }
+
+    if ($fallbackToLongPolling) {
+      $env:TELEGRAM_LONG_POLLING = '1'
+      Write-Info 'TELEGRAM_LONG_POLLING forced to 1 due to fallback.'
     }
 
     Write-Info 'Starting uvicorn...'
-    Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn','app:app','--host','0.0.0.0','--port','8000'
-
-    if ($enableNgrok -eq '0') {
-      Write-Info 'ENABLE_NGROK=0, skipping ngrok and webhook.'
-      exit 0
+    Write-Info "Using env file: $envFile"
+    Write-Info "App module: $appModule"
+    Write-Info "Starting on port: $Port"
+    if ($appModule.Contains(':')) {
+      $appTarget = $appModule
+    } else {
+      $appTarget = "$appModule`:app"
     }
-
-    Write-Info 'Starting ngrok...'
-    Start-Process -FilePath 'ngrok' -ArgumentList 'http 8000'
-
-    if ($enableWebhook -eq '0') {
-      Write-Info 'ENABLE_WEBHOOK=0, skipping webhook setup.'
-      exit 0
+    if ($ShowWindow) {
+      Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn',$appTarget,'--host','0.0.0.0','--port',"$Port"
+    } else {
+      Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn',$appTarget,'--host','0.0.0.0','--port',"$Port" -WindowStyle Hidden
     }
-
-    $deadline = (Get-Date).AddSeconds(30)
-    $publicUrl = $null
-
-    Write-Info 'Waiting for ngrok public URL...'
-    while ((Get-Date) -lt $deadline) {
-      try {
-        $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -Method Get -TimeoutSec 2
-        foreach ($t in $resp.tunnels) {
-          if ($t.public_url -and $t.public_url.StartsWith('https://')) {
-            $publicUrl = $t.public_url
-            break
-          }
-        }
-        if ($publicUrl) { break }
-      } catch {
-        Start-Sleep -Seconds 1
-        continue
-      }
-      Start-Sleep -Seconds 1
-    }
-
-    if (-not $publicUrl) {
-      throw 'Timeout waiting for ngrok public URL (check ngrok and 4040).'
-    }
-
-    Write-Info "ngrok URL: $publicUrl"
-
-    $webhookUrl = "$publicUrl/telegram"
-    Write-Info 'Setting Telegram webhook...'
-    $setResp = Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$token/setWebhook" -Body @{ url =
-  $webhookUrl } -TimeoutSec 10
-    if (-not $setResp.ok) {
-      throw "Telegram setWebhook failed: $($setResp | ConvertTo-Json -Depth 10)"
-    }
-
-    Write-Info 'Verifying Telegram webhook...'
-    $infoResp = Invoke-RestMethod -Method Get -Uri "https://api.telegram.org/bot$token/getWebhookInfo" -TimeoutSec 10
-    if (-not $infoResp.ok) {
-      throw "Telegram getWebhookInfo failed: $($infoResp | ConvertTo-Json -Depth 10)"
-    }
-
-    $resultUrl = $infoResp.result.url
-    if ($resultUrl -ne $webhookUrl) {
-      throw "Webhook mismatch. Expected: $webhookUrl, Got: $resultUrl"
-    }
-
-    Write-Info 'Webhook set and verified.'
   } catch {
     Write-Err $_.Exception.Message
     exit 1
