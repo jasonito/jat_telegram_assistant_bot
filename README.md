@@ -1,113 +1,16 @@
 # JAT Telegram Assistant Bot (PoC)
 
-## Setup (Windows, recommended)
-
-Use Python 3.11 for stable `openai-whisper` install on Windows.
-
-1. Install Python 3.11 and confirm it is available:
+## Setup
 
 ```powershell
-py -0p
-```
-
-2. Create a clean virtual environment with Python 3.11:
-
-```powershell
-cd C:\Users\KHUser\jat_telegram_assistant_bot
-Remove-Item -Recurse -Force .venv -ErrorAction SilentlyContinue
-py -3.11 -m venv .venv
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python --version
-```
-
-3. Install dependencies with constraints (important for whisper build deps):
-
-```powershell
-python -m pip install --upgrade "pip<26" "setuptools<81" wheel
-$env:PIP_CONSTRAINT="$PWD\constraints.txt"
 python -m pip install -r requirements.txt -c constraints.txt
 ```
 
-4. Install and verify `ffmpeg` (required by Whisper runtime):
-
-```powershell
-ffmpeg -version
-```
-
-5. Optional: Install Ollama (required only when `AI_SUMMARY_PROVIDER=ollama` or `local`):
-
-```powershell
-winget install Ollama.Ollama
-ollama --version
-ollama serve
-```
-
-If `winget` is not available, install manually:
-1. Open the official download page: https://ollama.com/download/windows
-2. Download and run the Windows installer.
-3. Restart PowerShell and verify:
-
-```powershell
-ollama --version
-ollama serve
-```
-
-In another terminal, verify service and pull a model:
-
-```powershell
-ollama list
-ollama pull qwen2.5:7b
-```
-
 Notes:
-- `constraints.txt` pins packaging/build tooling used during install.
+- `constraints.txt` pins packaging/build tooling used during install (currently includes `setuptools<81`).
 - `start.ps1` also uses this constraints file automatically when it installs dependencies.
-- Ollama is not installed by `pip install -r requirements.txt`; it must be installed as a system CLI.
-
-## Required Tools Checklist
-
-These are required/optional system tools for this project on Windows:
-
-- Required: Python 3.11 (`py -0p`)
-- Required for transcription: `ffmpeg` + `ffprobe`
-- Optional (AI summary with local model): Ollama CLI/service
-
-Quick verification:
-
-```powershell
-python --version
-ffmpeg -version
-ffprobe -version
-```
-
-If `ffmpeg`/`ffprobe` are not in PATH, set `FFMPEG_LOCATION` in your env file to the ffmpeg `bin` folder.
-After code changes, always restart bot processes:
-
-```powershell
-.\stop-both.ps1
-.\start-both.ps1
-```
-
-## Transcription Troubleshooting (Apple Podcasts)
-
-If Apple Podcasts transcription fails, check in this order:
-
-1. Confirm bot is running latest code (restart with `stop-both/start-both`).
-2. Confirm `yt-dlp` in `.venv` is latest:
-
-```powershell
-python -m pip install -U yt-dlp
-```
-
-3. Confirm `ffmpeg` and `ffprobe` are available.
-4. Retry the same URL. Current fallback order is:
-- direct audio URL from Apple metadata
-- RSS `enclosure` audio URL
-- `yt-dlp` as last fallback
-
-Known transient error:
-- `ERROR: [ApplePodcasts] ... Unable to extract server data`
-- This is from upstream Apple page parsing in `yt-dlp`; bot now tries RSS/direct sources first, but if all sources fail, retry later or test a different episode URL.
 
 ## Deployment Docs
 
@@ -118,32 +21,25 @@ Known transient error:
 
 ## Env
 
-For dual-bot startup (`start-both.ps1`), create two env files from dedicated templates:
-
-```powershell
-Copy-Item .env.main.example .env.main
-Copy-Item .env.chitchat.example .env.chitchat
-```
-
-Required minimum settings:
-- `.env.main`: set `TELEGRAM_BOT_TOKEN`, set `APP_MODULE=app_main`
-- `.env.chitchat`: set `TELEGRAM_BOT_TOKEN`, set `APP_MODULE=app_chitchat`
-- `.env.chitchat.example` intentionally excludes News/Slack config because chitchat does not use those features.
-
-Single-bot mode is also supported with one env file (for example `.env`, based on `.env.example`).
+Copy `.env.example` to `.env` and set your tokens.
 
 - `TELEGRAM_ALLOWED_GROUPS` comma-separated group titles to log
 - `DATA_DIR` location for SQLite + Markdown
 - `APP_MODULE` uvicorn module name (`app`, `app_main`, `app_chitchat`)
 - `TELEGRAM_LONG_POLLING` set `1` to enable getUpdates instead of webhook
 - `TELEGRAM_LOCAL_WEBHOOK_URL` local URL for polling to forward updates (default: `http://127.0.0.1:8000/telegram`)
+- `TELEGRAM_FILE_FETCH_RETRIES` retries for Telegram `getFile`/file download (default: `4`)
+- `TELEGRAM_FILE_FETCH_CONNECT_TIMEOUT` connect timeout seconds for Telegram file fetch (default: `5`)
+- `TELEGRAM_FILE_FETCH_READ_TIMEOUT` read timeout seconds for Telegram file fetch (default: `12`)
+- `TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS` base retry backoff seconds (default: `0.25`)
 
 Feature flags:
 - `FEATURE_NEWS_ENABLED` enable/disable news ingest + `/news` commands
 - `FEATURE_TRANSCRIBE_ENABLED` enable/disable `/transcribe` and audio transcription
 - `FEATURE_TRANSCRIBE_AUTO_URL` when set `1`, private chat plain URLs auto-trigger transcription
+- `TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS` progress heartbeat interval while transcription is running (default: `30`)
 - `FEATURE_OCR_ENABLED` enable/disable image OCR pipeline
-- `FEATURE_OCR_CHOICE_ENABLED` when set `1`, image OCR asks user to choose (`ÈÄ≤Ë°å OCR` or `Âè™Â≠òÂúñ`)
+- `FEATURE_OCR_CHOICE_ENABLED` when set `1`, image OCR asks user to choose (`?≤Ë? OCR` or `?™Â??ñ`)
 - `OCR_CHOICE_SCOPE` OCR choice scope (`private` recommended)
 - `OCR_CHOICE_TIMEOUT_SECONDS` choice timeout seconds before fallback to save-only (default: `60`)
 - `FEATURE_SLACK_ENABLED` enable/disable Slack worker
@@ -152,7 +48,6 @@ OCR (Google Vision):
 - `OCR_PROVIDER` set `google_vision`
 - `OCR_LANG_HINTS` OCR language hints (default: `zh-TW,en`)
 - `GOOGLE_APPLICATION_CREDENTIALS` full path to Google service-account JSON key
-- After downloading the service-account key (for example `vision.json`), place it in the project `gcp` folder and set `GOOGLE_APPLICATION_CREDENTIALS` to its absolute path, for example: `C:\Users\KHUser\jat_telegram_assistant_bot\gcp\vision.json`
 
 Dropbox sync:
 - `DROPBOX_ACCESS_TOKEN` API token (legacy/fallback mode)
@@ -168,74 +63,19 @@ Dropbox sync:
 - `DROPBOX_SYNC_TZ` sync timezone (default: `Asia/Taipei`)
 - `DROPBOX_SYNC_ON_STARTUP` set `1` to run one full backfill at startup
 
-Get `DROPBOX_REFRESH_TOKEN` (Windows CLI quick path):
+Notion (chitchat profile):
+- `NOTION_ENABLED` set `1` to enable Notion append for chitchat
+- `NOTION_TOKEN` Notion Internal Integration Secret (token), format like `ntn_...`
+- `NOTION_VERSION` Notion API version header (keep default unless you need migration)
+- `NOTION_CHATLOG_YEAR_PAGES_JSON` year->page_id map, e.g. `{"2026":"2dbf40303e778048974edcd4d534afd8"}`
+- `NOTION_CHATLOG_FALLBACK_PAGE_ID` fallback page id when year map has no match
+- `NOTION_CHATLOG_IMAGE_MODE` image sync mode; `link` or `embed` (`embed` inserts Notion image block directly)
+- `NOTION_CHATLOG_OCR_MODE` OCR sync mode; `optional` means include OCR summary when available
+- `NOTION_CHATLOG_INCLUDE_TIME` set `1` to prefix entries with `[HH:MM]`
 
-0. Dropbox Console prep:
-- Go to Dropbox Developer Console -> your App -> `Settings`.
-- Under `OAuth 2` -> `Redirect URIs`, keep exactly one URI:
-- `http://localhost:8000/dropbox/callback`
-- Use the exact same string in all later steps.
-
-1. Open this authorize URL in browser (replace `YOUR_APP_KEY`):
-
-```text
-https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&response_type=code&token_access_type=offline&redirect_uri=http://localhost:8000/dropbox/callback
-```
-
-- After approve, browser redirects to:
-- `http://localhost:8000/dropbox/callback?code=XXXX`
-- `ERR_CONNECTION_REFUSED` is expected; copy the full callback URL from address bar.
-
-2. Extract `code` from full callback URL (avoid copy pollution):
-
-```powershell
-$url = "http://localhost:8000/dropbox/callback?code=XXXXXXXX"
-$code = $url -replace '^.*code=', ''
-$code = $code -replace '&.*$', ''
-$code = $code.Trim()
-
-$code.Length
-```
-
-- `Length` should usually be 40+ chars.
-
-3. Exchange `code` for `refresh_token`:
-
-```powershell
-$appKey = "YOUR_APP_KEY"
-$appSecret = "YOUR_APP_SECRET"
-$redirect = "http://localhost:8000/dropbox/callback"
-
-$body = "code=$code&grant_type=authorization_code&client_id=$appKey&client_secret=$appSecret&redirect_uri=$([uri]::EscapeDataString($redirect))"
-
-Invoke-RestMethod -Method Post `
-  -Uri "https://api.dropboxapi.com/oauth2/token" `
-  -ContentType "application/x-www-form-urlencoded" `
-  -Body $body
-```
-
-- Success JSON includes `access_token`, `refresh_token`, `expires_in`.
-- Save `refresh_token` into `.env.main` / `.env.chitchat` as needed.
-
-4. Use `refresh_token` to get a new `access_token` later:
-
-```powershell
-$refresh = "YOUR_REFRESH_TOKEN"
-$appKey = "YOUR_APP_KEY"
-$appSecret = "YOUR_APP_SECRET"
-
-$body = "grant_type=refresh_token&refresh_token=$refresh&client_id=$appKey&client_secret=$appSecret"
-
-Invoke-RestMethod -Method Post `
-  -Uri "https://api.dropboxapi.com/oauth2/token" `
-  -ContentType "application/x-www-form-urlencoded" `
-  -Body $body
-```
-
-Common errors:
-- `redirect_uri mismatch`: `redirect_uri` in request is not exactly the same as Dropbox Console setting.
-- `code expired`: authorization code is one-time and short-lived; regenerate and retry immediately.
-- Bad copy/paste code: always extract from full callback URL using the PowerShell snippet above.
+Notes:
+- `page_id` should be pure Notion page id (32 hex chars or UUID style), do not prefix with year text.
+- Share the target parent/page with your integration in Notion (`Share` -> invite integration), or writes will fail with 403.
 
 Slack (Socket Mode):
 - `SLACK_BOT_TOKEN` (xoxb-...)
@@ -268,12 +108,6 @@ Recommended startup script:
 .\start.ps1
 ```
 
-Run both bots (requires `.env.main` and `.env.chitchat`):
-
-```powershell
-.\start-both.ps1
-```
-
 `start.ps1` behavior:
 - Creates `.venv` automatically if missing.
 - Imports env vars from `-EnvFile`.
@@ -286,6 +120,12 @@ Run with specific env file and port:
 ```powershell
 .\start.ps1 -EnvFile .env.main -Port 8000
 .\start.ps1 -EnvFile .env.chitchat -Port 8001
+```
+
+Start both bots:
+
+```powershell
+.\start-both.ps1
 ```
 
 Stop both bots:
@@ -338,6 +178,7 @@ sort downloads
 ```
 
 `/news` and `/transcribe` availability depends on `FEATURE_NEWS_ENABLED` and `FEATURE_TRANSCRIBE_ENABLED`.
+Transcription flow: bot sends `Â∑≤Ê??üÁ??Ñ` right after transcript is saved, then sends AI summary afterward (if enabled).
 
 Group logging (no reply):
 - Messages in allowed groups are stored in SQLite and appended to Markdown files.
@@ -349,9 +190,10 @@ Slack DM logging (no reply):
 - Run uvicorn, then send a DM to your bot.
 
 Image OCR and cloud sync:
-- Telegram private image uploads are saved to `DATA_DIR\inbox\images\YYYY-MM-DD\`.
-- If OCR choice is enabled, bot asks per image: `ÈÄ≤Ë°å OCR` or `Âè™Â≠òÂúñ`; timeout defaults to save-only.
-- OCR output is appended to `DATA_DIR\notes\ocr\YYYY-MM-DD_ocr.md`.
-- A Dropbox worker syncs local `notes` and `inbox/images` to:
-- `/read/notes`
-- `/read/images`
+- Telegram private image uploads are saved to `DATA_DIR\\images\YYYY-MM-DD\`.
+- If OCR choice is enabled, bot asks per image: `?≤Ë? OCR` or `?™Â??ñ`; timeout defaults to save-only.
+- OCR output is appended to `DATA_DIR\\notes\\telegram\\YYYY-MM-DD_telegram.md`.
+- A Dropbox worker syncs local `notes` and `images` to:
+- `/read & chat/read/notes`
+- `/read & chat/read/images`
+
