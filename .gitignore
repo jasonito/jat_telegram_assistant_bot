@@ -5,6 +5,7 @@ __pycache__
 .env.chitchat
 .venv/
 keys/
+gcp/*.json
 data/
 chitchat/
 youtubeconverter/downloads/

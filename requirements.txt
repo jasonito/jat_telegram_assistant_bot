@@ -1,8 +1,11 @@
+# Note: Ollama is a system dependency (CLI), not a pip package.
+# Install separately if using AI_SUMMARY_PROVIDER=ollama/local.
 setuptools<81
 fastapi
 uvicorn
 python-dotenv
 requests
+httpx
 slack_bolt
 feedparser
 rapidfuzz
