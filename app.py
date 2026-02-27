@@ -1568,6 +1568,78 @@ def sync_file_to_dropbox(local_path: Path, remote_path: str) -> None:
     _dropbox_call_with_retry(_upload)
 
 
+def _dropbox_download_file_bytes(remote_path: str) -> bytes | None:
+    normalized = normalize_dropbox_path(remote_path)
+
+    def _download(dbx):
+        return dbx.files_download(normalized)[1].content
+
+    try:
+        return _dropbox_call_with_retry(_download)
+    except Exception as e:
+        msg = str(e).lower()
+        if "not_found" in msg or "path/not_found" in msg:
+            return None
+        raise
+
+
+def _split_markdown_blocks(text: str) -> list[str]:
+    if not text:
+        return []
+    chunks = re.split(r"(?:\r?\n){2,}", text.replace("\r\n", "\n").strip())
+    return [c.strip() for c in chunks if c and c.strip()]
+
+
+def merge_markdown_content(remote_text: str | None, local_text: str) -> str:
+    remote_text = (remote_text or "").replace("\r\n", "\n")
+    local_text = (local_text or "").replace("\r\n", "\n")
+
+    remote_blocks = _split_markdown_blocks(remote_text)
+    local_blocks = _split_markdown_blocks(local_text)
+
+    heading = ""
+    if local_blocks and local_blocks[0].startswith("# "):
+        heading = local_blocks.pop(0)
+    elif remote_blocks and remote_blocks[0].startswith("# "):
+        heading = remote_blocks.pop(0)
+
+    merged_blocks: list[str] = []
+    seen: set[str] = set()
+    for block in remote_blocks + local_blocks:
+        key = hashlib.sha1(block.encode("utf-8")).hexdigest()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged_blocks.append(block)
+
+    out_parts: list[str] = []
+    if heading:
+        out_parts.append(heading.strip())
+    if merged_blocks:
+        if out_parts:
+            out_parts.append("")
+        out_parts.append("\n\n".join(merged_blocks).strip())
+    merged = "\n".join(out_parts).strip()
+    return (merged + "\n") if merged else ""
+
+
+def sync_markdown_with_merge(local_path: Path, remote_path: str) -> tuple[bool, bool]:
+    local_text = local_path.read_text(encoding="utf-8")
+    remote_bytes = _dropbox_download_file_bytes(remote_path)
+    remote_text = remote_bytes.decode("utf-8", errors="replace") if remote_bytes is not None else None
+
+    merged_text = merge_markdown_content(remote_text, local_text)
+    local_changed = merged_text != local_text
+    remote_changed = (remote_text or "") != merged_text
+
+    if local_changed:
+        local_path.write_text(merged_text, encoding="utf-8")
+    if remote_changed:
+        sync_file_to_dropbox(local_path, remote_path)
+
+    return local_changed, remote_changed
+
+
 def _dropbox_get_or_create_shared_link(remote_path: str) -> str | None:
     if dropbox is None:
         return None
@@ -2076,12 +2148,24 @@ def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
         stats["scanned"] += 1
         local_key = local_path.relative_to(DATA_DIR).as_posix()
         try:
+            remote_path = f"{root}/{category}/{rel}".replace("//", "/")
+            is_markdown_note = category == "notes" and local_path.suffix.lower() in {".md", ".markdown"}
+
+            if is_markdown_note:
+                _local_changed, remote_changed = sync_markdown_with_merge(local_path, remote_path)
+                fingerprint = compute_file_fingerprint(local_path)
+                upsert_sync_state("dropbox", local_key, fingerprint)
+                if remote_changed:
+                    stats["uploaded"] += 1
+                else:
+                    stats["skipped"] += 1
+                continue
+
             fingerprint = compute_file_fingerprint(local_path)
             last_fp = get_sync_state("dropbox", local_key)
             if not full_scan and last_fp == fingerprint:
                 stats["skipped"] += 1
                 continue
-            remote_path = f"{root}/{category}/{rel}".replace("//", "/")
             sync_file_to_dropbox(local_path, remote_path)
             upsert_sync_state("dropbox", local_key, fingerprint)
             stats["uploaded"] += 1
@@ -4739,7 +4823,16 @@ async def process_telegram_update(update: dict) -> None:
     has_image = bool(message.get("photo") or is_image_doc)
     has_audio_attachment = FEATURE_TRANSCRIBE_ENABLED and (_extract_audio_attachment(message) is not None)
 
-    if (is_group or is_private) and chat_id and text:
+    cmd_text = text.strip()
+    lower_text = cmd_text.lower()
+    is_local_control_text = (
+        lower_text.startswith("open ")
+        or lower_text in {"notepad", "open notepad", "sort downloads", "help", "/help"}
+    )
+    is_slash_command = cmd_text.startswith("/")
+    should_store_text = bool(cmd_text) and not is_slash_command and not is_local_control_text
+
+    if (is_group or is_private) and chat_id and should_store_text:
         store_message("telegram", str(chat_id), chat_title or chat_type or "", user_id, user_name, text, msg_ts)
         append_markdown("telegram", chat_title or ("private" if is_private else str(chat_id)), user_name, text, msg_ts)
         # Caption text for image messages is synced through notion_append_chitchat_image;
@@ -4754,13 +4847,6 @@ async def process_telegram_update(update: dict) -> None:
 
     if is_private and chat_id and text and not has_image and not has_audio_attachment:
         try:
-            cmd_text = text.strip()
-            lower = cmd_text.lower()
-            is_local_control_text = (
-                lower.startswith("open ")
-                or lower in {"notepad", "open notepad", "sort downloads", "help", "/help"}
-            )
-
             if await handle_transcribe_text_command(chat_id, cmd_text, message_ts=msg_ts):
                 return
             if await handle_transcribe_auto_url_message(chat_id, cmd_text, message_ts=msg_ts):
