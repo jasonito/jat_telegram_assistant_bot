@@ -61,6 +61,12 @@ TELEGRAM_LONG_POLLING = os.getenv("TELEGRAM_LONG_POLLING", "0").lower() in {
 TELEGRAM_LOCAL_WEBHOOK_URL = os.getenv(
     "TELEGRAM_LOCAL_WEBHOOK_URL", "http://127.0.0.1:8000/telegram"
 )
+TELEGRAM_FILE_FETCH_RETRIES = max(1, int(os.getenv("TELEGRAM_FILE_FETCH_RETRIES", "4")))
+TELEGRAM_FILE_FETCH_CONNECT_TIMEOUT = max(1, int(os.getenv("TELEGRAM_FILE_FETCH_CONNECT_TIMEOUT", "5")))
+TELEGRAM_FILE_FETCH_READ_TIMEOUT = max(3, int(os.getenv("TELEGRAM_FILE_FETCH_READ_TIMEOUT", "12")))
+TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS = max(
+    0.1, float(os.getenv("TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS", "0.25"))
+)
 
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "read")).resolve()
 DB_PATH = DATA_DIR / "messages.sqlite"
@@ -427,6 +433,20 @@ async def edit_message(chat_id: int, message_id: int, text: str) -> bool:
     return await asyncio.to_thread(_edit)
 
 
+async def clear_message_inline_keyboard(chat_id: int, message_id: int) -> bool:
+    def _clear() -> bool:
+        payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+        try:
+            resp = requests.post(f"{TELEGRAM_API}/editMessageReplyMarkup", json=payload, timeout=10)
+            data = resp.json() if resp.content else {}
+            print(f"editMessageReplyMarkup status={resp.status_code} ok={bool(data.get('ok'))}")
+            return bool(resp.status_code < 300 and data.get("ok"))
+        except Exception:
+            return False
+
+    return await asyncio.to_thread(_clear)
+
+
 async def send_document(chat_id: int, file_path: Path, caption: str | None = None) -> bool:
     def _send() -> bool:
         data = {"chat_id": str(chat_id)}
@@ -482,13 +502,28 @@ def _save_telegram_image(
     msg_id: int,
     msg_ts: datetime | None,
 ) -> tuple[Path, bytes]:
-    file_info = telegram_get_file_info(file_id)
-    if not file_info:
-        raise RuntimeError("image file info not found")
-    file_url, file_path = file_info
-    img_resp = requests.get(file_url, timeout=20)
-    if img_resp.status_code != 200:
-        raise RuntimeError(f"image download failed: {img_resp.status_code}")
+    file_url, file_path = telegram_get_file_info(file_id)
+    last_err: Exception | None = None
+    img_resp = None
+    for attempt in range(TELEGRAM_FILE_FETCH_RETRIES):
+        try:
+            img_resp = requests.get(
+                file_url,
+                timeout=(TELEGRAM_FILE_FETCH_CONNECT_TIMEOUT, TELEGRAM_FILE_FETCH_READ_TIMEOUT),
+            )
+            if img_resp.status_code == 200 and img_resp.content:
+                break
+            raise RuntimeError(f"image download failed: HTTP {img_resp.status_code}")
+        except Exception as e:
+            last_err = e
+            if attempt < TELEGRAM_FILE_FETCH_RETRIES - 1:
+                time.sleep(TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS * (attempt + 1))
+                continue
+            break
+    if not img_resp or img_resp.status_code != 200 or not img_resp.content:
+        if last_err:
+            raise RuntimeError(f"圖片下載失敗：{last_err}") from last_err
+        raise RuntimeError("圖片下載失敗：empty response")
     day = (msg_ts or datetime.now()).strftime("%Y-%m-%d")
     img_dir = INBOX_IMAGES_DIR / day
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -758,25 +793,14 @@ def _localize_transcribe_status(status: str) -> str:
     if not s:
         return ""
     lower = s.lower()
-    if lower.startswith("checking video info"):
-        return "進度：正在檢查影片資訊..."
-    if lower.startswith("downloading"):
-        return "進度：正在下載音訊..."
-    if lower.startswith("preparing"):
-        return "進度：正在準備音訊..."
-    if lower.startswith("transcribing segment"):
-        m = re.search(r"(\d+)\s*/\s*(\d+)", s)
-        if m:
-            return f"進度：正在轉錄分段 {m.group(1)}/{m.group(2)}..."
-        return "進度：正在轉錄分段..."
-    if lower.startswith("transcribing") and "segments" in lower:
-        m = re.search(r"(\d+)", s)
-        if m:
-            return f"進度：開始分段轉錄，共 {m.group(1)} 段..."
-        return "進度：開始分段轉錄..."
-    if lower.startswith("transcribing"):
-        return "進度：正在轉錄文字..."
-    return f"進度：{s}"
+    if (
+        lower.startswith("checking video info")
+        or lower.startswith("downloading")
+        or lower.startswith("preparing")
+        or lower.startswith("transcribing")
+    ):
+        return "進度：處理中..."
+    return "進度：處理中..."
 
 
 def _build_transcribe_status_message(intro_text: str, status_text: str, title: str | None = None) -> str:
@@ -796,7 +820,7 @@ async def _run_transcribe_job_with_progress(chat_id: int, worker, intro_text: st
             return
         loop.call_soon_threadsafe(queue.put_nowait, text)
 
-    progress_text = _build_transcribe_status_message(intro_text, "進度：準備中...")
+    progress_text = _build_transcribe_status_message(intro_text, "進度：處理中...")
     progress_message_id = await send_message(chat_id, progress_text)
     job = asyncio.create_task(asyncio.to_thread(worker, on_status))
     last_status = ""
@@ -815,7 +839,7 @@ async def _run_transcribe_job_with_progress(chat_id: int, worker, intro_text: st
             if (now - last_heartbeat_at) < TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS:
                 continue
             elapsed_sec = int(now - started_at)
-            heartbeat = f"{last_status}（已等待 {elapsed_sec // 60} 分 {elapsed_sec % 60} 秒）"
+            heartbeat = f"進度：處理中（已等待 {elapsed_sec // 60} 分 {elapsed_sec % 60} 秒）"
             heartbeat_text = _build_transcribe_status_message(intro_text, heartbeat)
             if progress_message_id:
                 ok = await edit_message(chat_id, progress_message_id, heartbeat_text)
@@ -882,7 +906,6 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
             out_path,
             message_ts,
         )
-        await send_message(chat_id, "已成功紀錄")
         await asyncio.to_thread(
             notion_append_chitchat_transcript,
             title=title,
@@ -895,6 +918,8 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
             await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
             for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
                 await send_message(chat_id, chunk)
+        else:
+            await send_message(chat_id, "已成功紀錄")
     except Exception as e:
         err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
         if 'progress_msg_id' in locals() and progress_msg_id:
@@ -937,10 +962,7 @@ def _extract_audio_attachment(message: dict) -> tuple[str, str] | None:
 
 
 def _download_telegram_file(file_id: str, dest_path: Path) -> None:
-    file_info = telegram_get_file_info(file_id)
-    if not file_info:
-        raise RuntimeError("Cannot fetch Telegram file info.")
-    file_url, _file_path = file_info
+    file_url, _file_path = telegram_get_file_info(file_id)
     resp = requests.get(file_url, timeout=300)
     if resp.status_code != 200:
         raise RuntimeError(f"Telegram file download failed: {resp.status_code}")
@@ -1018,7 +1040,6 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
             out_path,
             message_ts,
         )
-        await send_message(chat_id, "已成功紀錄")
         await asyncio.to_thread(
             notion_append_chitchat_transcript,
             title=title,
@@ -1031,6 +1052,8 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
             await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
             for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
                 await send_message(chat_id, chunk)
+        else:
+            await send_message(chat_id, "已成功紀錄")
     except Exception as e:
         err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
         if 'progress_msg_id' in locals() and progress_msg_id:
@@ -1571,6 +1594,23 @@ def _dropbox_get_or_create_shared_link(remote_path: str) -> str | None:
     return str(url).replace("?dl=0", "?raw=1")
 
 
+def _dropbox_get_temporary_link(remote_path: str) -> str | None:
+    if dropbox is None:
+        return None
+    normalized = normalize_dropbox_path(remote_path)
+
+    def _fetch(dbx):
+        result = dbx.files_get_temporary_link(normalized)
+        return getattr(result, "link", None)
+
+    try:
+        url = _dropbox_call_with_retry(_fetch)
+    except Exception as e:
+        print(f"[WARN] Dropbox temporary link failed for {normalized}: {e}")
+        return None
+    return str(url).strip() if url else None
+
+
 def _dropbox_remote_path_for_local_data_file(local_path: Path) -> str | None:
     try:
         rel = local_path.resolve().relative_to(DATA_DIR).as_posix()
@@ -1580,7 +1620,11 @@ def _dropbox_remote_path_for_local_data_file(local_path: Path) -> str | None:
     return f"{root}/{rel}".replace("//", "/")
 
 
-def get_or_create_dropbox_shared_link_for_local_file(local_path: Path) -> str | None:
+def get_or_create_dropbox_shared_link_for_local_file(
+    local_path: Path,
+    *,
+    prefer_temporary: bool = False,
+) -> str | None:
     if not DROPBOX_SYNC_ENABLED:
         return None
     remote_path = _dropbox_remote_path_for_local_data_file(local_path)
@@ -1592,6 +1636,10 @@ def get_or_create_dropbox_shared_link_for_local_file(local_path: Path) -> str | 
     except Exception as e:
         print(f"[WARN] Dropbox upload for shared link failed ({local_path}): {e}")
         return None
+    if prefer_temporary:
+        tmp = _dropbox_get_temporary_link(remote_path)
+        if tmp:
+            return tmp
     return _dropbox_get_or_create_shared_link(remote_path)
 
 
@@ -1710,11 +1758,27 @@ def _notion_bullet_block(text: str) -> dict:
     }
 
 
-def _notion_h2_block(text: str) -> dict:
+def _notion_h3_block(text: str) -> dict:
     return {
         "object": "block",
-        "type": "heading_2",
-        "heading_2": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+        "type": "heading_3",
+        "heading_3": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+    }
+
+
+def _notion_external_image_block(url: str, caption: str | None = None) -> dict:
+    cap = (caption or "").strip()
+    caption_rich_text = []
+    if cap:
+        caption_rich_text = [{"type": "text", "text": {"content": cap}}]
+    return {
+        "object": "block",
+        "type": "image",
+        "image": {
+            "type": "external",
+            "external": {"url": url},
+            "caption": caption_rich_text,
+        },
     }
 
 
@@ -1785,7 +1849,8 @@ def _notion_ensure_top_anchor(page_id: str) -> str:
 
 def _notion_find_date_heading_block_id(page_id: str, day_label: str) -> str | None:
     for block in _notion_iter_block_children(page_id):
-        if (block.get("type") or "") != "heading_2":
+        block_type = (block.get("type") or "")
+        if block_type not in {"heading_2", "heading_3"}:
             continue
         if _notion_rich_text_plain(block) == day_label:
             return str(block.get("id") or "")
@@ -1802,7 +1867,7 @@ def _notion_ensure_date_heading(page_id: str, day_label: str) -> str:
         _notion_date_heading_cache[key] = found
         return found
     anchor_id = _notion_ensure_top_anchor(page_id)
-    created = _notion_append_block_children(page_id, [_notion_h2_block(day_label)], after=anchor_id)
+    created = _notion_append_block_children(page_id, [_notion_h3_block(day_label)], after=anchor_id)
     if not created:
         raise RuntimeError("Notion date heading create returned no blocks")
     heading_id = str(created[0].get("id") or "")
@@ -1929,27 +1994,31 @@ def notion_append_chitchat_image(
 ) -> None:
     if not _notion_is_chitchat_enabled():
         return
-    if NOTION_CHATLOG_IMAGE_MODE != "link":
+    if NOTION_CHATLOG_IMAGE_MODE not in {"link", "embed"}:
         return
     page_id = _notion_get_chatlog_year_page_id(msg_ts or _infer_message_dt_from_image_path(image_path))
     if not page_id:
         print("[WARN] Notion chatlog page id not configured for image year")
         return
     day_label = _notion_day_label(msg_ts or _infer_message_dt_from_image_path(image_path))
-    bullet = "[圖片]"
+    blocks: list[dict] = []
     cap = (caption or "").strip()
-    if cap:
-        bullet = f"{bullet} {cap}"
-    blocks = [_notion_bullet_block(bullet)]
-    image_url = get_or_create_dropbox_shared_link_for_local_file(image_path)
-    if image_url:
+    image_url = get_or_create_dropbox_shared_link_for_local_file(
+        image_path,
+        prefer_temporary=(NOTION_CHATLOG_IMAGE_MODE == "embed"),
+    )
+    if image_url and NOTION_CHATLOG_IMAGE_MODE == "embed":
+        blocks.append(_notion_external_image_block(image_url, caption=cap or None))
+    elif image_url:
+        bullet = "[圖片]"
+        if cap:
+            bullet = f"{bullet} {cap}"
+        blocks.append(_notion_bullet_block(bullet))
         blocks.append(_notion_paragraph_block(f"圖片：{image_url}"))
     else:
-        try:
-            rel = image_path.resolve().relative_to(DATA_DIR).as_posix()
-        except Exception:
-            rel = str(image_path)
-        blocks.append(_notion_paragraph_block(f"圖片：[link unavailable] {rel}"))
+        if cap:
+            blocks.append(_notion_bullet_block(f"[圖片] {cap}"))
+        blocks.append(_notion_paragraph_block("圖片：本地已儲存（尚未取得雲端連結）"))
     ocr_summary = _notion_summarize_ocr_text(ocr_text) if NOTION_CHATLOG_OCR_MODE == "optional" else None
     if ocr_summary:
         blocks.append(_notion_paragraph_block(f"OCR 摘要：{ocr_summary}"))
@@ -1957,7 +2026,24 @@ def notion_append_chitchat_image(
         heading_id = _notion_ensure_date_heading(page_id, day_label)
         _notion_append_block_children(page_id, blocks, after=heading_id)
     except Exception as e:
-        print(f"[WARN] Notion image append failed: {e}")
+        if NOTION_CHATLOG_IMAGE_MODE == "embed" and image_url:
+            print(f"[WARN] Notion image embed failed, fallback to link mode: {e}")
+            fallback_blocks: list[dict] = []
+            bullet = "[圖片]"
+            if cap:
+                bullet = f"{bullet} {cap}"
+            fallback_blocks.append(_notion_bullet_block(bullet))
+            fallback_blocks.append(_notion_paragraph_block(f"圖片：{image_url}"))
+            if ocr_summary:
+                fallback_blocks.append(_notion_paragraph_block(f"OCR 摘要：{ocr_summary}"))
+            try:
+                heading_id = _notion_ensure_date_heading(page_id, day_label)
+                _notion_append_block_children(page_id, fallback_blocks, after=heading_id)
+                return
+            except Exception as e2:
+                print(f"[WARN] Notion image fallback append failed: {e2}")
+        else:
+            print(f"[WARN] Notion image append failed: {e}")
 
 
 def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
@@ -4373,40 +4459,50 @@ async def handle_ocr_choice_callback(callback: dict) -> None:
         await answer_callback_query(callback_id, "此圖片已處理", show_alert=False)
         return
     if now >= expire_dt:
+        await answer_callback_query(callback_id, "已逾時", show_alert=False)
         _update_ocr_choice_job_status(job_id, "expired", ocr_done=0, ocr_md_saved=0)
+        if prompt_message_id:
+            await clear_message_inline_keyboard(int(job_chat_id), int(prompt_message_id))
+        if prompt_message_id:
+            await edit_message(int(job_chat_id), int(prompt_message_id), "圖片已儲存")
         if OCR_CHOICE_TIMEOUT_DEFAULT == "skip":
-            await asyncio.to_thread(
+            asyncio.create_task(
+                asyncio.to_thread(
+                    notion_append_chitchat_image,
+                    image_path=Path(image_path_raw),
+                    caption=job_caption,
+                    ocr_text=None,
+                    msg_ts=job_msg_ts,
+                )
+            )
+        return
+
+    if action == "save":
+        await answer_callback_query(callback_id, "已選擇只存圖", show_alert=False)
+        _update_ocr_choice_job_status(job_id, "save", ocr_done=0, ocr_md_saved=0)
+        if prompt_message_id:
+            await clear_message_inline_keyboard(int(job_chat_id), int(prompt_message_id))
+        if prompt_message_id:
+            await edit_message(int(job_chat_id), int(prompt_message_id), "圖片已儲存")
+        asyncio.create_task(
+            asyncio.to_thread(
                 notion_append_chitchat_image,
                 image_path=Path(image_path_raw),
                 caption=job_caption,
                 ocr_text=None,
                 msg_ts=job_msg_ts,
             )
-        if prompt_message_id:
-            await edit_message(int(job_chat_id), int(prompt_message_id), "圖片已逾時，已自動只存圖。")
-        await answer_callback_query(callback_id, "已逾時", show_alert=False)
-        return
-
-    if action == "save":
-        _update_ocr_choice_job_status(job_id, "save", ocr_done=0, ocr_md_saved=0)
-        await asyncio.to_thread(
-            notion_append_chitchat_image,
-            image_path=Path(image_path_raw),
-            caption=job_caption,
-            ocr_text=None,
-            msg_ts=job_msg_ts,
         )
-        if prompt_message_id:
-            await edit_message(int(job_chat_id), int(prompt_message_id), "已存圖（未執行 OCR）。")
-        await answer_callback_query(callback_id, "已選擇只存圖", show_alert=False)
         return
 
+    await answer_callback_query(callback_id, "已開始 OCR", show_alert=False)
+    if prompt_message_id:
+        await clear_message_inline_keyboard(int(job_chat_id), int(prompt_message_id))
     image_path = Path(image_path_raw)
     if not image_path.exists():
         _update_ocr_choice_job_status(job_id, "ocr_failed", ocr_done=0, ocr_md_saved=0)
         if prompt_message_id:
-            await edit_message(int(job_chat_id), int(prompt_message_id), "OCR 失敗：找不到圖片檔案。")
-        await answer_callback_query(callback_id, "OCR 失敗", show_alert=False)
+            await edit_message(int(job_chat_id), int(prompt_message_id), "OCR 失敗")
         return
 
     ocr_ok, md_saved, ocr_text = await asyncio.to_thread(
@@ -4426,13 +4522,11 @@ async def handle_ocr_choice_callback(callback: dict) -> None:
     if ocr_ok and md_saved:
         _update_ocr_choice_job_status(job_id, "run", ocr_done=1, ocr_md_saved=1)
         if prompt_message_id:
-            await edit_message(int(job_chat_id), int(prompt_message_id), "已完成 OCR 並存檔。")
-        await answer_callback_query(callback_id, "OCR 完成", show_alert=False)
+            await edit_message(int(job_chat_id), int(prompt_message_id), "圖片已儲存")
     else:
         _update_ocr_choice_job_status(job_id, "ocr_failed", ocr_done=int(ocr_ok), ocr_md_saved=int(md_saved))
         if prompt_message_id:
-            await edit_message(int(job_chat_id), int(prompt_message_id), "OCR 失敗，已保留圖片。")
-        await answer_callback_query(callback_id, "OCR 失敗", show_alert=False)
+            await edit_message(int(job_chat_id), int(prompt_message_id), "OCR 失敗")
 
 
 def expire_ocr_choice_jobs_once() -> None:
@@ -4448,11 +4542,20 @@ def expire_ocr_choice_jobs_once() -> None:
         if prompt_message_id:
             try:
                 requests.post(
+                    f"{TELEGRAM_API}/editMessageReplyMarkup",
+                    json={
+                        "chat_id": int(chat_id),
+                        "message_id": int(prompt_message_id),
+                        "reply_markup": {"inline_keyboard": []},
+                    },
+                    timeout=10,
+                )
+                requests.post(
                     f"{TELEGRAM_API}/editMessageText",
                     json={
                         "chat_id": int(chat_id),
                         "message_id": int(prompt_message_id),
-                        "text": "圖片已逾時，已自動只存圖。",
+                        "text": "圖片已儲存",
                     },
                     timeout=10,
                 )
@@ -4476,21 +4579,65 @@ def start_ocr_choice_expire_thread() -> None:
     t.start()
 
 
-def telegram_get_file_info(file_id: str) -> tuple[str, str] | None:
-    try:
-        resp = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if not data.get("ok"):
-            return None
-        file_path = data.get("result", {}).get("file_path")
-        if not file_path:
-            return None
-        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-        return file_url, file_path
-    except Exception:
-        return None
+def telegram_get_file_info(file_id: str) -> tuple[str, str]:
+    last_err: Exception | None = None
+    last_detail = "unknown"
+    methods = ("get", "post")
+    for attempt in range(TELEGRAM_FILE_FETCH_RETRIES):
+        for method in methods:
+            try:
+                kwargs = {
+                    "timeout": (
+                        TELEGRAM_FILE_FETCH_CONNECT_TIMEOUT,
+                        TELEGRAM_FILE_FETCH_READ_TIMEOUT,
+                    ),
+                }
+                if method == "get":
+                    kwargs["params"] = {"file_id": file_id}
+                else:
+                    kwargs["data"] = {"file_id": file_id}
+                resp = requests.request(method, f"{TELEGRAM_API}/getFile", **kwargs)
+                status = int(resp.status_code or 0)
+                if status != 200:
+                    preview = (resp.text or "").strip().replace("\n", " ")
+                    if preview:
+                        preview = preview[:160]
+                    last_detail = f"HTTP {status} {preview}".strip()
+                    if status == 429:
+                        retry_after = 0.0
+                        try:
+                            retry_after = float(
+                                (resp.json() or {})
+                                .get("parameters", {})
+                                .get("retry_after", 0)
+                            )
+                        except Exception:
+                            retry_after = 0.0
+                        if retry_after > 0:
+                            time.sleep(retry_after)
+                    continue
+
+                data = resp.json()
+                if not data.get("ok"):
+                    last_detail = f"ok=false {str(data)[:200]}"
+                    continue
+                file_path = data.get("result", {}).get("file_path")
+                if not file_path:
+                    last_detail = "result missing file_path"
+                    continue
+                file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+                return file_url, file_path
+            except Exception as e:
+                last_err = e
+                last_detail = f"{type(e).__name__}: {e}"
+                continue
+        if attempt < TELEGRAM_FILE_FETCH_RETRIES - 1:
+            time.sleep(TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS * (attempt + 1))
+    detail = last_detail
+    if last_err:
+        detail = f"{detail}; last_err={type(last_err).__name__}: {last_err}"
+    print(f"[WARN] telegram_get_file_info failed file_id={file_id}: {detail}")
+    raise RuntimeError(f"無法取得 Telegram 檔案資訊（getFile 失敗）: {detail}")
 
 
 def telegram_polling_loop() -> None:
@@ -4595,7 +4742,10 @@ async def process_telegram_update(update: dict) -> None:
     if (is_group or is_private) and chat_id and text:
         store_message("telegram", str(chat_id), chat_title or chat_type or "", user_id, user_name, text, msg_ts)
         append_markdown("telegram", chat_title or ("private" if is_private else str(chat_id)), user_name, text, msg_ts)
-        await asyncio.to_thread(notion_append_chitchat_text, text, msg_ts)
+        # Caption text for image messages is synced through notion_append_chitchat_image;
+        # skip plain text append here to avoid duplicated caption entries in Notion.
+        if not has_image:
+            await asyncio.to_thread(notion_append_chitchat_text, text, msg_ts)
 
     if is_private and chat_id and has_audio_attachment and not has_image:
         handled = await handle_transcribe_audio_message(chat_id, message, message_ts=msg_ts)
@@ -4666,12 +4816,12 @@ async def process_telegram_update(update: dict) -> None:
             except Exception as e:
                 print(f"[WARN] Telegram image save failed: {e}")
                 if is_private:
-                    await send_message(chat_id, "Image save failed. Please retry.")
+                    await send_message(chat_id, f"Image save failed: {type(e).__name__} {e}")
                 return
 
             if _is_ocr_choice_enabled_for_chat(is_private=is_private, is_group=is_group):
                 job_id = str(uuid.uuid4())
-                prompt_text = "圖片已儲存，請選擇是否進行 OCR。"
+                prompt_text = "是否進行 OCR？"
                 keyboard = _build_ocr_choice_keyboard(job_id)
                 prompt_message_id = await send_message(chat_id, prompt_text, reply_markup=keyboard)
                 if not prompt_message_id:
@@ -4682,7 +4832,7 @@ async def process_telegram_update(update: dict) -> None:
                         ocr_text=None,
                         msg_ts=msg_ts,
                     )
-                    await send_message(chat_id, "圖片已儲存（未執行 OCR）。")
+                    await send_message(chat_id, "圖片已儲存")
                     return
                 created_job_id = await asyncio.to_thread(
                     _create_ocr_choice_job,
@@ -4715,10 +4865,7 @@ async def process_telegram_update(update: dict) -> None:
             )
             is_ocr_success = ocr_ok and md_saved
             if is_private:
-                if is_ocr_success:
-                    await send_message(chat_id, "img saved, ocr succeed")
-                else:
-                    await send_message(chat_id, "img saved, but ocr failed")
+                await send_message(chat_id, "圖片已儲存" if is_ocr_success else "OCR 失敗")
             else:
                 group_status = "ocr succeed" if is_ocr_success else "ocr failed"
                 print(f"[INFO] Telegram group image saved: {out_path} ({group_status})")

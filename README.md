@@ -28,6 +28,10 @@ Copy `.env.example` to `.env` and set your tokens.
 - `APP_MODULE` uvicorn module name (`app`, `app_main`, `app_chitchat`)
 - `TELEGRAM_LONG_POLLING` set `1` to enable getUpdates instead of webhook
 - `TELEGRAM_LOCAL_WEBHOOK_URL` local URL for polling to forward updates (default: `http://127.0.0.1:8000/telegram`)
+- `TELEGRAM_FILE_FETCH_RETRIES` retries for Telegram `getFile`/file download (default: `4`)
+- `TELEGRAM_FILE_FETCH_CONNECT_TIMEOUT` connect timeout seconds for Telegram file fetch (default: `5`)
+- `TELEGRAM_FILE_FETCH_READ_TIMEOUT` read timeout seconds for Telegram file fetch (default: `12`)
+- `TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS` base retry backoff seconds (default: `0.25`)
 
 Feature flags:
 - `FEATURE_NEWS_ENABLED` enable/disable news ingest + `/news` commands
@@ -35,7 +39,7 @@ Feature flags:
 - `FEATURE_TRANSCRIBE_AUTO_URL` when set `1`, private chat plain URLs auto-trigger transcription
 - `TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS` progress heartbeat interval while transcription is running (default: `30`)
 - `FEATURE_OCR_ENABLED` enable/disable image OCR pipeline
-- `FEATURE_OCR_CHOICE_ENABLED` when set `1`, image OCR asks user to choose (`ÈÄ≤Ë°å OCR` or `Âè™Â≠òÂúñ`)
+- `FEATURE_OCR_CHOICE_ENABLED` when set `1`, image OCR asks user to choose (`?≤Ë? OCR` or `?™Â??ñ`)
 - `OCR_CHOICE_SCOPE` OCR choice scope (`private` recommended)
 - `OCR_CHOICE_TIMEOUT_SECONDS` choice timeout seconds before fallback to save-only (default: `60`)
 - `FEATURE_SLACK_ENABLED` enable/disable Slack worker
@@ -65,7 +69,7 @@ Notion (chitchat profile):
 - `NOTION_VERSION` Notion API version header (keep default unless you need migration)
 - `NOTION_CHATLOG_YEAR_PAGES_JSON` year->page_id map, e.g. `{"2026":"2dbf40303e778048974edcd4d534afd8"}`
 - `NOTION_CHATLOG_FALLBACK_PAGE_ID` fallback page id when year map has no match
-- `NOTION_CHATLOG_IMAGE_MODE` image sync mode; current supported value is `link`
+- `NOTION_CHATLOG_IMAGE_MODE` image sync mode; `link` or `embed` (`embed` inserts Notion image block directly)
 - `NOTION_CHATLOG_OCR_MODE` OCR sync mode; `optional` means include OCR summary when available
 - `NOTION_CHATLOG_INCLUDE_TIME` set `1` to prefix entries with `[HH:MM]`
 
@@ -174,7 +178,7 @@ sort downloads
 ```
 
 `/news` and `/transcribe` availability depends on `FEATURE_NEWS_ENABLED` and `FEATURE_TRANSCRIBE_ENABLED`.
-Transcription flow: bot sends `Â∑≤ÊàêÂäüÁ¥ÄÈåÑ` right after transcript is saved, then sends AI summary afterward (if enabled).
+Transcription flow: bot sends `Â∑≤Ê??üÁ??Ñ` right after transcript is saved, then sends AI summary afterward (if enabled).
 
 Group logging (no reply):
 - Messages in allowed groups are stored in SQLite and appended to Markdown files.
@@ -187,8 +191,9 @@ Slack DM logging (no reply):
 
 Image OCR and cloud sync:
 - Telegram private image uploads are saved to `DATA_DIR\\images\YYYY-MM-DD\`.
-- If OCR choice is enabled, bot asks per image: `ÈÄ≤Ë°å OCR` or `Âè™Â≠òÂúñ`; timeout defaults to save-only.
+- If OCR choice is enabled, bot asks per image: `?≤Ë? OCR` or `?™Â??ñ`; timeout defaults to save-only.
 - OCR output is appended to `DATA_DIR\\notes\\telegram\\YYYY-MM-DD_telegram.md`.
 - A Dropbox worker syncs local `notes` and `images` to:
 - `/read & chat/read/notes`
 - `/read & chat/read/images`
+
