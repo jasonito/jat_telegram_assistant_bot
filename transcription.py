@@ -32,6 +32,8 @@ from slugify import slugify
 MAX_DURATION_SECONDS = int(os.getenv("TRANSCRIBE_MAX_DURATION_SECONDS", "10800"))
 CHUNK_MINUTES = int(os.getenv("TRANSCRIBE_CHUNK_MINUTES", "25"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip() or "base"
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "zh").strip() or "zh"
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 FFMPEG_LOCATION = os.getenv("FFMPEG_LOCATION", "").strip()
 
 ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".aac", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".opus"}
@@ -249,7 +251,11 @@ def transcribe_audio(
         raise ValueError(f"Audio is too short ({duration:.2f} seconds).")
 
     if duration <= CHUNK_MINUTES * 60:
-        result = model.transcribe(str(audio_path))
+        result = model.transcribe(
+            str(audio_path),
+            language=WHISPER_LANGUAGE,
+            beam_size=WHISPER_BEAM_SIZE,
+        )
         return (result.get("text") or "").strip()
 
     chunks = split_audio(audio_path, temp_dir, job_id)
@@ -260,7 +266,11 @@ def transcribe_audio(
     for idx, chunk in enumerate(chunks, start=1):
         if on_status:
             on_status(f"Transcribing segment {idx}/{len(chunks)}...")
-        result = model.transcribe(str(chunk))
+        result = model.transcribe(
+            str(chunk),
+            language=WHISPER_LANGUAGE,
+            beam_size=WHISPER_BEAM_SIZE,
+        )
         txt = (result.get("text") or "").strip()
         if txt:
             texts.append(txt)

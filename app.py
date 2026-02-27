@@ -11,6 +11,7 @@ import hashlib
 import json
 import time
 import uuid
+import traceback
 from typing import Iterator
 from urllib.parse import quote
 from urllib.parse import urlparse
@@ -61,16 +62,14 @@ TELEGRAM_LOCAL_WEBHOOK_URL = os.getenv(
     "TELEGRAM_LOCAL_WEBHOOK_URL", "http://127.0.0.1:8000/telegram"
 )
 
-DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "data")).resolve()
+DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "read")).resolve()
 DB_PATH = DATA_DIR / "messages.sqlite"
 NEWS_MD_DIR = DATA_DIR / "news"
 NOTES_DIR = DATA_DIR / "notes"
 TELEGRAM_MD_DIR = NOTES_DIR / "telegram"
-SLACK_MD_DIR = NOTES_DIR / "slack"
-OCR_MD_DIR = NOTES_DIR / "ocr"
-INBOX_IMAGES_DIR = DATA_DIR / "inbox" / "images"
-TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
-TRANSCRIPTS_TMP_DIR = DATA_DIR / "transcripts_tmp"
+INBOX_IMAGES_DIR = DATA_DIR / "images"
+TRANSCRIPTS_DIR = DATA_DIR / "_runtime" / "transcribe"
+TRANSCRIPTS_TMP_DIR = DATA_DIR / "_runtime" / "transcribe_tmp"
 ALLOWED_GROUPS = {
     g.strip()
     for g in os.getenv("TELEGRAM_ALLOWED_GROUPS", "").split(",")
@@ -143,11 +142,23 @@ NEWS_GNEWS_CEID = os.getenv("NEWS_GNEWS_CEID", "US:en")
 FEATURE_NEWS_ENABLED = _env_flag("FEATURE_NEWS_ENABLED", NEWS_ENABLED)
 FEATURE_TRANSCRIBE_ENABLED = _env_flag("FEATURE_TRANSCRIBE_ENABLED", True)
 FEATURE_TRANSCRIBE_AUTO_URL = _env_flag("FEATURE_TRANSCRIBE_AUTO_URL", False)
+TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS = max(10, int(os.getenv("TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS", "30")))
 FEATURE_OCR_ENABLED = _env_flag("FEATURE_OCR_ENABLED", True)
 FEATURE_OCR_CHOICE_ENABLED = _env_flag("FEATURE_OCR_CHOICE_ENABLED", False)
 OCR_CHOICE_SCOPE = (os.getenv("OCR_CHOICE_SCOPE", "private") or "private").strip().lower()
 OCR_CHOICE_TIMEOUT_SECONDS = int(os.getenv("OCR_CHOICE_TIMEOUT_SECONDS", "60"))
+OCR_CHOICE_TIMEOUT_DEFAULT = (os.getenv("OCR_CHOICE_TIMEOUT_DEFAULT", "skip") or "skip").strip().lower()
 FEATURE_SLACK_ENABLED = _env_flag("FEATURE_SLACK_ENABLED", True)
+APP_PROFILE = (os.getenv("APP_PROFILE", "main") or "main").strip().lower()
+
+NOTION_ENABLED = _env_flag("NOTION_ENABLED", False)
+NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
+NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28").strip() or "2022-06-28"
+NOTION_CHATLOG_YEAR_PAGES_JSON = os.getenv("NOTION_CHATLOG_YEAR_PAGES_JSON", "").strip()
+NOTION_CHATLOG_FALLBACK_PAGE_ID = os.getenv("NOTION_CHATLOG_FALLBACK_PAGE_ID", "").strip()
+NOTION_CHATLOG_IMAGE_MODE = (os.getenv("NOTION_CHATLOG_IMAGE_MODE", "link") or "link").strip().lower()
+NOTION_CHATLOG_OCR_MODE = (os.getenv("NOTION_CHATLOG_OCR_MODE", "optional") or "optional").strip().lower()
+NOTION_CHATLOG_INCLUDE_TIME = _env_flag("NOTION_CHATLOG_INCLUDE_TIME", False)
 
 try:
     NEWS_TZ = ZoneInfo("Asia/Taipei")
@@ -162,8 +173,17 @@ _dropbox_client = None
 _dropbox_token_lock = threading.Lock()
 _dropbox_access_token = DROPBOX_ACCESS_TOKEN
 _dropbox_access_token_expires_at = 0.0
+_notion_top_anchor_cache: dict[str, str] = {}
+_notion_date_heading_cache: dict[str, str] = {}
 _startup_lock = threading.Lock()
 _startup_done = False
+_telegram_poll_last_ok_at = 0.0
+_telegram_poll_last_update_at = 0.0
+_telegram_poll_last_update_id: int | None = None
+_telegram_poll_last_error = ""
+_telegram_send_last_ok_at = 0.0
+_telegram_send_last_status = ""
+_telegram_send_last_error = ""
 
 ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".aac", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".opus"}
 URL_RE = re.compile(r"https?://[^\s<>()]+", flags=re.I)
@@ -184,8 +204,6 @@ def init_storage() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     NOTES_DIR.mkdir(parents=True, exist_ok=True)
     TELEGRAM_MD_DIR.mkdir(parents=True, exist_ok=True)
-    SLACK_MD_DIR.mkdir(parents=True, exist_ok=True)
-    OCR_MD_DIR.mkdir(parents=True, exist_ok=True)
     INBOX_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -308,6 +326,14 @@ def init_storage() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ocr_pending_status_expires ON ocr_pending_choices(status, expires_at)"
         )
+        try:
+            conn.execute("ALTER TABLE ocr_pending_choices ADD COLUMN caption TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE ocr_pending_choices ADD COLUMN message_ts TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 
@@ -351,21 +377,34 @@ async def send_message(
     reply_markup: dict | None = None,
 ) -> int | None:
     def _send() -> int | None:
-        payload = {"chat_id": chat_id, "text": text}
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        if disable_web_page_preview is not None:
-            payload["disable_web_page_preview"] = disable_web_page_preview
-        if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-        if resp.status_code >= 300 and parse_mode:
-            fallback_payload = {"chat_id": chat_id, "text": text}
-            resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=fallback_payload, timeout=10)
+        global _telegram_send_last_ok_at, _telegram_send_last_status, _telegram_send_last_error
+        try:
+            payload = {"chat_id": chat_id, "text": text}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            if disable_web_page_preview is not None:
+                payload["disable_web_page_preview"] = disable_web_page_preview
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
+            resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+            if resp.status_code >= 300 and parse_mode:
+                fallback_payload = {"chat_id": chat_id, "text": text}
+                resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=fallback_payload, timeout=10)
+        except Exception as e:
+            _telegram_send_last_status = "request_error"
+            _telegram_send_last_error = f"{type(e).__name__}: {e}"
+            print(f"sendMessage error: {type(e).__name__}: {e}")
+            return None
         try:
             data = resp.json() if resp.content else {}
         except Exception:
             data = {}
+        _telegram_send_last_status = str(resp.status_code)
+        if data.get("ok"):
+            _telegram_send_last_ok_at = time.time()
+            _telegram_send_last_error = ""
+        else:
+            _telegram_send_last_error = str(data.get("description") or "send_not_ok")
         print(f"sendMessage status={resp.status_code} ok={bool(data.get('ok'))}")
         if data.get("ok"):
             return data.get("result", {}).get("message_id")
@@ -466,7 +505,7 @@ def _run_ocr_on_image(
     msg_id: int | str,
     image_path: Path,
     msg_ts: datetime | None,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, str]:
     ocr_ok = False
     md_saved = False
     ocr_text = ""
@@ -489,7 +528,7 @@ def _run_ocr_on_image(
         md_saved = True
     except Exception as e:
         print(f"[WARN] OCR markdown save failed for {image_path}: {e}")
-    return ocr_ok, md_saved
+    return ocr_ok, md_saved, (ocr_text or "").strip()
 
 
 def _create_ocr_choice_job(
@@ -500,6 +539,8 @@ def _create_ocr_choice_job(
     image_path: Path,
     file_unique_id: str,
     source_msg_id: int | None,
+    caption: str | None = None,
+    message_ts: datetime | None = None,
 ) -> str:
     now = datetime.now()
     expires = now + timedelta(seconds=max(5, OCR_CHOICE_TIMEOUT_SECONDS))
@@ -508,8 +549,8 @@ def _create_ocr_choice_job(
             """
             INSERT INTO ocr_pending_choices
             (job_id, chat_id, prompt_message_id, image_path, file_unique_id, source_msg_id,
-             created_at, expires_at, status, ocr_done, ocr_md_saved)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0)
+             created_at, expires_at, status, ocr_done, ocr_md_saved, caption, message_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)
             """,
             (
                 job_id,
@@ -520,6 +561,8 @@ def _create_ocr_choice_job(
                 source_msg_id,
                 now.isoformat(timespec="seconds"),
                 expires.isoformat(timespec="seconds"),
+                (caption or "").strip() or None,
+                message_ts.isoformat(timespec="seconds") if message_ts else None,
             ),
         )
         conn.commit()
@@ -531,7 +574,7 @@ def _get_ocr_choice_job(job_id: str) -> tuple | None:
         return conn.execute(
             """
             SELECT job_id, chat_id, prompt_message_id, image_path, source_msg_id,
-                   expires_at, status, ocr_done, ocr_md_saved
+                   expires_at, status, ocr_done, ocr_md_saved, caption, message_ts
             FROM ocr_pending_choices
             WHERE job_id = ?
             """,
@@ -557,7 +600,7 @@ def _list_expired_ocr_choice_jobs(now_dt: datetime | None = None) -> list[tuple]
     with sqlite3.connect(DB_PATH) as conn:
         return conn.execute(
             """
-            SELECT job_id, chat_id, prompt_message_id
+            SELECT job_id, chat_id, prompt_message_id, image_path, caption, message_ts
             FROM ocr_pending_choices
             WHERE status = 'pending' AND expires_at <= ?
             """,
@@ -683,6 +726,33 @@ def _prepend_summary_to_transcript(transcript_path: Path, summary_text: str) -> 
     transcript_path.write_text(block + raw, encoding="utf-8")
 
 
+def _append_transcript_to_telegram_markdown(
+    chat_id: int,
+    title: str,
+    source: str,
+    transcript_path: Path,
+    message_ts: datetime | None,
+) -> Path:
+    day = (message_ts or datetime.now()).strftime("%Y-%m-%d")
+    md_path = TELEGRAM_MD_DIR / f"{day}_telegram.md"
+    if not md_path.exists():
+        md_path.write_text(f"# {day} telegram\n\n", encoding="utf-8")
+    content = transcript_path.read_text(encoding="utf-8", errors="replace").strip()
+    time_str = (message_ts or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    normalized_title = (title or "").strip() or "untitled"
+    normalized_source = (source or "").strip() or "unknown"
+    with md_path.open("a", encoding="utf-8") as f:
+        f.write(f"## [{time_str}] transcript chat={chat_id}\n")
+        f.write(f"- title: {normalized_title}\n")
+        f.write(f"- source: {normalized_source}\n\n")
+        if content:
+            f.write(content)
+            f.write("\n\n")
+        else:
+            f.write("[empty transcript]\n\n")
+    return md_path
+
+
 def _localize_transcribe_status(status: str) -> str:
     s = (status or "").strip()
     if not s:
@@ -731,12 +801,29 @@ async def _run_transcribe_job_with_progress(chat_id: int, worker, intro_text: st
     job = asyncio.create_task(asyncio.to_thread(worker, on_status))
     last_status = ""
     last_sent_at = 0.0
+    started_at = time.time()
+    last_heartbeat_at = started_at
     while True:
         if job.done() and queue.empty():
             break
         try:
             raw_status = await asyncio.wait_for(queue.get(), timeout=0.8)
         except asyncio.TimeoutError:
+            now = time.time()
+            if job.done() or not last_status:
+                continue
+            if (now - last_heartbeat_at) < TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS:
+                continue
+            elapsed_sec = int(now - started_at)
+            heartbeat = f"{last_status}（已等待 {elapsed_sec // 60} 分 {elapsed_sec % 60} 秒）"
+            heartbeat_text = _build_transcribe_status_message(intro_text, heartbeat)
+            if progress_message_id:
+                ok = await edit_message(chat_id, progress_message_id, heartbeat_text)
+                if not ok:
+                    progress_message_id = await send_message(chat_id, heartbeat_text)
+            else:
+                progress_message_id = await send_message(chat_id, heartbeat_text)
+            last_heartbeat_at = now
             continue
         localized = _localize_transcribe_status(raw_status)
         now = time.time()
@@ -755,12 +842,13 @@ async def _run_transcribe_job_with_progress(chat_id: int, worker, intro_text: st
             progress_message_id = await send_message(chat_id, _build_transcribe_status_message(intro_text, localized))
         last_status = localized
         last_sent_at = now
+        last_heartbeat_at = now
 
     result = await job
     return result, progress_message_id
 
 
-async def _run_transcribe_url_flow(chat_id: int, target: str) -> bool:
+async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: datetime | None = None) -> bool:
     try:
         tx = _load_transcription_module()
     except Exception as e:
@@ -783,18 +871,23 @@ async def _run_transcribe_url_flow(chat_id: int, target: str) -> bool:
             ),
             intro_text,
         )
-        summary = await asyncio.to_thread(_build_transcript_ai_summary, out_path)
-        if summary:
-            await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
         if progress_msg_id:
             done_text = _build_transcribe_status_message(intro_text, f"轉錄完成：{title}")
             await edit_message(chat_id, progress_msg_id, done_text)
+        await asyncio.to_thread(
+            _append_transcript_to_telegram_markdown,
+            chat_id,
+            title,
+            target,
+            out_path,
+            message_ts,
+        )
+        await send_message(chat_id, "已成功紀錄")
+        summary = await asyncio.to_thread(_build_transcript_ai_summary, out_path)
         if summary:
+            await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
             for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
                 await send_message(chat_id, chunk)
-        sent = await send_document(chat_id, out_path)
-        if not sent:
-            await send_message(chat_id, "檔案上傳失敗，請稍後重試。")
     except Exception as e:
         err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
         if 'progress_msg_id' in locals() and progress_msg_id:
@@ -803,6 +896,12 @@ async def _run_transcribe_url_flow(chat_id: int, target: str) -> bool:
                 await send_message(chat_id, err_text)
         else:
             await send_message(chat_id, err_text)
+    finally:
+        try:
+            if 'out_path' in locals() and out_path and Path(out_path).exists():
+                Path(out_path).unlink()
+        except Exception:
+            pass
     return True
 
 
@@ -842,7 +941,7 @@ def _download_telegram_file(file_id: str, dest_path: Path) -> None:
     dest_path.write_bytes(resp.content)
 
 
-async def handle_transcribe_text_command(chat_id: int, text: str) -> bool:
+async def handle_transcribe_text_command(chat_id: int, text: str, message_ts: datetime | None = None) -> bool:
     if not FEATURE_TRANSCRIBE_ENABLED:
         return False
     target = _extract_transcribe_target(text)
@@ -851,10 +950,10 @@ async def handle_transcribe_text_command(chat_id: int, text: str) -> bool:
             await send_message(chat_id, "用法：/transcribe <YouTube URL | Podcast URL | 音訊 URL>")
             return True
         return False
-    return await _run_transcribe_url_flow(chat_id, target)
+    return await _run_transcribe_url_flow(chat_id, target, message_ts=message_ts)
 
 
-async def handle_transcribe_auto_url_message(chat_id: int, text: str) -> bool:
+async def handle_transcribe_auto_url_message(chat_id: int, text: str, message_ts: datetime | None = None) -> bool:
     if not FEATURE_TRANSCRIBE_ENABLED or not FEATURE_TRANSCRIBE_AUTO_URL:
         return False
     raw = (text or "").strip()
@@ -863,10 +962,10 @@ async def handle_transcribe_auto_url_message(chat_id: int, text: str) -> bool:
     target = _extract_supported_transcribe_url(raw)
     if not target:
         return False
-    return await _run_transcribe_url_flow(chat_id, target)
+    return await _run_transcribe_url_flow(chat_id, target, message_ts=message_ts)
 
 
-async def handle_transcribe_audio_message(chat_id: int, message: dict) -> bool:
+async def handle_transcribe_audio_message(chat_id: int, message: dict, message_ts: datetime | None = None) -> bool:
     if not FEATURE_TRANSCRIBE_ENABLED:
         return False
     extracted = _extract_audio_attachment(message)
@@ -901,18 +1000,23 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict) -> bool:
             ),
             intro_text,
         )
-        summary = await asyncio.to_thread(_build_transcript_ai_summary, out_path)
-        if summary:
-            await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
         if progress_msg_id:
             done_text = _build_transcribe_status_message(intro_text, f"轉錄完成：{title}")
             await edit_message(chat_id, progress_msg_id, done_text)
+        await asyncio.to_thread(
+            _append_transcript_to_telegram_markdown,
+            chat_id,
+            title,
+            original_filename,
+            out_path,
+            message_ts,
+        )
+        await send_message(chat_id, "已成功紀錄")
+        summary = await asyncio.to_thread(_build_transcript_ai_summary, out_path)
         if summary:
+            await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
             for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
                 await send_message(chat_id, chunk)
-        sent = await send_document(chat_id, out_path)
-        if not sent:
-            await send_message(chat_id, "檔案上傳失敗，請稍後重試。")
     except Exception as e:
         err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
         if 'progress_msg_id' in locals() and progress_msg_id:
@@ -925,6 +1029,11 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict) -> bool:
         try:
             if temp_input.exists():
                 temp_input.unlink()
+        except Exception:
+            pass
+        try:
+            if 'out_path' in locals() and out_path and Path(out_path).exists():
+                Path(out_path).unlink()
         except Exception:
             pass
     return True
@@ -1063,8 +1172,6 @@ def append_markdown(
     day = (message_ts or datetime.now()).strftime("%Y-%m-%d")
     if platform == "telegram":
         md_dir = TELEGRAM_MD_DIR
-    elif platform == "slack":
-        md_dir = SLACK_MD_DIR
     else:
         md_dir = NOTES_DIR / platform
         md_dir.mkdir(parents=True, exist_ok=True)
@@ -1104,9 +1211,9 @@ def append_ocr_markdown(
     message_ts: datetime | None,
 ) -> Path:
     day = (message_ts or datetime.now()).strftime("%Y-%m-%d")
-    md_path = OCR_MD_DIR / f"{day}_ocr.md"
+    md_path = TELEGRAM_MD_DIR / f"{day}_telegram.md"
     if not md_path.exists():
-        md_path.write_text(f"# {day} ocr\n\n", encoding="utf-8")
+        md_path.write_text(f"# {day} telegram\n\n", encoding="utf-8")
     try:
         rel_path = image_path.relative_to(DATA_DIR).as_posix()
     except Exception:
@@ -1114,14 +1221,14 @@ def append_ocr_markdown(
     time_str = (message_ts or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     normalized_text = (text or "").strip()
     with md_path.open("a", encoding="utf-8") as f:
-        f.write(f"## [{time_str}] telegram chat={chat_id} message={msg_id}\n")
+        f.write(f"## [{time_str}] OCR chat={chat_id} message={msg_id}\n")
         f.write(f"- image: `{rel_path}`\n")
         if normalized_text:
-            f.write("- text:\n\n")
+            f.write("- ocr_text:\n\n")
             f.write(normalized_text)
             f.write("\n\n")
         else:
-            f.write("- text: [no text detected]\n\n")
+            f.write("- ocr_text: [no text detected]\n\n")
     return md_path
 
 
@@ -1422,6 +1529,355 @@ def sync_file_to_dropbox(local_path: Path, remote_path: str) -> None:
             mute=True,
         )
     _dropbox_call_with_retry(_upload)
+
+
+def _dropbox_get_or_create_shared_link(remote_path: str) -> str | None:
+    if dropbox is None:
+        return None
+    normalized = normalize_dropbox_path(remote_path)
+
+    def _list_or_create(dbx):
+        try:
+            listed = dbx.sharing_list_shared_links(path=normalized, direct_only=True)
+            links = list(getattr(listed, "links", []) or [])
+            if links:
+                return links[0].url
+        except Exception:
+            pass
+        created = dbx.sharing_create_shared_link_with_settings(normalized)
+        return getattr(created, "url", None)
+
+    try:
+        url = _dropbox_call_with_retry(_list_or_create)
+    except Exception as e:
+        print(f"[WARN] Dropbox shared link failed for {normalized}: {e}")
+        return None
+    if not url:
+        return None
+    return str(url).replace("?dl=0", "?raw=1")
+
+
+def _dropbox_remote_path_for_local_data_file(local_path: Path) -> str | None:
+    try:
+        rel = local_path.resolve().relative_to(DATA_DIR).as_posix()
+    except Exception:
+        return None
+    root = normalize_dropbox_path(DROPBOX_ROOT_PATH)
+    return f"{root}/{rel}".replace("//", "/")
+
+
+def get_or_create_dropbox_shared_link_for_local_file(local_path: Path) -> str | None:
+    if not DROPBOX_SYNC_ENABLED:
+        return None
+    remote_path = _dropbox_remote_path_for_local_data_file(local_path)
+    if not remote_path:
+        return None
+    try:
+        _dropbox_call_with_retry(lambda dbx: ensure_dropbox_folders(dbx, normalize_dropbox_path(DROPBOX_ROOT_PATH)))
+        sync_file_to_dropbox(local_path, remote_path)
+    except Exception as e:
+        print(f"[WARN] Dropbox upload for shared link failed ({local_path}): {e}")
+        return None
+    return _dropbox_get_or_create_shared_link(remote_path)
+
+
+def _parse_notion_year_page_map() -> dict[str, str]:
+    if not NOTION_CHATLOG_YEAR_PAGES_JSON:
+        return {}
+    try:
+        raw = json.loads(NOTION_CHATLOG_YEAR_PAGES_JSON)
+    except Exception as e:
+        print(f"[WARN] NOTION_CHATLOG_YEAR_PAGES_JSON parse failed: {e}")
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        key = str(k).strip()
+        val = str(v).replace("-", "").strip()
+        if key and val:
+            out[key] = val
+    return out
+
+
+def _notion_is_chitchat_enabled() -> bool:
+    if APP_PROFILE != "chitchat":
+        return False
+    if not (NOTION_ENABLED and NOTION_TOKEN):
+        return False
+    return True
+
+
+def _notion_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def _notion_request(method: str, path: str, payload: dict | None = None) -> dict:
+    url = f"https://api.notion.com/v1/{path.lstrip('/')}"
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = requests.request(method.upper(), url, headers=_notion_headers(), json=payload, timeout=20)
+            if resp.status_code in {429, 500, 502, 503, 504}:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Notion API {resp.status_code}: {resp.text[:300]}")
+            if not resp.content:
+                return {}
+            return resp.json()
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            break
+    raise RuntimeError(str(last_exc) if last_exc else "Notion request failed")
+
+
+def _notion_rich_text_plain(block: dict) -> str:
+    for key in ("paragraph", "heading_1", "heading_2", "heading_3", "bulleted_list_item"):
+        node = block.get(key)
+        if not isinstance(node, dict):
+            continue
+        texts = node.get("rich_text") or []
+        chunks = []
+        for t in texts:
+            plain = (t or {}).get("plain_text") or ""
+            if plain:
+                chunks.append(plain)
+        if chunks:
+            return "".join(chunks).strip()
+    return ""
+
+
+def _notion_iter_block_children(block_id: str, page_size: int = 100) -> Iterator[dict]:
+    cursor = None
+    while True:
+        path = f"blocks/{block_id}/children?page_size={page_size}"
+        if cursor:
+            path += f"&start_cursor={quote(str(cursor), safe='')}"
+        data = _notion_request("GET", path)
+        for item in data.get("results") or []:
+            if isinstance(item, dict):
+                yield item
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+        if not cursor:
+            break
+
+
+def _notion_append_block_children(block_id: str, children: list[dict], after: str | None = None) -> list[dict]:
+    payload: dict[str, object] = {"children": children}
+    if after:
+        payload["after"] = after
+    data = _notion_request("PATCH", f"blocks/{block_id}/children", payload)
+    return list(data.get("results") or [])
+
+
+def _notion_paragraph_block(text: str) -> dict:
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+    }
+
+
+def _notion_bullet_block(text: str) -> dict:
+    return {
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+    }
+
+
+def _notion_h2_block(text: str) -> dict:
+    return {
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+    }
+
+
+def _notion_day_label(dt: datetime | None) -> str:
+    d = dt or datetime.now()
+    return f"{d.year}/{d.month}/{d.day}"
+
+
+def _notion_get_chatlog_year_page_id(dt: datetime | None) -> str | None:
+    d = dt or datetime.now()
+    mapping = _parse_notion_year_page_map()
+    page_id = mapping.get(str(d.year))
+    if page_id:
+        return page_id
+    if NOTION_CHATLOG_FALLBACK_PAGE_ID:
+        return NOTION_CHATLOG_FALLBACK_PAGE_ID.replace("-", "")
+    return None
+
+
+def _notion_cache_key_date(page_id: str, day_label: str) -> str:
+    return f"{page_id}:{day_label}"
+
+
+def _notion_find_top_anchor_block_id(page_id: str) -> str | None:
+    for block in _notion_iter_block_children(page_id, page_size=20):
+        block_type = (block.get("type") or "").strip()
+        if block_type == "divider":
+            return str(block.get("id") or "")
+        if block_type == "paragraph" and _notion_rich_text_plain(block) == "Chatlog Anchor":
+            return str(block.get("id") or "")
+    return None
+
+
+def _notion_ensure_top_anchor(page_id: str) -> str:
+    cached = _notion_top_anchor_cache.get(page_id)
+    if cached:
+        return cached
+    found = _notion_find_top_anchor_block_id(page_id)
+    if found:
+        _notion_top_anchor_cache[page_id] = found
+        return found
+    first_block_id = None
+    for block in _notion_iter_block_children(page_id, page_size=1):
+        first_block_id = str(block.get("id") or "")
+        break
+    if first_block_id:
+        print("[WARN] Notion top anchor missing; using first block as insertion anchor (not absolute top).")
+        _notion_top_anchor_cache[page_id] = first_block_id
+        return first_block_id
+    created = _notion_append_block_children(
+        page_id,
+        [{"object": "block", "type": "divider", "divider": {}}],
+    )
+    if not created:
+        raise RuntimeError("Notion anchor create returned no blocks")
+    block_id = str(created[0].get("id") or "")
+    if not block_id:
+        raise RuntimeError("Notion anchor block id missing")
+    _notion_top_anchor_cache[page_id] = block_id
+    return block_id
+
+
+def _notion_find_date_heading_block_id(page_id: str, day_label: str) -> str | None:
+    for block in _notion_iter_block_children(page_id):
+        if (block.get("type") or "") != "heading_2":
+            continue
+        if _notion_rich_text_plain(block) == day_label:
+            return str(block.get("id") or "")
+    return None
+
+
+def _notion_ensure_date_heading(page_id: str, day_label: str) -> str:
+    key = _notion_cache_key_date(page_id, day_label)
+    cached = _notion_date_heading_cache.get(key)
+    if cached:
+        return cached
+    found = _notion_find_date_heading_block_id(page_id, day_label)
+    if found:
+        _notion_date_heading_cache[key] = found
+        return found
+    anchor_id = _notion_ensure_top_anchor(page_id)
+    created = _notion_append_block_children(page_id, [_notion_h2_block(day_label)], after=anchor_id)
+    if not created:
+        raise RuntimeError("Notion date heading create returned no blocks")
+    heading_id = str(created[0].get("id") or "")
+    if not heading_id:
+        raise RuntimeError("Notion date heading block id missing")
+    _notion_date_heading_cache[key] = heading_id
+    return heading_id
+
+
+def notion_append_chitchat_text(text: str, msg_ts: datetime | None) -> None:
+    if not _notion_is_chitchat_enabled():
+        return
+    normalized = (text or "").strip()
+    if not normalized:
+        return
+    page_id = _notion_get_chatlog_year_page_id(msg_ts)
+    if not page_id:
+        print("[WARN] Notion chatlog page id not configured for year")
+        return
+    day_label = _notion_day_label(msg_ts)
+    try:
+        heading_id = _notion_ensure_date_heading(page_id, day_label)
+        _notion_append_block_children(page_id, [_notion_bullet_block(normalized)], after=heading_id)
+    except Exception as e:
+        print(f"[WARN] Notion text append failed: {e}")
+
+
+def _notion_summarize_ocr_text(ocr_text: str | None, limit: int = 160) -> str | None:
+    txt = (ocr_text or "").strip()
+    if not txt:
+        return None
+    txt = " ".join(txt.split())
+    if txt.startswith("[OCR failed]"):
+        return None
+    if len(txt) > limit:
+        return txt[:limit].rstrip() + "..."
+    return txt
+
+
+def _infer_message_dt_from_image_path(image_path: Path) -> datetime | None:
+    try:
+        day_part = image_path.parent.name
+        return datetime.strptime(day_part, "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _parse_iso_dt_or_none(value: str | None) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def notion_append_chitchat_image(
+    *,
+    image_path: Path,
+    caption: str | None = None,
+    ocr_text: str | None = None,
+    msg_ts: datetime | None = None,
+) -> None:
+    if not _notion_is_chitchat_enabled():
+        return
+    if NOTION_CHATLOG_IMAGE_MODE != "link":
+        return
+    page_id = _notion_get_chatlog_year_page_id(msg_ts or _infer_message_dt_from_image_path(image_path))
+    if not page_id:
+        print("[WARN] Notion chatlog page id not configured for image year")
+        return
+    day_label = _notion_day_label(msg_ts or _infer_message_dt_from_image_path(image_path))
+    bullet = "[圖片]"
+    cap = (caption or "").strip()
+    if cap:
+        bullet = f"{bullet} {cap}"
+    blocks = [_notion_bullet_block(bullet)]
+    image_url = get_or_create_dropbox_shared_link_for_local_file(image_path)
+    if image_url:
+        blocks.append(_notion_paragraph_block(f"圖片：{image_url}"))
+    else:
+        try:
+            rel = image_path.resolve().relative_to(DATA_DIR).as_posix()
+        except Exception:
+            rel = str(image_path)
+        blocks.append(_notion_paragraph_block(f"圖片：[link unavailable] {rel}"))
+    ocr_summary = _notion_summarize_ocr_text(ocr_text) if NOTION_CHATLOG_OCR_MODE == "optional" else None
+    if ocr_summary:
+        blocks.append(_notion_paragraph_block(f"OCR 摘要：{ocr_summary}"))
+    try:
+        heading_id = _notion_ensure_date_heading(page_id, day_label)
+        _notion_append_block_children(page_id, blocks, after=heading_id)
+    except Exception as e:
+        print(f"[WARN] Notion image append failed: {e}")
 
 
 def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
@@ -2265,20 +2721,6 @@ def _collect_transcript_files_for_day(day: str) -> list[Path]:
 
 def _summary_files_for_day(day: str) -> tuple[list[Path], list[Path]]:
     notes_files = sorted(NOTES_DIR.rglob(f"{day}*.md"))
-    ocr_files = sorted(OCR_MD_DIR.glob(f"{day}*_ocr.md"))
-    if ocr_files:
-        seen = {str(fp) for fp in notes_files}
-        for fp in ocr_files:
-            if str(fp) not in seen:
-                notes_files.append(fp)
-        notes_files.sort()
-    transcript_files = _collect_transcript_files_for_day(day)
-    if transcript_files:
-        seen = {str(fp) for fp in notes_files}
-        for fp in transcript_files:
-            if str(fp) not in seen:
-                notes_files.append(fp)
-        notes_files.sort()
 
     news_files: list[Path] = []
     if FEATURE_NEWS_ENABLED:
@@ -3617,6 +4059,17 @@ def _ollama_health() -> str:
         return f"error:{type(e).__name__}"
 
 
+def _fmt_diag_time(ts: float) -> str:
+    if not ts:
+        return "never"
+    try:
+        dt = datetime.fromtimestamp(ts, tz=get_local_tz())
+        age_sec = max(0, int(time.time() - ts))
+        return f"{dt.strftime('%Y-%m-%d %H:%M:%S %Z')} ({age_sec}s ago)"
+    except Exception:
+        return "error"
+
+
 def build_status_report() -> str:
     now = datetime.now(tz=get_local_tz())
     day = now.strftime("%Y-%m-%d")
@@ -3657,6 +4110,18 @@ def build_status_report() -> str:
     ]
     if FEATURE_NEWS_ENABLED:
         lines.append(f"news clusters (24h): {news_24h}")
+    lines.append(f"telegram mode: {'long_polling' if TELEGRAM_LONG_POLLING else 'webhook'}")
+    if TELEGRAM_LONG_POLLING:
+        lines.append(f"telegram poll last ok: {_fmt_diag_time(_telegram_poll_last_ok_at)}")
+        lines.append(f"telegram poll last update: {_fmt_diag_time(_telegram_poll_last_update_at)}")
+        lines.append(
+            "telegram poll last update id: "
+            + (str(_telegram_poll_last_update_id) if _telegram_poll_last_update_id is not None else "n/a")
+        )
+        lines.append(f"telegram poll last error: {_telegram_poll_last_error or 'none'}")
+    lines.append(f"telegram send last ok: {_fmt_diag_time(_telegram_send_last_ok_at)}")
+    lines.append(f"telegram send last status: {_telegram_send_last_status or 'n/a'}")
+    lines.append(f"telegram send last error: {_telegram_send_last_error or 'none'}")
     lines.extend([
         f"note markdown files (3d): {notes_3d}",
         f"dropbox sync: {'on' if DROPBOX_SYNC_ENABLED else 'off'} ({DROPBOX_SYNC_TIME} {DROPBOX_SYNC_TZ_NAME})",
@@ -3794,7 +4259,21 @@ async def handle_ocr_choice_callback(callback: dict) -> None:
         await answer_callback_query(callback_id, "任務不存在或已過期", show_alert=False)
         return
 
-    _job_id, job_chat_id, prompt_message_id, image_path_raw, source_msg_id, expires_at, status, _ocr_done, _ocr_md = job
+    (
+        _job_id,
+        job_chat_id,
+        prompt_message_id,
+        image_path_raw,
+        source_msg_id,
+        expires_at,
+        status,
+        _ocr_done,
+        _ocr_md,
+        caption_raw,
+        message_ts_raw,
+    ) = job
+    job_msg_ts = _parse_iso_dt_or_none(message_ts_raw)
+    job_caption = (caption_raw or "").strip() or None
     if str(chat_id or "") != str(job_chat_id):
         await answer_callback_query(callback_id, "無效操作", show_alert=False)
         return
@@ -3810,6 +4289,14 @@ async def handle_ocr_choice_callback(callback: dict) -> None:
         return
     if now >= expire_dt:
         _update_ocr_choice_job_status(job_id, "expired", ocr_done=0, ocr_md_saved=0)
+        if OCR_CHOICE_TIMEOUT_DEFAULT == "skip":
+            await asyncio.to_thread(
+                notion_append_chitchat_image,
+                image_path=Path(image_path_raw),
+                caption=job_caption,
+                ocr_text=None,
+                msg_ts=job_msg_ts,
+            )
         if prompt_message_id:
             await edit_message(int(job_chat_id), int(prompt_message_id), "圖片已逾時，已自動只存圖。")
         await answer_callback_query(callback_id, "已逾時", show_alert=False)
@@ -3817,6 +4304,13 @@ async def handle_ocr_choice_callback(callback: dict) -> None:
 
     if action == "save":
         _update_ocr_choice_job_status(job_id, "save", ocr_done=0, ocr_md_saved=0)
+        await asyncio.to_thread(
+            notion_append_chitchat_image,
+            image_path=Path(image_path_raw),
+            caption=job_caption,
+            ocr_text=None,
+            msg_ts=job_msg_ts,
+        )
         if prompt_message_id:
             await edit_message(int(job_chat_id), int(prompt_message_id), "已存圖（未執行 OCR）。")
         await answer_callback_query(callback_id, "已選擇只存圖", show_alert=False)
@@ -3830,12 +4324,19 @@ async def handle_ocr_choice_callback(callback: dict) -> None:
         await answer_callback_query(callback_id, "OCR 失敗", show_alert=False)
         return
 
-    ocr_ok, md_saved = await asyncio.to_thread(
+    ocr_ok, md_saved, ocr_text = await asyncio.to_thread(
         _run_ocr_on_image,
         chat_id=int(job_chat_id),
         msg_id=source_msg_id or "",
         image_path=image_path,
         msg_ts=datetime.now(),
+    )
+    await asyncio.to_thread(
+        notion_append_chitchat_image,
+        image_path=image_path,
+        caption=job_caption,
+        ocr_text=ocr_text if ocr_ok else None,
+        msg_ts=job_msg_ts,
     )
     if ocr_ok and md_saved:
         _update_ocr_choice_job_status(job_id, "run", ocr_done=1, ocr_md_saved=1)
@@ -3850,8 +4351,15 @@ async def handle_ocr_choice_callback(callback: dict) -> None:
 
 
 def expire_ocr_choice_jobs_once() -> None:
-    for job_id, chat_id, prompt_message_id in _list_expired_ocr_choice_jobs():
+    for job_id, chat_id, prompt_message_id, image_path_raw, caption_raw, message_ts_raw in _list_expired_ocr_choice_jobs():
         _update_ocr_choice_job_status(job_id, "expired", ocr_done=0, ocr_md_saved=0)
+        if OCR_CHOICE_TIMEOUT_DEFAULT == "skip":
+            notion_append_chitchat_image(
+                image_path=Path(image_path_raw),
+                caption=(caption_raw or "").strip() or None,
+                ocr_text=None,
+                msg_ts=_parse_iso_dt_or_none(message_ts_raw),
+            )
         if prompt_message_id:
             try:
                 requests.post(
@@ -3901,6 +4409,7 @@ def telegram_get_file_info(file_id: str) -> tuple[str, str] | None:
 
 
 def telegram_polling_loop() -> None:
+    global _telegram_poll_last_ok_at, _telegram_poll_last_update_at, _telegram_poll_last_update_id, _telegram_poll_last_error
     print("[INFO] Telegram long polling enabled.")
     delete_telegram_webhook(drop_pending=False)
     offset = None
@@ -3915,21 +4424,35 @@ def telegram_polling_loop() -> None:
                 timeout=30,
             )
             if resp.status_code != 200:
+                body = (resp.text or "").strip().replace("\n", " ")
+                body = body[:300]
+                _telegram_poll_last_error = f"http_{resp.status_code}: {body}" if body else f"http_{resp.status_code}"
+                print(f"[WARN] Telegram getUpdates http={resp.status_code} body={body}")
                 time.sleep(2)
                 continue
             data = resp.json()
+            _telegram_poll_last_ok_at = time.time()
             if not data.get("ok"):
+                desc = str(data.get("description") or "unknown_error")
+                _telegram_poll_last_error = f"telegram_not_ok: {desc}"
+                print(f"[WARN] Telegram getUpdates ok=false: {desc}")
                 time.sleep(2)
                 continue
+            _telegram_poll_last_error = ""
             for update in data.get("result", []):
                 update_id = update.get("update_id")
                 if update_id is not None:
                     offset = update_id + 1
+                    _telegram_poll_last_update_id = int(update_id)
+                # Mark update as seen immediately so /status reflects the latest received update.
+                _telegram_poll_last_update_at = time.time()
                 try:
                     asyncio.run(process_telegram_update(update))
                 except Exception as e:
                     print(f"[WARN] telegram update process error: {e}")
+                    print(traceback.format_exc())
         except Exception as e:
+            _telegram_poll_last_error = f"{type(e).__name__}: {e}"
             print(f"[ERROR] Telegram polling error: {e}")
             time.sleep(2)
 
@@ -3987,29 +4510,48 @@ async def process_telegram_update(update: dict) -> None:
     if (is_group or is_private) and chat_id and text:
         store_message("telegram", str(chat_id), chat_title or chat_type or "", user_id, user_name, text, msg_ts)
         append_markdown("telegram", chat_title or ("private" if is_private else str(chat_id)), user_name, text, msg_ts)
+        await asyncio.to_thread(notion_append_chitchat_text, text, msg_ts)
 
     if is_private and chat_id and has_audio_attachment and not has_image:
-        handled = await handle_transcribe_audio_message(chat_id, message)
+        handled = await handle_transcribe_audio_message(chat_id, message, message_ts=msg_ts)
         if handled:
             return
 
     if is_private and chat_id and text and not has_image and not has_audio_attachment:
-        cmd_text = text.strip()
+        try:
+            cmd_text = text.strip()
+            lower = cmd_text.lower()
+            is_local_control_text = (
+                lower.startswith("open ")
+                or lower in {"notepad", "open notepad", "sort downloads", "help", "/help"}
+            )
 
-        if await handle_transcribe_text_command(chat_id, cmd_text):
-            return
-        if await handle_transcribe_auto_url_message(chat_id, cmd_text):
-            return
+            if await handle_transcribe_text_command(chat_id, cmd_text, message_ts=msg_ts):
+                return
+            if await handle_transcribe_auto_url_message(chat_id, cmd_text, message_ts=msg_ts):
+                return
 
-        replies, parse_mode, disable_preview = route_user_text_command(cmd_text, str(chat_id))
-        for reply in replies:
-            for chunk in _chunk_text_for_telegram(reply):
-                await send_message(
-                    chat_id,
-                    chunk,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=disable_preview,
-                )
+            # For normal recorded text, always send a clear ACK.
+            if not cmd_text.startswith("/") and not is_local_control_text:
+                sent_id = await send_message(chat_id, "已成功紀錄")
+                if sent_id is None:
+                    print(f"[WARN] ack send failed chat_id={chat_id}")
+                return
+
+            replies, parse_mode, disable_preview = route_user_text_command(cmd_text, str(chat_id))
+            for reply in replies:
+                for chunk in _chunk_text_for_telegram(reply):
+                    sent_id = await send_message(
+                        chat_id,
+                        chunk,
+                        parse_mode=parse_mode,
+                        disable_web_page_preview=disable_preview,
+                    )
+                    if sent_id is None:
+                        print(f"[WARN] reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
+        except Exception as e:
+            print(f"[WARN] private command handling failed: {type(e).__name__}: {e}")
+            await send_message(chat_id, f"指令處理失敗：{type(e).__name__}")
         return
 
     if FEATURE_OCR_ENABLED and (is_private or is_group) and chat_id and has_image:
@@ -4048,6 +4590,13 @@ async def process_telegram_update(update: dict) -> None:
                 keyboard = _build_ocr_choice_keyboard(job_id)
                 prompt_message_id = await send_message(chat_id, prompt_text, reply_markup=keyboard)
                 if not prompt_message_id:
+                    await asyncio.to_thread(
+                        notion_append_chitchat_image,
+                        image_path=out_path,
+                        caption=text or None,
+                        ocr_text=None,
+                        msg_ts=msg_ts,
+                    )
                     await send_message(chat_id, "圖片已儲存（未執行 OCR）。")
                     return
                 created_job_id = await asyncio.to_thread(
@@ -4058,16 +4607,25 @@ async def process_telegram_update(update: dict) -> None:
                     image_path=out_path,
                     file_unique_id=file_unique_id,
                     source_msg_id=msg_id,
+                    caption=text or None,
+                    message_ts=msg_ts,
                 )
                 if created_job_id != job_id:
                     print(f"[WARN] OCR choice job id mismatch: generated={job_id} stored={created_job_id}")
                 return
 
-            ocr_ok, md_saved = await asyncio.to_thread(
+            ocr_ok, md_saved, ocr_text = await asyncio.to_thread(
                 _run_ocr_on_image,
                 chat_id=chat_id,
                 msg_id=msg_id,
                 image_path=out_path,
+                msg_ts=msg_ts,
+            )
+            await asyncio.to_thread(
+                notion_append_chitchat_image,
+                image_path=out_path,
+                caption=text or None,
+                ocr_text=ocr_text if ocr_ok else None,
                 msg_ts=msg_ts,
             )
             is_ocr_success = ocr_ok and md_saved

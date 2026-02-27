@@ -33,6 +33,7 @@ Feature flags:
 - `FEATURE_NEWS_ENABLED` enable/disable news ingest + `/news` commands
 - `FEATURE_TRANSCRIBE_ENABLED` enable/disable `/transcribe` and audio transcription
 - `FEATURE_TRANSCRIBE_AUTO_URL` when set `1`, private chat plain URLs auto-trigger transcription
+- `TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS` progress heartbeat interval while transcription is running (default: `30`)
 - `FEATURE_OCR_ENABLED` enable/disable image OCR pipeline
 - `FEATURE_OCR_CHOICE_ENABLED` when set `1`, image OCR asks user to choose (`進行 OCR` or `只存圖`)
 - `OCR_CHOICE_SCOPE` OCR choice scope (`private` recommended)
@@ -159,6 +160,7 @@ sort downloads
 ```
 
 `/news` and `/transcribe` availability depends on `FEATURE_NEWS_ENABLED` and `FEATURE_TRANSCRIBE_ENABLED`.
+Transcription flow: bot sends `已成功紀錄` right after transcript is saved, then sends AI summary afterward (if enabled).
 
 Group logging (no reply):
 - Messages in allowed groups are stored in SQLite and appended to Markdown files.
@@ -170,9 +172,9 @@ Slack DM logging (no reply):
 - Run uvicorn, then send a DM to your bot.
 
 Image OCR and cloud sync:
-- Telegram private image uploads are saved to `DATA_DIR\inbox\images\YYYY-MM-DD\`.
+- Telegram private image uploads are saved to `DATA_DIR\\images\YYYY-MM-DD\`.
 - If OCR choice is enabled, bot asks per image: `進行 OCR` or `只存圖`; timeout defaults to save-only.
-- OCR output is appended to `DATA_DIR\notes\ocr\YYYY-MM-DD_ocr.md`.
-- A Dropbox worker syncs local `notes` and `inbox/images` to:
-- `/read/notes`
-- `/read/images`
+- OCR output is appended to `DATA_DIR\\notes\\telegram\\YYYY-MM-DD_telegram.md`.
+- A Dropbox worker syncs local `notes` and `images` to:
+- `/read & chat/read/notes`
+- `/read & chat/read/images`
