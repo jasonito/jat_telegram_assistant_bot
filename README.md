@@ -59,6 +59,20 @@ Dropbox sync:
 - `DROPBOX_SYNC_TZ` sync timezone (default: `Asia/Taipei`)
 - `DROPBOX_SYNC_ON_STARTUP` set `1` to run one full backfill at startup
 
+Notion (chitchat profile):
+- `NOTION_ENABLED` set `1` to enable Notion append for chitchat
+- `NOTION_TOKEN` Notion Internal Integration Secret (token), format like `ntn_...`
+- `NOTION_VERSION` Notion API version header (keep default unless you need migration)
+- `NOTION_CHATLOG_YEAR_PAGES_JSON` year->page_id map, e.g. `{"2026":"2dbf40303e778048974edcd4d534afd8"}`
+- `NOTION_CHATLOG_FALLBACK_PAGE_ID` fallback page id when year map has no match
+- `NOTION_CHATLOG_IMAGE_MODE` image sync mode; current supported value is `link`
+- `NOTION_CHATLOG_OCR_MODE` OCR sync mode; `optional` means include OCR summary when available
+- `NOTION_CHATLOG_INCLUDE_TIME` set `1` to prefix entries with `[HH:MM]`
+
+Notes:
+- `page_id` should be pure Notion page id (32 hex chars or UUID style), do not prefix with year text.
+- Share the target parent/page with your integration in Notion (`Share` -> invite integration), or writes will fail with 403.
+
 Slack (Socket Mode):
 - `SLACK_BOT_TOKEN` (xoxb-...)
 - `SLACK_APP_TOKEN` (xapp-...) with `connections:write`

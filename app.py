@@ -883,6 +883,13 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
             message_ts,
         )
         await send_message(chat_id, "已成功紀錄")
+        await asyncio.to_thread(
+            notion_append_chitchat_transcript,
+            title=title,
+            source=target,
+            transcript_path=out_path,
+            msg_ts=message_ts,
+        )
         summary = await asyncio.to_thread(_build_transcript_ai_summary, out_path)
         if summary:
             await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
@@ -1012,6 +1019,13 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
             message_ts,
         )
         await send_message(chat_id, "已成功紀錄")
+        await asyncio.to_thread(
+            notion_append_chitchat_transcript,
+            title=title,
+            source=original_filename,
+            transcript_path=out_path,
+            msg_ts=message_ts,
+        )
         summary = await asyncio.to_thread(_build_transcript_ai_summary, out_path)
         if summary:
             await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
@@ -1709,6 +1723,12 @@ def _notion_day_label(dt: datetime | None) -> str:
     return f"{d.year}/{d.month}/{d.day}"
 
 
+def _notion_time_prefix(dt: datetime | None) -> str:
+    if not (NOTION_CHATLOG_INCLUDE_TIME and dt):
+        return ""
+    return f"[{dt.strftime('%H:%M')}] "
+
+
 def _notion_get_chatlog_year_page_id(dt: datetime | None) -> str | None:
     d = dt or datetime.now()
     mapping = _parse_notion_year_page_map()
@@ -1798,6 +1818,7 @@ def notion_append_chitchat_text(text: str, msg_ts: datetime | None) -> None:
     normalized = (text or "").strip()
     if not normalized:
         return
+    normalized = _notion_time_prefix(msg_ts) + normalized
     page_id = _notion_get_chatlog_year_page_id(msg_ts)
     if not page_id:
         print("[WARN] Notion chatlog page id not configured for year")
@@ -1808,6 +1829,65 @@ def notion_append_chitchat_text(text: str, msg_ts: datetime | None) -> None:
         _notion_append_block_children(page_id, [_notion_bullet_block(normalized)], after=heading_id)
     except Exception as e:
         print(f"[WARN] Notion text append failed: {e}")
+
+
+def _notion_extract_transcript_excerpt(transcript_path: Path, limit: int = 220) -> str | None:
+    try:
+        raw = transcript_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    lines: list[str] = []
+    in_ai_summary = False
+    for line in raw.splitlines():
+        s = (line or "").strip()
+        if not s:
+            continue
+        if s.startswith("## AI 摘要"):
+            in_ai_summary = True
+            continue
+        if in_ai_summary:
+            if s.startswith("---"):
+                in_ai_summary = False
+            continue
+        if s.startswith("#") or s.startswith("- **") or s.startswith("---") or s.startswith("摘要："):
+            continue
+        lines.append(s)
+        if len(lines) >= 3:
+            break
+    if not lines:
+        return None
+    excerpt = " ".join(" ".join(lines).split())
+    if len(excerpt) > limit:
+        excerpt = excerpt[:limit].rstrip() + "..."
+    return excerpt
+
+
+def notion_append_chitchat_transcript(
+    *,
+    title: str,
+    source: str,
+    transcript_path: Path,
+    msg_ts: datetime | None,
+) -> None:
+    if not _notion_is_chitchat_enabled():
+        return
+    page_id = _notion_get_chatlog_year_page_id(msg_ts)
+    if not page_id:
+        print("[WARN] Notion chatlog page id not configured for transcript year")
+        return
+    day_label = _notion_day_label(msg_ts)
+    normalized_title = (title or "").strip() or "untitled"
+    normalized_source = (source or "").strip() or "unknown"
+    excerpt = _notion_extract_transcript_excerpt(transcript_path)
+    blocks = [_notion_bullet_block(f"{_notion_time_prefix(msg_ts)}[轉錄] {normalized_title}")]
+    blocks.append(_notion_paragraph_block(f"來源：{normalized_source}"))
+    if excerpt:
+        blocks.append(_notion_paragraph_block(f"摘錄：{excerpt}"))
+    try:
+        heading_id = _notion_ensure_date_heading(page_id, day_label)
+        _notion_append_block_children(page_id, blocks, after=heading_id)
+    except Exception as e:
+        print(f"[WARN] Notion transcript append failed: {e}")
 
 
 def _notion_summarize_ocr_text(ocr_text: str | None, limit: int = 160) -> str | None:
@@ -4108,6 +4188,11 @@ def build_status_report() -> str:
         f"ollama health: {_ollama_health()}",
         f"db path exists: {'yes' if DB_PATH.exists() else 'no'}",
     ]
+    if APP_PROFILE == "chitchat":
+        notion_ready = "yes" if _notion_is_chitchat_enabled() else "no"
+        notion_year_page = _notion_get_chatlog_year_page_id(now)
+        lines.append(f"notion chitchat sync: {notion_ready}")
+        lines.append(f"notion target page ({now.year}): {notion_year_page or 'missing'}")
     if FEATURE_NEWS_ENABLED:
         lines.append(f"news clusters (24h): {news_24h}")
     lines.append(f"telegram mode: {'long_polling' if TELEGRAM_LONG_POLLING else 'webhook'}")
