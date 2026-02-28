@@ -67,6 +67,21 @@ TELEGRAM_FILE_FETCH_READ_TIMEOUT = max(3, int(os.getenv("TELEGRAM_FILE_FETCH_REA
 TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS = max(
     0.1, float(os.getenv("TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS", "0.25"))
 )
+TELEGRAM_POLL_TIMEOUT_SECONDS = max(5, int(os.getenv("TELEGRAM_POLL_TIMEOUT_SECONDS", "20")))
+TELEGRAM_POLL_CONNECT_TIMEOUT_SECONDS = max(
+    3, int(os.getenv("TELEGRAM_POLL_CONNECT_TIMEOUT_SECONDS", "10"))
+)
+TELEGRAM_POLL_READ_TIMEOUT_SECONDS = max(
+    TELEGRAM_POLL_TIMEOUT_SECONDS + 5,
+    int(os.getenv("TELEGRAM_POLL_READ_TIMEOUT_SECONDS", "35")),
+)
+TELEGRAM_POLL_ERROR_BACKOFF_BASE_SECONDS = max(
+    1.0, float(os.getenv("TELEGRAM_POLL_ERROR_BACKOFF_BASE_SECONDS", "2"))
+)
+TELEGRAM_POLL_ERROR_BACKOFF_MAX_SECONDS = max(
+    TELEGRAM_POLL_ERROR_BACKOFF_BASE_SECONDS,
+    float(os.getenv("TELEGRAM_POLL_ERROR_BACKOFF_MAX_SECONDS", "20")),
+)
 
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "read")).resolve()
 DB_PATH = DATA_DIR / "messages.sqlite"
@@ -190,10 +205,98 @@ _telegram_poll_last_error = ""
 _telegram_send_last_ok_at = 0.0
 _telegram_send_last_status = ""
 _telegram_send_last_error = ""
+_recent_update_ids: dict[int, float] = {}
+_recent_update_ids_lock = threading.Lock()
 
 ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".aac", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".opus"}
 URL_RE = re.compile(r"https?://[^\s<>()]+", flags=re.I)
+DIRECT_AUDIO_URL_RE = re.compile(r"\.(mp3|m4a|wav|ogg|aac|flac|wma|opus)(\?|$)", re.IGNORECASE)
 OCR_CHOICE_CALLBACK_RE = re.compile(r"^ocr_choice:([a-f0-9-]{8,64}):(run|save)$", flags=re.I)
+_TRANSCRIBE_JOBS: dict[int, dict] = {}
+_TRANSCRIBE_JOBS_LOCK = threading.Lock()
+
+
+class TranscribeJobCancelled(Exception):
+    """Raised when active transcription job is cancelled."""
+
+
+def _normalize_text_value(value, default: str = "") -> str:
+    if isinstance(value, str):
+        txt = value.strip()
+    elif value is None:
+        txt = ""
+    elif isinstance(value, (list, tuple, set)):
+        txt = " ".join(str(x) for x in value if x is not None).strip()
+    else:
+        txt = str(value).strip()
+    return txt or default
+
+
+def _mark_update_seen(update_id: int | None, ttl_seconds: int = 600) -> bool:
+    if update_id is None:
+        return False
+    now = time.time()
+    with _recent_update_ids_lock:
+        expired = [k for k, ts in _recent_update_ids.items() if now - ts > ttl_seconds]
+        for k in expired:
+            _recent_update_ids.pop(k, None)
+        if update_id in _recent_update_ids:
+            return True
+        _recent_update_ids[update_id] = now
+    return False
+
+
+def _register_transcribe_job(chat_id: int, job_id: str, cancel_event: Event) -> bool:
+    now = time.time()
+    with _TRANSCRIBE_JOBS_LOCK:
+        existing = _TRANSCRIBE_JOBS.get(chat_id)
+        if existing and not existing.get("finished"):
+            return False
+        _TRANSCRIBE_JOBS[chat_id] = {
+            "job_id": job_id,
+            "cancel_event": cancel_event,
+            "started_at": now,
+            "progress_message_id": None,
+            "finished": False,
+        }
+    return True
+
+
+def _set_transcribe_progress_message_id(chat_id: int, job_id: str, message_id: int | None) -> None:
+    with _TRANSCRIBE_JOBS_LOCK:
+        existing = _TRANSCRIBE_JOBS.get(chat_id)
+        if not existing or existing.get("job_id") != job_id:
+            return
+        existing["progress_message_id"] = message_id
+
+
+def _get_transcribe_job(chat_id: int) -> dict | None:
+    with _TRANSCRIBE_JOBS_LOCK:
+        existing = _TRANSCRIBE_JOBS.get(chat_id)
+        if not existing:
+            return None
+        return dict(existing)
+
+
+def _cancel_transcribe_job(chat_id: int) -> dict | None:
+    with _TRANSCRIBE_JOBS_LOCK:
+        existing = _TRANSCRIBE_JOBS.get(chat_id)
+        if not existing or existing.get("finished"):
+            return None
+        cancel_event = existing.get("cancel_event")
+        if isinstance(cancel_event, Event):
+            cancel_event.set()
+        existing["cancelled_at"] = time.time()
+        return dict(existing)
+
+
+def _clear_transcribe_job(chat_id: int, job_id: str) -> None:
+    with _TRANSCRIBE_JOBS_LOCK:
+        existing = _TRANSCRIBE_JOBS.get(chat_id)
+        if not existing or existing.get("job_id") != job_id:
+            return
+        existing["finished"] = True
+        _TRANSCRIBE_JOBS.pop(chat_id, None)
 
 
 def _load_transcription_module():
@@ -419,6 +522,16 @@ async def send_message(
     return await asyncio.to_thread(_send)
 
 
+async def send_ack_message(chat_id: int, text: str = "已成功紀錄") -> bool:
+    for attempt in range(3):
+        sent_id = await send_message(chat_id, text)
+        if sent_id is not None:
+            return True
+        if attempt < 2:
+            await asyncio.sleep(0.8 * (attempt + 1))
+    return False
+
+
 async def edit_message(chat_id: int, message_id: int, text: str) -> bool:
     def _edit() -> bool:
         payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
@@ -426,7 +539,14 @@ async def edit_message(chat_id: int, message_id: int, text: str) -> bool:
             resp = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload, timeout=10)
             data = resp.json() if resp.content else {}
             print(f"editMessageText status={resp.status_code} ok={bool(data.get('ok'))}")
-            return bool(resp.status_code < 300 and data.get("ok"))
+            if resp.status_code < 300 and data.get("ok"):
+                return True
+            # Telegram returns this when the text is unchanged; treat as success
+            # so we do not incorrectly fan out new progress messages.
+            desc = str(data.get("description") or "").lower()
+            if "message is not modified" in desc:
+                return True
+            return False
         except Exception:
             return False
 
@@ -704,14 +824,15 @@ def _extract_supported_transcribe_url(text: str) -> str:
     raw = (text or "").strip()
     if not raw:
         return ""
-    try:
-        tx = _load_transcription_module()
-    except Exception:
-        return ""
     for match in URL_RE.findall(raw):
         candidate = match.rstrip(").,;!?")
-        _url_type, error = tx.classify_url(candidate)
-        if not error:
+        lower = candidate.lower()
+        if (
+            "youtube.com/" in lower
+            or "youtu.be/" in lower
+            or "podcasts.apple.com/" in lower
+            or DIRECT_AUDIO_URL_RE.search(candidate)
+        ):
             return candidate
     return ""
 
@@ -732,7 +853,8 @@ def _build_transcript_ai_summary(transcript_path: Path) -> str | None:
         return None
 
     clipped = transcript_text[: min(len(transcript_text), AI_SUMMARY_MAX_CHARS)]
-    fallback = _fallback_three_points(clipped)
+    fallback_points = _fallback_three_points(clipped)
+    fallback = "\n".join(f"- {p}" for p in fallback_points if _normalize_text_value(p))
     if not AI_SUMMARY_ENABLED:
         return fallback
 
@@ -750,8 +872,8 @@ def _build_transcript_ai_summary(transcript_path: Path) -> str | None:
     return ai or fallback
 
 
-def _prepend_summary_to_transcript(transcript_path: Path, summary_text: str) -> None:
-    summary = (summary_text or "").strip()
+def _prepend_summary_to_transcript(transcript_path: Path, summary_text: str | list[str] | tuple[str, ...]) -> None:
+    summary = _normalize_text_value(summary_text)
     if not summary:
         return
     raw = transcript_path.read_text(encoding="utf-8", errors="replace")
@@ -774,8 +896,8 @@ def _append_transcript_to_telegram_markdown(
         md_path.write_text(f"# {day} telegram\n\n", encoding="utf-8")
     content = transcript_path.read_text(encoding="utf-8", errors="replace").strip()
     time_str = (message_ts or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
-    normalized_title = (title or "").strip() or "untitled"
-    normalized_source = (source or "").strip() or "unknown"
+    normalized_title = _normalize_text_value(title, "untitled")
+    normalized_source = _normalize_text_value(source, "unknown")
     with md_path.open("a", encoding="utf-8") as f:
         f.write(f"## [{time_str}] transcript chat={chat_id}\n")
         f.write(f"- title: {normalized_title}\n")
@@ -785,7 +907,30 @@ def _append_transcript_to_telegram_markdown(
             f.write("\n\n")
         else:
             f.write("[empty transcript]\n\n")
+    _sync_single_note_file_to_dropbox(md_path)
     return md_path
+
+
+def _sync_single_note_file_to_dropbox(local_path: Path) -> None:
+    if not DROPBOX_SYNC_ENABLED:
+        return
+    try:
+        path = local_path.resolve()
+        path.relative_to(NOTES_DIR.resolve())
+    except Exception:
+        return
+    try:
+        _get_dropbox_client()
+        root = normalize_dropbox_path(DROPBOX_ROOT_PATH)
+        _dropbox_call_with_retry(lambda dbx: ensure_dropbox_folders(dbx, root))
+        rel = path.relative_to(NOTES_DIR).as_posix()
+        remote_path = f"{root}/notes/{rel}".replace("//", "/")
+        _local_changed, _remote_changed = sync_markdown_with_merge(path, remote_path)
+        local_key = path.relative_to(DATA_DIR).as_posix()
+        fingerprint = compute_file_fingerprint(path)
+        upsert_sync_state("dropbox", local_key, fingerprint)
+    except Exception as e:
+        print(f"[WARN] Immediate Dropbox note sync failed for {local_path}: {e}")
 
 
 def _localize_transcribe_status(status: str) -> str:
@@ -793,24 +938,58 @@ def _localize_transcribe_status(status: str) -> str:
     if not s:
         return ""
     lower = s.lower()
-    if (
-        lower.startswith("checking video info")
-        or lower.startswith("downloading")
-        or lower.startswith("preparing")
-        or lower.startswith("transcribing")
-    ):
-        return "進度：處理中..."
-    return "進度：處理中..."
+    if lower.startswith("checking video info"):
+        return "進度：正在取得媒體資訊..."
+    if lower.startswith("downloading"):
+        return "進度：正在下載音訊..."
+    if lower.startswith("preparing"):
+        return "進度：正在準備音訊..."
+    if lower.startswith("transcribing segment"):
+        m = re.search(r"transcribing segment\s+(\d+/\d+)", lower)
+        if m:
+            return f"進度：正在分段轉錄（{m.group(1)}）..."
+        return "進度：正在分段轉錄..."
+    if lower.startswith("resolving media url"):
+        return "進度：正在解析媒體網址..."
+    if lower.startswith("transcribing..."):
+        m = re.search(r"transcribing\.\.\.\s*(\d+)%", lower)
+        if m:
+            return f"進度：正在轉錄語音（{m.group(1)}%）..."
+        return "進度：正在轉錄語音..."
+    if lower.startswith("transcribing"):
+        return "進度：正在轉錄語音..."
+    return f"進度：{s}"
 
 
 def _build_transcribe_status_message(intro_text: str, status_text: str, title: str | None = None) -> str:
-    lines = [intro_text.strip(), status_text.strip()]
+    lines = [_normalize_text_value(intro_text), _normalize_text_value(status_text)]
     if title:
-        lines.append(f"轉錄完成：{title}")
+        lines.append(f"轉錄完成：{_normalize_text_value(title)}")
     return "\n".join(x for x in lines if x)
 
 
-async def _run_transcribe_job_with_progress(chat_id: int, worker, intro_text: str):
+async def _cancellable_to_thread(cancel_event: Event, func, *args):
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(None, func, *args)
+    while not future.done():
+        if cancel_event.is_set():
+            future.add_done_callback(lambda f: f.cancelled() or f.exception())
+            raise TranscribeJobCancelled("Cancelled by user.")
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+    return future.result()
+
+
+async def _run_transcribe_job_with_progress(
+    chat_id: int,
+    worker,
+    intro_text: str,
+    *,
+    cancel_event: Event,
+    job_id: str,
+):
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[str] = asyncio.Queue()
 
@@ -822,7 +1001,8 @@ async def _run_transcribe_job_with_progress(chat_id: int, worker, intro_text: st
 
     progress_text = _build_transcribe_status_message(intro_text, "進度：處理中...")
     progress_message_id = await send_message(chat_id, progress_text)
-    job = asyncio.create_task(asyncio.to_thread(worker, on_status))
+    _set_transcribe_progress_message_id(chat_id, job_id, progress_message_id)
+    job = asyncio.create_task(_cancellable_to_thread(cancel_event, worker, on_status))
     last_status = ""
     last_sent_at = 0.0
     started_at = time.time()
@@ -830,6 +1010,8 @@ async def _run_transcribe_job_with_progress(chat_id: int, worker, intro_text: st
     while True:
         if job.done() and queue.empty():
             break
+        if cancel_event.is_set():
+            raise TranscribeJobCancelled("Cancelled by user.")
         try:
             raw_status = await asyncio.wait_for(queue.get(), timeout=0.8)
         except asyncio.TimeoutError:
@@ -842,11 +1024,7 @@ async def _run_transcribe_job_with_progress(chat_id: int, worker, intro_text: st
             heartbeat = f"進度：處理中（已等待 {elapsed_sec // 60} 分 {elapsed_sec % 60} 秒）"
             heartbeat_text = _build_transcribe_status_message(intro_text, heartbeat)
             if progress_message_id:
-                ok = await edit_message(chat_id, progress_message_id, heartbeat_text)
-                if not ok:
-                    progress_message_id = await send_message(chat_id, heartbeat_text)
-            else:
-                progress_message_id = await send_message(chat_id, heartbeat_text)
+                await edit_message(chat_id, progress_message_id, heartbeat_text)
             last_heartbeat_at = now
             continue
         localized = _localize_transcribe_status(raw_status)
@@ -859,11 +1037,7 @@ async def _run_transcribe_job_with_progress(chat_id: int, worker, intro_text: st
             continue
         if progress_message_id:
             text = _build_transcribe_status_message(intro_text, localized)
-            ok = await edit_message(chat_id, progress_message_id, text)
-            if not ok:
-                progress_message_id = await send_message(chat_id, text)
-        else:
-            progress_message_id = await send_message(chat_id, _build_transcribe_status_message(intro_text, localized))
+            await edit_message(chat_id, progress_message_id, text)
         last_status = localized
         last_sent_at = now
         last_heartbeat_at = now
@@ -876,14 +1050,23 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
     try:
         tx = _load_transcription_module()
     except Exception as e:
+        print(f"[TRANSCRIBE][LOAD_FAIL] chat_id={chat_id} error={type(e).__name__}: {e}")
         await send_message(chat_id, f"轉錄模組不可用：{e}")
         return True
     _url_type, error = tx.classify_url(target)
+    print(f"[TRANSCRIBE][CLASSIFY] chat_id={chat_id} url={target} type={_url_type} error={error}")
     if error:
         await send_message(chat_id, f"URL 不支援：{error}")
         return True
 
+    job_id = str(uuid.uuid4())
+    cancel_event = Event()
+    if not _register_transcribe_job(chat_id, job_id, cancel_event):
+        await send_message(chat_id, "目前已有一個轉錄任務進行中，請先 /cancel 或等待完成。")
+        return True
+
     intro_text = ""
+    progress_msg_id: int | None = None
     try:
         (title, out_path), progress_msg_id = await _run_transcribe_job_with_progress(
             chat_id,
@@ -892,8 +1075,11 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
                 TRANSCRIPTS_DIR,
                 TRANSCRIPTS_TMP_DIR,
                 on_status=on_status,
+                cancel_event=cancel_event,
             ),
             intro_text,
+            cancel_event=cancel_event,
+            job_id=job_id,
         )
         if progress_msg_id:
             done_text = _build_transcribe_status_message(intro_text, f"轉錄完成：{title}")
@@ -918,22 +1104,32 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
             await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
             for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
                 await send_message(chat_id, chunk)
-        else:
-            await send_message(chat_id, "已成功紀錄")
     except Exception as e:
+        print(f"[TRANSCRIBE][URL_FLOW][ERROR] chat_id={chat_id} error={type(e).__name__}: {e}")
+        print(traceback.format_exc())
+        is_cancelled = isinstance(e, TranscribeJobCancelled) or (
+            hasattr(tx, "JobCancelled") and isinstance(e, tx.JobCancelled)
+        )
+        if progress_msg_id is None:
+            job = _get_transcribe_job(chat_id)
+            if job and job.get("job_id") == job_id:
+                progress_msg_id = job.get("progress_message_id")
+        if is_cancelled:
+            cancel_text = _build_transcribe_status_message(intro_text, "已取消本次轉錄")
+            if progress_msg_id:
+                await edit_message(chat_id, progress_msg_id, cancel_text)
+            else:
+                await send_message(chat_id, cancel_text)
+            return True
         err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
-        if 'progress_msg_id' in locals() and progress_msg_id:
+        if progress_msg_id:
             ok = await edit_message(chat_id, progress_msg_id, err_text)
             if not ok:
                 await send_message(chat_id, err_text)
         else:
             await send_message(chat_id, err_text)
     finally:
-        try:
-            if 'out_path' in locals() and out_path and Path(out_path).exists():
-                Path(out_path).unlink()
-        except Exception:
-            pass
+        _clear_transcribe_job(chat_id, job_id)
     return True
 
 
@@ -984,14 +1180,43 @@ async def handle_transcribe_text_command(chat_id: int, text: str, message_ts: da
 
 async def handle_transcribe_auto_url_message(chat_id: int, text: str, message_ts: datetime | None = None) -> bool:
     if not FEATURE_TRANSCRIBE_ENABLED or not FEATURE_TRANSCRIBE_AUTO_URL:
+        print(
+            f"[TRANSCRIBE][AUTO_URL][SKIP] chat_id={chat_id} "
+            f"enabled={FEATURE_TRANSCRIBE_ENABLED} auto={FEATURE_TRANSCRIBE_AUTO_URL}"
+        )
         return False
     raw = (text or "").strip()
     if not raw or raw.startswith("/"):
+        print(f"[TRANSCRIBE][AUTO_URL][SKIP] chat_id={chat_id} reason=empty_or_command")
         return False
     target = _extract_supported_transcribe_url(raw)
     if not target:
+        print(f"[TRANSCRIBE][AUTO_URL][NO_MATCH] chat_id={chat_id} text={raw[:180]!r}")
+        if URL_RE.search(raw):
+            await send_message(chat_id, "偵測到網址，但不是可轉錄來源。支援：YouTube / Apple Podcasts / 直接音訊連結。")
+            return True
         return False
+    print(f"[TRANSCRIBE][AUTO_URL][MATCH] chat_id={chat_id} target={target}")
     return await _run_transcribe_url_flow(chat_id, target, message_ts=message_ts)
+
+
+async def handle_transcribe_cancel_command(chat_id: int, text: str) -> bool:
+    raw = (text or "").strip().lower()
+    if not raw.startswith("/cancel"):
+        return False
+    job = _cancel_transcribe_job(chat_id)
+    if not job:
+        await send_message(chat_id, "目前沒有進行中的轉錄任務。")
+        return True
+    progress_msg_id = job.get("progress_message_id")
+    cancel_text = _build_transcribe_status_message("", "已收到取消請求，正在停止轉錄...")
+    if progress_msg_id:
+        ok = await edit_message(chat_id, int(progress_msg_id), cancel_text)
+        if not ok:
+            await send_message(chat_id, cancel_text)
+    else:
+        await send_message(chat_id, cancel_text)
+    return True
 
 
 async def handle_transcribe_audio_message(chat_id: int, message: dict, message_ts: datetime | None = None) -> bool:
@@ -1011,7 +1236,14 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
         return True
 
     temp_input = TRANSCRIPTS_TMP_DIR / f"{uuid.uuid4()}{ext}"
+    job_id = str(uuid.uuid4())
+    cancel_event = Event()
+    if not _register_transcribe_job(chat_id, job_id, cancel_event):
+        await send_message(chat_id, "目前已有一個轉錄任務進行中，請先 /cancel 或等待完成。")
+        return True
     intro_text = ""
+    progress_msg_id: int | None = None
+    tx = None
     try:
         tx = _load_transcription_module()
         await asyncio.to_thread(_download_telegram_file, file_id, temp_input)
@@ -1026,8 +1258,11 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
                 TRANSCRIPTS_DIR,
                 TRANSCRIPTS_TMP_DIR,
                 on_status=on_status,
+                cancel_event=cancel_event,
             ),
             intro_text,
+            cancel_event=cancel_event,
+            job_id=job_id,
         )
         if progress_msg_id:
             done_text = _build_transcribe_status_message(intro_text, f"轉錄完成：{title}")
@@ -1052,11 +1287,25 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
             await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
             for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
                 await send_message(chat_id, chunk)
-        else:
-            await send_message(chat_id, "已成功紀錄")
     except Exception as e:
+        print(f"[TRANSCRIBE][UPLOAD_FLOW][ERROR] chat_id={chat_id} error={type(e).__name__}: {e}")
+        print(traceback.format_exc())
+        is_cancelled = isinstance(e, TranscribeJobCancelled) or (
+            hasattr(tx, "JobCancelled") and isinstance(e, tx.JobCancelled)
+        )
+        if progress_msg_id is None:
+            job = _get_transcribe_job(chat_id)
+            if job and job.get("job_id") == job_id:
+                progress_msg_id = job.get("progress_message_id")
+        if is_cancelled:
+            cancel_text = _build_transcribe_status_message(intro_text, "已取消本次轉錄")
+            if progress_msg_id:
+                await edit_message(chat_id, progress_msg_id, cancel_text)
+            else:
+                await send_message(chat_id, cancel_text)
+            return True
         err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
-        if 'progress_msg_id' in locals() and progress_msg_id:
+        if progress_msg_id:
             ok = await edit_message(chat_id, progress_msg_id, err_text)
             if not ok:
                 await send_message(chat_id, err_text)
@@ -1068,11 +1317,7 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
                 temp_input.unlink()
         except Exception:
             pass
-        try:
-            if 'out_path' in locals() and out_path and Path(out_path).exists():
-                Path(out_path).unlink()
-        except Exception:
-            pass
+        _clear_transcribe_job(chat_id, job_id)
     return True
 
 
@@ -1140,6 +1385,7 @@ def handle_command(text: str) -> str:
             cmds.extend(["/news latest", "/summary news"])
         if FEATURE_TRANSCRIBE_ENABLED:
             cmds.append("/transcribe <url>")
+            cmds.append("/cancel")
         return "Commands: " + ", ".join(cmds)
 
     if text.startswith("/"):
@@ -1217,9 +1463,10 @@ def append_markdown(
         md_path.write_text(f"# {day} {platform}\n\n", encoding="utf-8")
 
     time_str = (message_ts or datetime.now()).strftime("%H:%M:%S")
-    line = f"- [{time_str}] ({platform}) {chat_title} | {user_name}: {text}\n"
+    line = f"- [{time_str}] {text}\n"
     with md_path.open("a", encoding="utf-8") as f:
         f.write(line)
+    _sync_single_note_file_to_dropbox(md_path)
 
 
 def append_slack_note_markdown(
@@ -1266,6 +1513,7 @@ def append_ocr_markdown(
             f.write("\n\n")
         else:
             f.write("- ocr_text: [no text detected]\n\n")
+    _sync_single_note_file_to_dropbox(md_path)
     return md_path
 
 
@@ -1597,15 +1845,19 @@ def merge_markdown_content(remote_text: str | None, local_text: str) -> str:
     remote_blocks = _split_markdown_blocks(remote_text)
     local_blocks = _split_markdown_blocks(local_text)
 
-    heading = ""
+    local_heading = ""
+    remote_heading = ""
     if local_blocks and local_blocks[0].startswith("# "):
-        heading = local_blocks.pop(0)
-    elif remote_blocks and remote_blocks[0].startswith("# "):
-        heading = remote_blocks.pop(0)
+        local_heading = local_blocks.pop(0).strip()
+    if remote_blocks and remote_blocks[0].startswith("# "):
+        remote_heading = remote_blocks.pop(0).strip()
+    heading = local_heading or remote_heading
 
     merged_blocks: list[str] = []
     seen: set[str] = set()
     for block in remote_blocks + local_blocks:
+        if heading and block.strip() == heading:
+            continue
         key = hashlib.sha1(block.encode("utf-8")).hexdigest()
         if key in seen:
             continue
@@ -2013,8 +2265,8 @@ def notion_append_chitchat_transcript(
         print("[WARN] Notion chatlog page id not configured for transcript year")
         return
     day_label = _notion_day_label(msg_ts)
-    normalized_title = (title or "").strip() or "untitled"
-    normalized_source = (source or "").strip() or "unknown"
+    normalized_title = _normalize_text_value(title, "untitled")
+    normalized_source = _normalize_text_value(source, "unknown")
     excerpt = _notion_extract_transcript_excerpt(transcript_path)
     blocks = [_notion_bullet_block(f"{_notion_time_prefix(msg_ts)}[轉錄] {normalized_title}")]
     blocks.append(_notion_paragraph_block(f"來源：{normalized_source}"))
@@ -4247,6 +4499,7 @@ def set_telegram_commands() -> None:
         )
     if FEATURE_TRANSCRIBE_ENABLED:
         commands.append({"command": "transcribe", "description": "Transcribe url/audio to markdown"})
+        commands.append({"command": "cancel", "description": "Cancel active transcription"})
     commands.append({"command": "status", "description": "Bot health status"})
     try:
         resp = requests.post(
@@ -4729,30 +4982,42 @@ def telegram_polling_loop() -> None:
     print("[INFO] Telegram long polling enabled.")
     delete_telegram_webhook(drop_pending=False)
     offset = None
+    consecutive_errors = 0
     while True:
         try:
-            params = {"timeout": 20}
+            params = {"timeout": TELEGRAM_POLL_TIMEOUT_SECONDS}
             if offset is not None:
                 params["offset"] = offset
             resp = requests.get(
                 f"{TELEGRAM_API}/getUpdates",
                 params=params,
-                timeout=30,
+                timeout=(TELEGRAM_POLL_CONNECT_TIMEOUT_SECONDS, TELEGRAM_POLL_READ_TIMEOUT_SECONDS),
             )
             if resp.status_code != 200:
+                consecutive_errors += 1
                 body = (resp.text or "").strip().replace("\n", " ")
                 body = body[:300]
                 _telegram_poll_last_error = f"http_{resp.status_code}: {body}" if body else f"http_{resp.status_code}"
                 print(f"[WARN] Telegram getUpdates http={resp.status_code} body={body}")
-                time.sleep(2)
+                sleep_s = min(
+                    TELEGRAM_POLL_ERROR_BACKOFF_MAX_SECONDS,
+                    TELEGRAM_POLL_ERROR_BACKOFF_BASE_SECONDS * (2 ** min(4, consecutive_errors - 1)),
+                )
+                time.sleep(sleep_s)
                 continue
             data = resp.json()
+            consecutive_errors = 0
             _telegram_poll_last_ok_at = time.time()
             if not data.get("ok"):
+                consecutive_errors += 1
                 desc = str(data.get("description") or "unknown_error")
                 _telegram_poll_last_error = f"telegram_not_ok: {desc}"
                 print(f"[WARN] Telegram getUpdates ok=false: {desc}")
-                time.sleep(2)
+                sleep_s = min(
+                    TELEGRAM_POLL_ERROR_BACKOFF_MAX_SECONDS,
+                    TELEGRAM_POLL_ERROR_BACKOFF_BASE_SECONDS * (2 ** min(4, consecutive_errors - 1)),
+                )
+                time.sleep(sleep_s)
                 continue
             _telegram_poll_last_error = ""
             for update in data.get("result", []):
@@ -4760,17 +5025,28 @@ def telegram_polling_loop() -> None:
                 if update_id is not None:
                     offset = update_id + 1
                     _telegram_poll_last_update_id = int(update_id)
+                    if _mark_update_seen(int(update_id)):
+                        continue
                 # Mark update as seen immediately so /status reflects the latest received update.
                 _telegram_poll_last_update_at = time.time()
                 try:
-                    asyncio.run(process_telegram_update(update))
+                    t = threading.Thread(
+                        target=lambda u=update: asyncio.run(process_telegram_update(u)),
+                        daemon=True,
+                    )
+                    t.start()
                 except Exception as e:
                     print(f"[WARN] telegram update process error: {e}")
                     print(traceback.format_exc())
         except Exception as e:
+            consecutive_errors += 1
             _telegram_poll_last_error = f"{type(e).__name__}: {e}"
             print(f"[ERROR] Telegram polling error: {e}")
-            time.sleep(2)
+            sleep_s = min(
+                TELEGRAM_POLL_ERROR_BACKOFF_MAX_SECONDS,
+                TELEGRAM_POLL_ERROR_BACKOFF_BASE_SECONDS * (2 ** min(4, consecutive_errors - 1)),
+            )
+            time.sleep(sleep_s)
 
 
 def start_telegram_polling_thread() -> None:
@@ -4847,15 +5123,27 @@ async def process_telegram_update(update: dict) -> None:
 
     if is_private and chat_id and text and not has_image and not has_audio_attachment:
         try:
+            print(
+                f"[ROUTE][PRIVATE_TEXT] chat_id={chat_id} "
+                f"slash={is_slash_command} local={is_local_control_text} "
+                f"transcribe_enabled={FEATURE_TRANSCRIBE_ENABLED} auto_url={FEATURE_TRANSCRIBE_AUTO_URL} "
+                f"text={cmd_text[:180]!r}"
+            )
+            if await handle_transcribe_cancel_command(chat_id, cmd_text):
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=cancel")
+                return
             if await handle_transcribe_text_command(chat_id, cmd_text, message_ts=msg_ts):
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=transcribe_command")
                 return
             if await handle_transcribe_auto_url_message(chat_id, cmd_text, message_ts=msg_ts):
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=transcribe_auto_url")
                 return
 
             # For normal recorded text, always send a clear ACK.
             if not cmd_text.startswith("/") and not is_local_control_text:
-                sent_id = await send_message(chat_id, "已成功紀錄")
-                if sent_id is None:
+                ok = await send_ack_message(chat_id, "已成功紀錄")
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=ack ok={ok}")
+                if not ok:
                     print(f"[WARN] ack send failed chat_id={chat_id}")
                 return
 
@@ -4965,7 +5253,14 @@ async def process_telegram_update(update: dict) -> None:
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
     update = await request.json()
-    await process_telegram_update(update)
+    update_id = update.get("update_id")
+    try:
+        update_id = int(update_id) if update_id is not None else None
+    except Exception:
+        update_id = None
+    if _mark_update_seen(update_id):
+        return JSONResponse({"ok": True, "duplicate": True})
+    asyncio.create_task(process_telegram_update(update))
     return JSONResponse({"ok": True})
 
 

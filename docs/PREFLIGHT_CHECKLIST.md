@@ -67,7 +67,7 @@ Use this before production launch.
 - [ ] `/summary` works.
 - [ ] `/summary note` includes expected note/transcript content.
 - [ ] Dropbox sync log shows successful cycle.
+- [ ] Optional one-time markdown cleanup completed (main/chitchat notes) if historical files used legacy format.
 - [ ] Reboot test passed:
   - [ ] `sudo reboot`
   - [ ] service auto-starts and bot responds after reboot.
-

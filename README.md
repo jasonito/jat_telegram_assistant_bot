@@ -21,78 +21,61 @@ Notes:
 
 ## Env
 
-Copy `.env.example` to `.env` and set your tokens.
+Use profile-specific env files instead of a shared `.env` whenever possible:
 
-- `TELEGRAM_ALLOWED_GROUPS` comma-separated group titles to log
-- `DATA_DIR` location for SQLite + Markdown
-- `APP_MODULE` uvicorn module name (`app`, `app_main`, `app_chitchat`)
-- `TELEGRAM_LONG_POLLING` set `1` to enable getUpdates instead of webhook
-- `TELEGRAM_LOCAL_WEBHOOK_URL` local URL for polling to forward updates (default: `http://127.0.0.1:8000/telegram`)
-- `TELEGRAM_FILE_FETCH_RETRIES` retries for Telegram `getFile`/file download (default: `4`)
-- `TELEGRAM_FILE_FETCH_CONNECT_TIMEOUT` connect timeout seconds for Telegram file fetch (default: `5`)
-- `TELEGRAM_FILE_FETCH_READ_TIMEOUT` read timeout seconds for Telegram file fetch (default: `12`)
-- `TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS` base retry backoff seconds (default: `0.25`)
+- main bot: `.env.main`
+- chitchat bot: `.env.chitchat`
 
-Feature flags:
-- `FEATURE_NEWS_ENABLED` enable/disable news ingest + `/news` commands
-- `FEATURE_TRANSCRIBE_ENABLED` enable/disable `/transcribe` and audio transcription
-- `FEATURE_TRANSCRIBE_AUTO_URL` when set `1`, private chat plain URLs auto-trigger transcription
-- `TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS` progress heartbeat interval while transcription is running (default: `30`)
-- `FEATURE_OCR_ENABLED` enable/disable image OCR pipeline
-- `FEATURE_OCR_CHOICE_ENABLED` when set `1`, image OCR asks user to choose (`?²è? OCR` or `?ªå??–`)
-- `OCR_CHOICE_SCOPE` OCR choice scope (`private` recommended)
-- `OCR_CHOICE_TIMEOUT_SECONDS` choice timeout seconds before fallback to save-only (default: `60`)
-- `FEATURE_SLACK_ENABLED` enable/disable Slack worker
+`start.ps1` loads env values from `-EnvFile`, and `start-both.ps1` already uses `.env.main` + `.env.chitchat`.
 
-OCR (Google Vision):
-- `OCR_PROVIDER` set `google_vision`
-- `OCR_LANG_HINTS` OCR language hints (default: `zh-TW,en`)
-- `GOOGLE_APPLICATION_CREDENTIALS` full path to Google service-account JSON key
+### Segment A: Profile / Runtime
+- Purpose: select bot profile and data root.
+- Keys: `APP_MODULE`, `APP_PROFILE`, `DATA_DIR`.
 
-Dropbox sync:
-- `DROPBOX_ACCESS_TOKEN` API token (legacy/fallback mode)
-- `DROPBOX_REFRESH_TOKEN` long-lived refresh token (recommended)
-- `DROPBOX_APP_KEY` Dropbox app key (required with refresh token)
-- `DROPBOX_APP_SECRET` Dropbox app secret (required with refresh token)
-- `DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS` refresh-ahead buffer in seconds (default: `300`)
-- `DROPBOX_TRANSCRIPTS_PATH` Dropbox transcripts folder to import locally (default: `/Transcripts`)
-- `DROPBOX_TRANSCRIPTS_SYNC_ENABLED` set `1` to sync transcripts from Dropbox before digest (default: `1`)
-- `DROPBOX_ROOT_PATH` cloud root folder (default: `/read`)
-- `DROPBOX_SYNC_ENABLED` set `1` to enable sync worker
-- `DROPBOX_SYNC_TIME` daily sync time in `HH:MM` (default: `00:10`)
-- `DROPBOX_SYNC_TZ` sync timezone (default: `Asia/Taipei`)
-- `DROPBOX_SYNC_ON_STARTUP` set `1` to run one full backfill at startup
+### Segment B: Telegram Core
+- Purpose: Telegram token, webhook/polling mode, and network retry behavior.
+- Keys: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_GROUPS`, `TELEGRAM_LONG_POLLING`, `TELEGRAM_LOCAL_WEBHOOK_URL`.
+- Optional tuning: `TELEGRAM_FILE_FETCH_*`, `TELEGRAM_POLL_*`.
 
-Notion (chitchat profile):
-- `NOTION_ENABLED` set `1` to enable Notion append for chitchat
-- `NOTION_TOKEN` Notion Internal Integration Secret (token), format like `ntn_...`
-- `NOTION_VERSION` Notion API version header (keep default unless you need migration)
-- `NOTION_CHATLOG_YEAR_PAGES_JSON` year->page_id map, e.g. `{"2026":"2dbf40303e778048974edcd4d534afd8"}`
-- `NOTION_CHATLOG_FALLBACK_PAGE_ID` fallback page id when year map has no match
-- `NOTION_CHATLOG_IMAGE_MODE` image sync mode; `link` or `embed` (`embed` inserts Notion image block directly)
-- `NOTION_CHATLOG_OCR_MODE` OCR sync mode; `optional` means include OCR summary when available
-- `NOTION_CHATLOG_INCLUDE_TIME` set `1` to prefix entries with `[HH:MM]`
+### Segment C: Feature Flags
+- Purpose: toggle major functions without code changes.
+- Keys: `FEATURE_NEWS_ENABLED`, `FEATURE_TRANSCRIBE_ENABLED`, `FEATURE_TRANSCRIBE_AUTO_URL`, `FEATURE_OCR_ENABLED`, `FEATURE_OCR_CHOICE_ENABLED`, `FEATURE_SLACK_ENABLED`.
+- OCR choice behavior: `OCR_CHOICE_SCOPE`, `OCR_CHOICE_TIMEOUT_SECONDS`, `OCR_CHOICE_TIMEOUT_DEFAULT`.
 
-Notes:
-- `page_id` should be pure Notion page id (32 hex chars or UUID style), do not prefix with year text.
-- Share the target parent/page with your integration in Notion (`Share` -> invite integration), or writes will fail with 403.
+### Segment D: Transcription Engine
+- Purpose: control Whisper quality/speed/memory and chunking.
+- Keys: `TRANSCRIBE_MAX_DURATION_SECONDS`, `TRANSCRIBE_CHUNK_MINUTES`, `TRANSCRIBE_CHECKPOINT_FLUSH_SECONDS`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`, `WHISPER_BEAM_SIZE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_CPU_THREADS`, `WHISPER_BATCH_SIZE`, `FFMPEG_LOCATION`, `TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS`.
 
-Slack (Socket Mode):
-- `SLACK_BOT_TOKEN` (xoxb-...)
-- `SLACK_APP_TOKEN` (xapp-...) with `connections:write`
-- `SLACK_USER_ID` your user id (U...)
+### Segment E: OCR Provider
+- Purpose: configure image OCR backend.
+- Keys: `OCR_PROVIDER`, `OCR_LANG_HINTS`, `GOOGLE_APPLICATION_CREDENTIALS`.
 
-AI summary for `/summary`:
-- `AI_SUMMARY_ENABLED` set `1` to enable
-- `AI_SUMMARY_PROVIDER` supports `openai`, `gemini`, `anthropic`, `huggingface`, `ollama` (`antropic`, `hf`, `local` aliases also work)
-- `AI_SUMMARY_TIMEOUT_SECONDS` request timeout for all providers
-- `AI_SUMMARY_MAX_CHARS` max context size sent to model
-- OpenAI: `OPENAI_API_KEY`, `OPENAI_MODEL`
-- Gemini: `GEMINI_API_KEY`, `GEMINI_MODEL`
-- Anthropic: `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`
-- Hugging Face: `HUGGINGFACE_API_KEY`, `HUGGINGFACE_MODEL`, `HUGGINGFACE_BASE_URL`
-- Ollama: `OLLAMA_BASE_URL`, `OLLAMA_MODEL`
-- `start.ps1` will auto-pull `OLLAMA_MODEL` if missing locally.
+### Segment F: News / Digest
+- Purpose: collect, filter, and summarize news.
+- Keys: `NEWS_ENABLED`, `NEWS_FETCH_INTERVAL_MINUTES`, `NEWS_PUSH_ENABLED`, `NEWS_PUSH_MAX_ITEMS`, `NEWS_GNEWS_*`, `NEWS_RSS_URLS`, `NEWS_RSS_URLS_FILE`, `NEWS_URL_FETCH_*`, `NEWS_DIGEST_*`, `NOTE_DIGEST_MAX_ITEMS`.
+
+### Segment G: AI Summary Providers
+- Purpose: shared AI config for `/summary` and transcript summary blocks.
+- Keys: `AI_SUMMARY_ENABLED`, `AI_SUMMARY_PROVIDER`, `AI_SUMMARY_TIMEOUT_SECONDS`, `AI_SUMMARY_MAX_CHARS`.
+- Provider keys: `OPENAI_*`, `GEMINI_*`, `ANTHROPIC_*`, `HUGGINGFACE_*`, `OLLAMA_*`.
+
+### Segment H: Dropbox Sync
+- Purpose: sync notes/images and import transcript files.
+- Keys: `DROPBOX_ACCESS_TOKEN`, `DROPBOX_REFRESH_TOKEN`, `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS`, `DROPBOX_ROOT_PATH`, `DROPBOX_SYNC_ENABLED`, `DROPBOX_SYNC_TIME`, `DROPBOX_SYNC_TZ`, `DROPBOX_SYNC_ON_STARTUP`, `DROPBOX_TRANSCRIPTS_PATH`, `DROPBOX_TRANSCRIPTS_SYNC_ENABLED`.
+
+### Segment I: Notion (mainly chitchat)
+- Purpose: append chitchat logs/images/transcripts to Notion pages.
+- Keys: `NOTION_ENABLED`, `NOTION_TOKEN`, `NOTION_VERSION`, `NOTION_CHATLOG_YEAR_PAGES_JSON`, `NOTION_CHATLOG_FALLBACK_PAGE_ID`, `NOTION_CHATLOG_IMAGE_MODE`, `NOTION_CHATLOG_OCR_MODE`, `NOTION_CHATLOG_INCLUDE_TIME`.
+
+### Segment J: Slack (optional)
+- Purpose: enable Socket Mode DM logging.
+- Keys: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_USER_ID`, `SLACK_DEBUG`.
+
+### Templates
+
+- Main profile template: `.env.main.example`
+- Chitchat profile template: `.env.chitchat.example`
+- Legacy generic template: `.env.example`
 
 ## Run
 
@@ -178,7 +161,7 @@ sort downloads
 ```
 
 `/news` and `/transcribe` availability depends on `FEATURE_NEWS_ENABLED` and `FEATURE_TRANSCRIBE_ENABLED`.
-Transcription flow: bot sends `å·²æ??Ÿç??„` right after transcript is saved, then sends AI summary afterward (if enabled).
+Transcription flow: bot sends `å·²ï¿½??ï¿½ï¿½??ï¿½` right after transcript is saved, then sends AI summary afterward (if enabled).
 
 Group logging (no reply):
 - Messages in allowed groups are stored in SQLite and appended to Markdown files.
@@ -191,9 +174,17 @@ Slack DM logging (no reply):
 
 Image OCR and cloud sync:
 - Telegram private image uploads are saved to `DATA_DIR\\images\YYYY-MM-DD\`.
-- If OCR choice is enabled, bot asks per image: `?²è? OCR` or `?ªå??–`; timeout defaults to save-only.
+- If OCR choice is enabled, bot asks per image: `?ï¿½ï¿½? OCR` or `?ï¿½ï¿½??ï¿½`; timeout defaults to save-only.
 - OCR output is appended to `DATA_DIR\\notes\\telegram\\YYYY-MM-DD_telegram.md`.
 - A Dropbox worker syncs local `notes` and `images` to:
 - `/read & chat/read/notes`
 - `/read & chat/read/images`
 
+
+## Markdown Cleanup Maintenance
+
+- Use `python tools\cleanup_dropbox_notes_md.py` to normalize existing note markdown (deduplicate duplicated headings/blocks and convert old Telegram line format to `- [HH:MM:SS] text`).
+- Main profile cleanup:
+  - `python tools\cleanup_dropbox_notes_md.py --env-file .env.main --remote-root "/read & chat/read" --local-notes "read/notes"`
+- Chitchat profile cleanup:
+  - `python tools\cleanup_dropbox_notes_md.py --env-file .env.chitchat --remote-root "/read & chat/chitchat" --local-notes "chitchat/notes"`
