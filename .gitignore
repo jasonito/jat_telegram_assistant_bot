@@ -10,3 +10,6 @@ data/
 chitchat/
 youtubeconverter/downloads/
 youtubeconverter/transcripts/
+
+data/messages.sqlite
+

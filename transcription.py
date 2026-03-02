@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import datetime
 import glob
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,62 +27,53 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-import whisper
+import requests
 import yt_dlp
-import feedparser
 from slugify import slugify
+
+try:
+    from faster_whisper import BatchedInferencePipeline, WhisperModel  # type: ignore
+except Exception:
+    BatchedInferencePipeline = None  # type: ignore
+    WhisperModel = None  # type: ignore
+
+try:
+    import whisper  # type: ignore
+except Exception:
+    whisper = None  # type: ignore
 
 MAX_DURATION_SECONDS = int(os.getenv("TRANSCRIBE_MAX_DURATION_SECONDS", "10800"))
 CHUNK_MINUTES = int(os.getenv("TRANSCRIBE_CHUNK_MINUTES", "25"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip() or "base"
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "auto").strip() or "auto"
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8"
+WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "0"))
+WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "16"))
+CHECKPOINT_FLUSH_INTERVAL = int(os.getenv("TRANSCRIBE_CHECKPOINT_FLUSH_SECONDS", "30"))
 FFMPEG_LOCATION = os.getenv("FFMPEG_LOCATION", "").strip()
 
-ALLOWED_AUDIO_EXTENSIONS = {
-    ".mp3",
-    ".aac",
-    ".wav",
-    ".flac",
-    ".m4a",
-    ".m4b",
-    ".ogg",
-    ".wma",
-    ".opus",
-    ".webm",
-    ".mp4",
-}
+ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".aac", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".opus"}
 
 YOUTUBE_RE = re.compile(
     r"^https?://((www|m)\.)?(youtube\.com/(watch\?v=[\w-]+|shorts/[\w-]+)|youtu\.be/[\w-]+)(?:[/?#].*)?$"
 )
 APPLE_RE = re.compile(r"^https?://podcasts\.apple\.com/.+/id(\d+)")
-DIRECT_AUDIO_RE = re.compile(r"\.(mp3|m4a|m4b|wav|ogg|aac|flac|wma|opus|webm|mp4)(\?|$)", re.IGNORECASE)
+DIRECT_AUDIO_RE = re.compile(r"\.(mp3|m4a|wav|ogg|aac|flac|wma|opus)(\?|$)", re.IGNORECASE)
 SPOTIFY_RE = re.compile(r"^https?://open\.spotify\.com/")
 
 _model = None
+_batched_model = None
 _model_lock = threading.Lock()
 
 
-def _safe_str(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (int, float, bool)):
-        return str(value)
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            text = _safe_str(item).strip()
-            if text:
-                return text
-        return ""
-    if isinstance(value, dict):
-        for key in ("href", "url", "link", "value"):
-            if key in value:
-                text = _safe_str(value.get(key)).strip()
-                if text:
-                    return text
-        return ""
-    return str(value)
+class JobCancelled(Exception):
+    """Raised when a transcription job is cancelled by caller."""
+
+
+def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event and cancel_event.is_set():
+        raise JobCancelled("Cancelled by user.")
 
 
 def _resolve_media_tool(tool: str) -> str:
@@ -113,15 +106,246 @@ def get_model():
     if _model is None:
         with _model_lock:
             if _model is None:
-                _model = whisper.load_model(WHISPER_MODEL)
+                if WhisperModel is not None:
+                    model_kwargs = {
+                        "device": "cpu",
+                        "compute_type": WHISPER_COMPUTE_TYPE,
+                    }
+                    if WHISPER_CPU_THREADS > 0:
+                        model_kwargs["cpu_threads"] = WHISPER_CPU_THREADS
+                    _model = WhisperModel(WHISPER_MODEL, **model_kwargs)
+                elif whisper is not None:
+                    _model = whisper.load_model(WHISPER_MODEL)
+                else:
+                    raise RuntimeError(
+                        "No whisper backend available. Install 'faster-whisper' or 'openai-whisper'."
+                    )
     return _model
+
+
+def get_batched_model():
+    global _batched_model
+    if _batched_model is None:
+        with _model_lock:
+            if _batched_model is None:
+                if BatchedInferencePipeline is None:
+                    return None
+                _batched_model = BatchedInferencePipeline(model=get_model())
+    return _batched_model
+
+
+def _backend_name() -> str:
+    return "faster-whisper" if WhisperModel is not None else "openai-whisper"
+
+
+def _checkpoint_dir(temp_dir: Path) -> Path:
+    cp = temp_dir / "checkpoints"
+    cp.mkdir(parents=True, exist_ok=True)
+    return cp
+
+
+def _compute_audio_fingerprint(file_path: Path) -> str:
+    file_size = file_path.stat().st_size
+    h = hashlib.sha256()
+    with file_path.open("rb") as f:
+        h.update(f.read(16 * 1024 * 1024))
+    h.update(str(file_size).encode("ascii"))
+    return h.hexdigest()
+
+
+def _checkpoint_path(temp_dir: Path, fingerprint: str) -> Path:
+    return _checkpoint_dir(temp_dir) / f"{fingerprint}.json"
+
+
+def _get_whisper_config() -> dict:
+    return {
+        "backend": _backend_name(),
+        "model": WHISPER_MODEL,
+        "beam_size": WHISPER_BEAM_SIZE,
+        "language": WHISPER_LANGUAGE,
+    }
+
+
+def _resolve_whisper_language() -> str | None:
+    raw = (WHISPER_LANGUAGE or "").strip().lower()
+    if raw in {"", "auto", "detect", "none"}:
+        return None
+    return WHISPER_LANGUAGE
+
+
+def _normalize_sentence_key(text: str) -> str:
+    t = re.sub(r"https?://\S+", "", text or "", flags=re.IGNORECASE)
+    t = re.sub(r"[\W_]+", "", t, flags=re.UNICODE).lower()
+    return t
+
+
+def _clean_transcript_text(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    no_urls = re.sub(r"https?://\S+", " ", raw, flags=re.IGNORECASE)
+    units = [u.strip() for u in re.split(r"(?<=[\.\!\?。！？])\s+|\n+", no_urls) if u and u.strip()]
+    if not units:
+        return re.sub(r"\s+", " ", no_urls).strip()
+    deduped: list[str] = []
+    prev_key = ""
+    for u in units:
+        key = _normalize_sentence_key(u)
+        if not key:
+            continue
+        if key == prev_key:
+            continue
+        deduped.append(u)
+        prev_key = key
+    return re.sub(r"\s+", " ", " ".join(deduped)).strip()
+
+
+def _load_checkpoint(temp_dir: Path, fingerprint: str, expected_duration: float) -> dict | None:
+    path = _checkpoint_path(temp_dir, fingerprint)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        return None
+    if data.get("version") != 1:
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        return None
+    if abs(float(data.get("audio_duration", 0.0)) - expected_duration) > 1.0:
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        return None
+    if data.get("whisper_config") != _get_whisper_config():
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        return None
+    if data.get("last_completed_end", 0) <= 0 or not data.get("segments"):
+        return None
+    return data
+
+
+def _save_checkpoint(
+    temp_dir: Path,
+    fingerprint: str,
+    audio_duration: float,
+    segments: list[dict],
+    source_info: dict | None = None,
+) -> None:
+    path = _checkpoint_path(temp_dir, fingerprint)
+    tmp = path.with_suffix(".json.tmp")
+    last_end = float(segments[-1]["end"]) if segments else 0.0
+    data = {
+        "version": 1,
+        "audio_fingerprint": fingerprint,
+        "audio_duration": audio_duration,
+        "last_completed_end": last_end,
+        "segments": segments,
+        "whisper_config": _get_whisper_config(),
+        "source_info": source_info or {},
+        "updated_at": time.time(),
+    }
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _delete_checkpoint(temp_dir: Path, fingerprint: str) -> None:
+    path = _checkpoint_path(temp_dir, fingerprint)
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def cleanup_old_checkpoints(temp_dir: Path, max_age_seconds: int = 7 * 24 * 3600) -> None:
+    cp_dir = _checkpoint_dir(temp_dir)
+    now = time.time()
+    for item in cp_dir.glob("*.json*"):
+        try:
+            if now - item.stat().st_mtime > max_age_seconds:
+                item.unlink()
+        except Exception:
+            pass
+
+
+def _trim_audio_from(input_path: Path, start_seconds: float, output_path: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            [
+                FFMPEG_BIN,
+                "-ss",
+                str(start_seconds),
+                "-i",
+                str(input_path),
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-y",
+                str(output_path),
+            ],
+            capture_output=True,
+            timeout=300,
+        )
+        if result.returncode == 0 and output_path.exists():
+            return output_path
+    except Exception:
+        pass
+    return None
+
+
+def _is_youtube_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    # youtu.be/<video_id>
+    if host == "youtu.be":
+        return bool(parsed.path and parsed.path.strip("/") and "/" not in parsed.path.strip("/"))
+
+    if host not in {"youtube.com", "m.youtube.com"}:
+        return False
+
+    path = (parsed.path or "").rstrip("/")
+    query = urllib.parse.parse_qs(parsed.query or "")
+    if path == "/watch":
+        return bool(query.get("v", [""])[0])
+    if path.startswith("/shorts/"):
+        seg = path.split("/", 2)[2] if path.count("/") >= 2 else ""
+        return bool(seg)
+    if path.startswith("/live/"):
+        seg = path.split("/", 2)[2] if path.count("/") >= 2 else ""
+        return bool(seg)
+    return False
 
 
 def classify_url(url: str) -> tuple[str | None, str | None]:
     """Return (url_type, error)."""
     if not url:
         return None, "No URL provided."
-    if YOUTUBE_RE.match(url):
+    if _is_youtube_url(url) or YOUTUBE_RE.match(url):
         if "list=" in url:
             return None, "Playlists are not supported. Please provide a single video URL."
         return "youtube", None
@@ -140,10 +364,21 @@ def fetch_apple_podcast_episodes(url: str) -> list[dict]:
     if not match:
         return []
 
+    # Apple episode links usually include ?i=<trackId>. Prefer that episode.
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    target_episode_id = (query.get("i") or [None])[0]
+    country = "TW"
+    path_parts = [p for p in parsed.path.split("/") if p]
+    if path_parts:
+        cc = path_parts[0].strip().upper()
+        if len(cc) == 2 and cc.isalpha():
+            country = cc
+
     podcast_id = match.group(1)
     api_url = (
         f"https://itunes.apple.com/lookup?id={podcast_id}"
-        f"&country=TW&media=podcast&entity=podcastEpisode&limit=5"
+        f"&country={country}&media=podcast&entity=podcastEpisode&limit=50"
     )
 
     try:
@@ -156,107 +391,27 @@ def fetch_apple_podcast_episodes(url: str) -> list[dict]:
     if not data.get("results"):
         return []
 
-    query = urllib.parse.urlparse(url).query
-    query_i = _safe_str(urllib.parse.parse_qs(query).get("i", [""])[0]).strip()
-    target_track_id = int(query_i) if query_i.isdigit() else None
-    show_feed_url = ""
-    for entry in data["results"]:
-        if entry.get("wrapperType") == "podcast":
-            show_feed_url = _safe_str(entry.get("feedUrl")).strip()
-            break
-
-    def _pick_audio_url(entry: dict) -> str | None:
-        # Prefer fields that are usually direct media links.
-        for key in ("previewUrl", "enclosureUrl", "assetUrl", "episodeUrl"):
-            val = _safe_str(entry.get(key)).strip()
-            if val:
-                return val
-        return None
-
     out = []
     for entry in data["results"]:
         if entry.get("wrapperType") != "podcastEpisode":
             continue
-        episode_url = _pick_audio_url(entry)
+        episode_url = entry.get("episodeUrl")
         if not episode_url:
             continue
         out.append(
             {
+                "episode_id": str(entry.get("trackId") or ""),
                 "title": entry.get("trackName", "Unknown Episode"),
                 "audio_url": episode_url,
-                "show_name": _safe_str(entry.get("collectionName")),
-                "publish_date": _safe_str(entry.get("releaseDate")),
-                "track_id": entry.get("trackId"),
-                "feed_url": show_feed_url,
+                "show_name": entry.get("collectionName", ""),
+                "publish_date": entry.get("releaseDate", ""),
             }
         )
-    if target_track_id is not None:
-        exact = []
+    if target_episode_id:
         for ep in out:
-            ep_track_raw = _safe_str(ep.get("track_id")).strip()
-            ep_track_id = int(ep_track_raw) if ep_track_raw.isdigit() else 0
-            if ep_track_id == target_track_id:
-                exact.append(ep)
-        if exact:
-            return exact
-    return out[:5]
-
-
-def _get_rss_enclosure_url(feed_url: str, episode_title: str = "", episode_page_url: str = "") -> str | None:
-    if not feed_url:
-        return None
-    try:
-        feed = feedparser.parse(feed_url)
-    except Exception:
-        return None
-
-    entries = list(getattr(feed, "entries", []) or [])
-    if not entries:
-        return None
-
-    norm_title = _safe_str(episode_title).strip().lower()
-    norm_page = _safe_str(episode_page_url).strip()
-
-    def _extract_entry_audio(entry) -> str | None:
-        for enc in getattr(entry, "enclosures", []) or []:
-            href = _safe_str(enc.get("href")).strip()
-            if href:
-                return href
-        for link in getattr(entry, "links", []) or []:
-            href = _safe_str(link.get("href")).strip()
-            rel = _safe_str(link.get("rel")).strip().lower()
-            typ = _safe_str(link.get("type")).strip().lower()
-            if href and (rel == "enclosure" or typ.startswith("audio/")):
-                return href
-        return None
-
-    if norm_page:
-        for entry in entries:
-            entry_link = _safe_str(getattr(entry, "link", "")).strip()
-            if entry_link and entry_link == norm_page:
-                audio = _extract_entry_audio(entry)
-                if audio:
-                    return audio
-
-    if norm_title:
-        for entry in entries:
-            entry_title = _safe_str(getattr(entry, "title", "")).strip().lower()
-            if entry_title and entry_title == norm_title:
-                audio = _extract_entry_audio(entry)
-                if audio:
-                    return audio
-        for entry in entries:
-            entry_title = _safe_str(getattr(entry, "title", "")).strip().lower()
-            if entry_title and norm_title in entry_title:
-                audio = _extract_entry_audio(entry)
-                if audio:
-                    return audio
-
-    for entry in entries:
-        audio = _extract_entry_audio(entry)
-        if audio:
-            return audio
-    return None
+            if ep.get("episode_id") == str(target_episode_id):
+                return [ep]
+    return out[:3]
 
 
 def cleanup_files(temp_dir: Path, job_id: str) -> None:
@@ -356,7 +511,12 @@ def transcribe_audio(
     temp_dir: Path,
     job_id: str,
     on_status: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    *,
+    source_info: dict | None = None,
+    fingerprint_path: Path | None = None,
 ) -> str:
+    _raise_if_cancelled(cancel_event)
     if not audio_path.exists():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
@@ -364,28 +524,122 @@ def transcribe_audio(
     if file_size < 1024:
         raise ValueError(f"Audio file is too small ({file_size} bytes).")
 
-    model = get_model()
     duration = get_audio_duration(audio_path)
     if duration <= 0.1:
         raise ValueError(f"Audio is too short ({duration:.2f} seconds).")
+    _raise_if_cancelled(cancel_event)
 
-    if duration <= CHUNK_MINUTES * 60:
-        result = model.transcribe(str(audio_path))
-        return _safe_str(result.get("text")).strip()
+    fp_path = fingerprint_path if fingerprint_path and fingerprint_path.exists() else audio_path
+    fingerprint = _compute_audio_fingerprint(fp_path)
+    checkpoint = _load_checkpoint(temp_dir, fingerprint, duration)
+    resume_from = 0.0
+    previous_segments: list[dict] = []
+    previous_text_parts: list[str] = []
+    if checkpoint:
+        resume_from = float(checkpoint.get("last_completed_end", 0.0))
+        previous_segments = list(checkpoint.get("segments", []))
+        previous_text_parts = [str(s.get("text", "")).strip() for s in previous_segments if s.get("text")]
+        if on_status and duration > 0:
+            pct = min(99, int((resume_from / duration) * 100))
+            on_status(f"Transcribing... {pct}% (resuming)")
 
-    chunks = split_audio(audio_path, temp_dir, job_id)
-    if on_status:
-        on_status(f"Transcribing {len(chunks)} segments...")
+    if resume_from > 0 and (duration - resume_from) < 5.0:
+        _delete_checkpoint(temp_dir, fingerprint)
+        return _clean_transcript_text(" ".join(previous_text_parts).strip())
 
-    texts: list[str] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        if on_status:
-            on_status(f"Transcribing segment {idx}/{len(chunks)}...")
-        result = model.transcribe(str(chunk))
-        txt = _safe_str(result.get("text")).strip()
-        if txt:
-            texts.append(txt)
-    return " ".join(texts).strip()
+    transcribe_path = audio_path
+    if resume_from > 0:
+        trimmed_path = temp_dir / f"{job_id}_resumed.wav"
+        trimmed = _trim_audio_from(audio_path, resume_from, trimmed_path)
+        if trimmed:
+            transcribe_path = trimmed
+        else:
+            resume_from = 0.0
+            previous_segments = []
+            previous_text_parts = []
+
+    model = get_model()
+    accumulated_segments: list[dict] = list(previous_segments)
+    new_texts: list[str] = []
+    last_status_update = time.time()
+    last_checkpoint_flush = time.time()
+
+    def collect_segment(start_s: float, end_s: float, text: str) -> None:
+        nonlocal last_status_update, last_checkpoint_flush
+        seg_text = (text or "").strip()
+        if not seg_text:
+            return
+        new_texts.append(seg_text)
+        seg_data = {
+            "start": round(start_s + resume_from, 3),
+            "end": round(end_s + resume_from, 3),
+            "text": seg_text,
+        }
+        accumulated_segments.append(seg_data)
+        now = time.time()
+        if on_status and duration > 0 and now - last_status_update >= 5:
+            pct = min(99, int((seg_data["end"] / duration) * 100))
+            on_status(f"Transcribing... {pct}%")
+            last_status_update = now
+        if now - last_checkpoint_flush >= CHECKPOINT_FLUSH_INTERVAL:
+            _save_checkpoint(temp_dir, fingerprint, duration, accumulated_segments, source_info=source_info)
+            last_checkpoint_flush = now
+
+    try:
+        _raise_if_cancelled(cancel_event)
+        resolved_language = _resolve_whisper_language()
+        use_batched = (
+            BatchedInferencePipeline is not None and get_batched_model() is not None and duration > CHUNK_MINUTES * 60
+        )
+        if use_batched:
+            if on_status and resume_from == 0:
+                on_status("Transcribing... 0%")
+            batched_model = get_batched_model()
+            kwargs = {
+                "beam_size": WHISPER_BEAM_SIZE,
+                "batch_size": WHISPER_BATCH_SIZE,
+                "condition_on_previous_text": False,
+                "vad_filter": True,
+                "vad_parameters": dict(min_silence_duration_ms=500),
+            }
+            if resolved_language:
+                kwargs["language"] = resolved_language
+            segments, _info = batched_model.transcribe(str(transcribe_path), **kwargs)
+            for seg in segments:
+                _raise_if_cancelled(cancel_event)
+                collect_segment(float(seg.start), float(seg.end), str(seg.text))
+        elif WhisperModel is not None:
+            if on_status and resume_from == 0:
+                on_status("Transcribing... 0%")
+            kwargs = {
+                "beam_size": WHISPER_BEAM_SIZE,
+                "condition_on_previous_text": False,
+                "vad_filter": True,
+                "vad_parameters": dict(min_silence_duration_ms=500),
+            }
+            if resolved_language:
+                kwargs["language"] = resolved_language
+            segments, _info = model.transcribe(str(transcribe_path), **kwargs)
+            for seg in segments:
+                _raise_if_cancelled(cancel_event)
+                collect_segment(float(seg.start), float(seg.end), str(seg.text))
+        else:
+            if on_status:
+                on_status("Transcribing...")
+            kwargs = {"beam_size": WHISPER_BEAM_SIZE}
+            if resolved_language:
+                kwargs["language"] = resolved_language
+            result = model.transcribe(str(transcribe_path), **kwargs)
+            full_text = (result.get("text") or "").strip()
+            if full_text:
+                new_texts.append(full_text)
+                accumulated_segments.append({"start": resume_from, "end": duration, "text": full_text})
+        _delete_checkpoint(temp_dir, fingerprint)
+        return _clean_transcript_text(" ".join(previous_text_parts + new_texts).strip())
+    except Exception:
+        if len(accumulated_segments) > len(previous_segments):
+            _save_checkpoint(temp_dir, fingerprint, duration, accumulated_segments, source_info=source_info)
+        raise
 
 
 def _safe_filename(title: str) -> str:
@@ -434,8 +688,10 @@ def _pipeline_youtube(
     temp_dir: Path,
     job_id: str,
     on_status: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, Path]:
     try:
+        _raise_if_cancelled(cancel_event)
         if on_status:
             on_status("Checking video info...")
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
@@ -450,6 +706,7 @@ def _pipeline_youtube(
         title = info.get("title", "Unknown")
         if on_status:
             on_status(f"Downloading '{title}'...")
+        _raise_if_cancelled(cancel_event)
 
         output_path = temp_dir / job_id
         ydl_opts = {
@@ -471,15 +728,25 @@ def _pipeline_youtube(
             ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
+        _raise_if_cancelled(cancel_event)
 
         audio_file = output_path.with_suffix(".mp3")
         if not audio_file.exists():
             raise FileNotFoundError("Failed to download audio.")
 
+        original_audio = audio_file
         normalized = normalize_audio(audio_file, temp_dir, job_id)
         if on_status:
             on_status(f"Transcribing '{title}'...")
-        text = transcribe_audio(normalized, temp_dir, job_id, on_status=on_status)
+        text = transcribe_audio(
+            normalized,
+            temp_dir,
+            job_id,
+            on_status=on_status,
+            cancel_event=cancel_event,
+            source_info={"source_type": "youtube", "title": title, "source_url": url},
+            fingerprint_path=original_audio,
+        )
         out_path = save_transcript_md(transcript_dir, title, url, "youtube", duration or None, text)
         return title, out_path
     finally:
@@ -494,108 +761,91 @@ def _pipeline_podcast(
     transcript_dir: Path,
     temp_dir: Path,
     job_id: str,
-    fallback_audio_urls: list[str] | None = None,
     on_status: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, Path]:
-    def _download_via_ytdlp(target_url: str, out_base: Path) -> Path:
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": str(out_base),
-            "quiet": True,
-            "no_warnings": True,
-            "retries": 3,
-            "fragment_retries": 3,
-            "noplaylist": True,
-        }
-        if FFMPEG_LOCATION:
-            ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([target_url])
-        files = sorted(temp_dir.glob(f"{job_id}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for f in files:
-            if f.is_file() and not str(f).endswith(".part") and f.suffix.lower() in ALLOWED_AUDIO_EXTENSIONS:
-                return f
-        raise FileNotFoundError("Failed to download audio via yt-dlp.")
-
-    def _looks_like_html(file_path: Path) -> bool:
-        try:
-            with file_path.open("rb") as fh:
-                head = fh.read(512).lower()
-            return b"<html" in head or b"<!doctype html" in head
-        except OSError:
-            return False
-
-    def _download_direct(target_url: str, out_path: Path) -> Path:
-        req = urllib.request.Request(target_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            with out_path.open("wb") as fh:
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-        return out_path
-
-    def _try_fallback_audio_urls() -> Path | None:
-        for idx, candidate in enumerate(fallback_audio_urls or [], start=1):
-            if not candidate or candidate == audio_url:
-                continue
-            ext_match2 = re.search(r"\.(mp3|m4a|m4b|wav|ogg|aac|flac|wma|opus|webm|mp4)", candidate, re.IGNORECASE)
-            ext2 = ext_match2.group(1).lower() if ext_match2 else "mp3"
-            candidate_file = temp_dir / f"{job_id}_fb{idx}.{ext2}"
-            try:
-                if on_status:
-                    on_status(f"Trying fallback audio source #{idx}...")
-                _download_direct(candidate, candidate_file)
-                if candidate_file.exists() and candidate_file.stat().st_size >= 1024:
-                    if not _looks_like_html(candidate_file) and get_audio_duration(candidate_file) > 0.1:
-                        return candidate_file
-            except Exception:
-                continue
-        return None
-
     try:
+        _raise_if_cancelled(cancel_event)
         if on_status:
             on_status(f"Downloading '{title}'...")
 
         ext_match = re.search(r"\.(mp3|m4a|wav|ogg|aac|flac|wma|opus)", audio_url, re.IGNORECASE)
+        is_direct_audio_url = bool(ext_match)
         ext = ext_match.group(1).lower() if ext_match else "mp3"
         audio_file = temp_dir / f"{job_id}.{ext}"
 
-        try:
-            _download_direct(audio_url, audio_file)
-        except urllib.error.HTTPError as e:
-            raise ValueError(f"Failed to download audio (HTTP {e.code}).") from e
+        if is_direct_audio_url:
+            # Use streaming requests with explicit timeouts to avoid hanging forever.
+            try:
+                with requests.get(
+                    audio_url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    stream=True,
+                    timeout=(20, 60),
+                ) as resp:
+                    if resp.status_code >= 400:
+                        raise ValueError(f"Failed to download audio (HTTP {resp.status_code}).")
+                    with audio_file.open("wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            _raise_if_cancelled(cancel_event)
+                            if chunk:
+                                fh.write(chunk)
+            except requests.RequestException as e:
+                raise ValueError(f"Failed to download audio ({type(e).__name__}).") from e
+        else:
+            if on_status:
+                on_status("Resolving media URL...")
+            output_path = temp_dir / job_id
+            ydl_opts = {
+                "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }
+                ],
+                "outtmpl": str(output_path),
+                "quiet": True,
+                "no_warnings": True,
+                "retries": 3,
+                "fragment_retries": 3,
+            }
+            if FFMPEG_LOCATION:
+                ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([audio_url])
+            except Exception as e:
+                raise ValueError(f"Failed to resolve/download podcast audio: {e}") from e
+            _raise_if_cancelled(cancel_event)
+            candidate = output_path.with_suffix(".mp3")
+            if candidate.exists():
+                audio_file = candidate
+            else:
+                matches = sorted(temp_dir.glob(f"{job_id}.*"))
+                audio_matches = [p for p in matches if p.suffix.lower() in ALLOWED_AUDIO_EXTENSIONS]
+                if audio_matches:
+                    audio_file = max(audio_matches, key=lambda p: p.stat().st_size)
 
         if not audio_file.exists():
             raise FileNotFoundError("Failed to download audio.")
         if audio_file.stat().st_size < 1024:
             raise ValueError("Downloaded audio file is too small.")
-        if _looks_like_html(audio_file):
-            if on_status:
-                on_status("Direct link is a webpage, trying RSS/fallback sources...")
-            fallback_file = _try_fallback_audio_urls()
-            if fallback_file is not None:
-                audio_file = fallback_file
-            else:
-                if on_status:
-                    on_status("Fallback sources failed, retrying with yt-dlp...")
-                audio_file = _download_via_ytdlp(source_url, temp_dir / job_id)
-        elif get_audio_duration(audio_file) <= 0.1:
-            if on_status:
-                on_status("Direct audio probe failed, trying RSS/fallback sources...")
-            fallback_file = _try_fallback_audio_urls()
-            if fallback_file is not None:
-                audio_file = fallback_file
-            else:
-                if on_status:
-                    on_status("Fallback sources failed, retrying with yt-dlp...")
-                audio_file = _download_via_ytdlp(source_url, temp_dir / job_id)
 
+        original_audio = audio_file
         normalized = normalize_audio(audio_file, temp_dir, job_id)
         if on_status:
             on_status(f"Transcribing '{title}'...")
-        text = transcribe_audio(normalized, temp_dir, job_id, on_status=on_status)
+        text = transcribe_audio(
+            normalized,
+            temp_dir,
+            job_id,
+            on_status=on_status,
+            cancel_event=cancel_event,
+            source_info={"source_type": source_type, "title": title, "source_url": source_url},
+            fingerprint_path=original_audio,
+        )
         out_path = save_transcript_md(transcript_dir, title, source_url, source_type, None, text)
         return title, out_path
     finally:
@@ -607,15 +857,25 @@ def transcribe_url_to_markdown(
     transcript_dir: Path,
     temp_dir: Path,
     on_status: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, Path]:
     temp_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_old_checkpoints(temp_dir)
+    _raise_if_cancelled(cancel_event)
     job_id = str(uuid.uuid4())
     url_type, error = classify_url(url)
     if error:
         raise ValueError(error)
 
     if url_type == "youtube":
-        return _pipeline_youtube(url, transcript_dir, temp_dir, job_id, on_status=on_status)
+        return _pipeline_youtube(
+            url,
+            transcript_dir,
+            temp_dir,
+            job_id,
+            on_status=on_status,
+            cancel_event=cancel_event,
+        )
 
     if url_type == "apple":
         episodes = fetch_apple_podcast_episodes(url)
@@ -625,12 +885,6 @@ def transcribe_url_to_markdown(
         title = episode["title"]
         if episode.get("show_name"):
             title = f"{episode['show_name']} - {episode['title']}"
-        rss_audio_url = _get_rss_enclosure_url(
-            _safe_str(episode.get("feed_url")).strip(),
-            episode_title=episode.get("title", ""),
-            episode_page_url=episode.get("audio_url", ""),
-        )
-        fallback_audio_urls = [u for u in [rss_audio_url] if u]
         return _pipeline_podcast(
             episode["audio_url"],
             title,
@@ -639,8 +893,8 @@ def transcribe_url_to_markdown(
             transcript_dir=transcript_dir,
             temp_dir=temp_dir,
             job_id=job_id,
-            fallback_audio_urls=fallback_audio_urls,
             on_status=on_status,
+            cancel_event=cancel_event,
         )
 
     if url_type == "direct":
@@ -655,6 +909,7 @@ def transcribe_url_to_markdown(
             temp_dir=temp_dir,
             job_id=job_id,
             on_status=on_status,
+            cancel_event=cancel_event,
         )
 
     raise ValueError("Unsupported URL type.")
@@ -666,17 +921,29 @@ def transcribe_upload_to_markdown(
     transcript_dir: Path,
     temp_dir: Path,
     on_status: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, Path]:
     temp_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_old_checkpoints(temp_dir)
+    _raise_if_cancelled(cancel_event)
     job_id = str(uuid.uuid4())
     try:
         if on_status:
             on_status(f"Preparing '{original_filename}'...")
+        _raise_if_cancelled(cancel_event)
+        original_audio = audio_path
         normalized = normalize_audio(audio_path, temp_dir, job_id)
         if on_status:
             on_status(f"Transcribing '{original_filename}'...")
-        text = transcribe_audio(normalized, temp_dir, job_id, on_status=on_status)
-        text = _safe_str(text)
+        text = transcribe_audio(
+            normalized,
+            temp_dir,
+            job_id,
+            on_status=on_status,
+            cancel_event=cancel_event,
+            source_info={"source_type": "upload", "title": original_filename},
+            fingerprint_path=original_audio,
+        )
         if not text:
             raise ValueError("Transcription produced no text.")
 

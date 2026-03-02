@@ -105,3 +105,13 @@ python healthcheck.py
 sudo systemctl restart jat-bot
 ```
 
+## 9) Optional: Cleanup Historical Markdown Notes
+
+If old notes contain duplicate day headings or legacy Telegram line format, run:
+
+```bash
+cd /opt/jat_telegram_assistant_bot
+source .venv/bin/activate
+python tools/cleanup_dropbox_notes_md.py --env-file .env.main --remote-root "/read & chat/read" --local-notes "read/notes"
+python tools/cleanup_dropbox_notes_md.py --env-file .env.chitchat --remote-root "/read & chat/chitchat" --local-notes "chitchat/notes"
+```

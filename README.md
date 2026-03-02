@@ -1,113 +1,16 @@
 # JAT Telegram Assistant Bot (PoC)
 
-## Setup (Windows, recommended)
-
-Use Python 3.11 for stable `openai-whisper` install on Windows.
-
-1. Install Python 3.11 and confirm it is available:
+## Setup
 
 ```powershell
-py -0p
-```
-
-2. Create a clean virtual environment with Python 3.11:
-
-```powershell
-cd C:\Users\KHUser\jat_telegram_assistant_bot
-Remove-Item -Recurse -Force .venv -ErrorAction SilentlyContinue
-py -3.11 -m venv .venv
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python --version
-```
-
-3. Install dependencies with constraints (important for whisper build deps):
-
-```powershell
-python -m pip install --upgrade "pip<26" "setuptools<81" wheel
-$env:PIP_CONSTRAINT="$PWD\constraints.txt"
 python -m pip install -r requirements.txt -c constraints.txt
 ```
 
-4. Install and verify `ffmpeg` (required by Whisper runtime):
-
-```powershell
-ffmpeg -version
-```
-
-5. Optional: Install Ollama (required only when `AI_SUMMARY_PROVIDER=ollama` or `local`):
-
-```powershell
-winget install Ollama.Ollama
-ollama --version
-ollama serve
-```
-
-If `winget` is not available, install manually:
-1. Open the official download page: https://ollama.com/download/windows
-2. Download and run the Windows installer.
-3. Restart PowerShell and verify:
-
-```powershell
-ollama --version
-ollama serve
-```
-
-In another terminal, verify service and pull a model:
-
-```powershell
-ollama list
-ollama pull qwen2.5:7b
-```
-
 Notes:
-- `constraints.txt` pins packaging/build tooling used during install.
+- `constraints.txt` pins packaging/build tooling used during install (currently includes `setuptools<81`).
 - `start.ps1` also uses this constraints file automatically when it installs dependencies.
-- Ollama is not installed by `pip install -r requirements.txt`; it must be installed as a system CLI.
-
-## Required Tools Checklist
-
-These are required/optional system tools for this project on Windows:
-
-- Required: Python 3.11 (`py -0p`)
-- Required for transcription: `ffmpeg` + `ffprobe`
-- Optional (AI summary with local model): Ollama CLI/service
-
-Quick verification:
-
-```powershell
-python --version
-ffmpeg -version
-ffprobe -version
-```
-
-If `ffmpeg`/`ffprobe` are not in PATH, set `FFMPEG_LOCATION` in your env file to the ffmpeg `bin` folder.
-After code changes, always restart bot processes:
-
-```powershell
-.\stop-both.ps1
-.\start-both.ps1
-```
-
-## Transcription Troubleshooting (Apple Podcasts)
-
-If Apple Podcasts transcription fails, check in this order:
-
-1. Confirm bot is running latest code (restart with `stop-both/start-both`).
-2. Confirm `yt-dlp` in `.venv` is latest:
-
-```powershell
-python -m pip install -U yt-dlp
-```
-
-3. Confirm `ffmpeg` and `ffprobe` are available.
-4. Retry the same URL. Current fallback order is:
-- direct audio URL from Apple metadata
-- RSS `enclosure` audio URL
-- `yt-dlp` as last fallback
-
-Known transient error:
-- `ERROR: [ApplePodcasts] ... Unable to extract server data`
-- This is from upstream Apple page parsing in `yt-dlp`; bot now tries RSS/direct sources first, but if all sources fail, retry later or test a different episode URL.
 
 ## Deployment Docs
 
@@ -118,141 +21,61 @@ Known transient error:
 
 ## Env
 
-For dual-bot startup (`start-both.ps1`), create two env files from dedicated templates:
+Use profile-specific env files instead of a shared `.env` whenever possible:
 
-```powershell
-Copy-Item .env.main.example .env.main
-Copy-Item .env.chitchat.example .env.chitchat
-```
+- main bot: `.env.main`
+- chitchat bot: `.env.chitchat`
 
-Required minimum settings:
-- `.env.main`: set `TELEGRAM_BOT_TOKEN`, set `APP_MODULE=app_main`
-- `.env.chitchat`: set `TELEGRAM_BOT_TOKEN`, set `APP_MODULE=app_chitchat`
-- `.env.chitchat.example` intentionally excludes News/Slack config because chitchat does not use those features.
+`start.ps1` loads env values from `-EnvFile`, and `start-both.ps1` already uses `.env.main` + `.env.chitchat`.
 
-Single-bot mode is also supported with one env file (for example `.env`, based on `.env.example`).
+### Segment A: Profile / Runtime
+- Purpose: select bot profile and data root.
+- Keys: `APP_MODULE`, `APP_PROFILE`, `DATA_DIR`.
 
-- `TELEGRAM_ALLOWED_GROUPS` comma-separated group titles to log
-- `DATA_DIR` location for SQLite + Markdown
-- `APP_MODULE` uvicorn module name (`app`, `app_main`, `app_chitchat`)
-- `TELEGRAM_LONG_POLLING` set `1` to enable getUpdates instead of webhook
-- `TELEGRAM_LOCAL_WEBHOOK_URL` local URL for polling to forward updates (default: `http://127.0.0.1:8000/telegram`)
+### Segment B: Telegram Core
+- Purpose: Telegram token, webhook/polling mode, and network retry behavior.
+- Keys: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_GROUPS`, `TELEGRAM_LONG_POLLING`, `TELEGRAM_LOCAL_WEBHOOK_URL`.
+- Optional tuning: `TELEGRAM_FILE_FETCH_*`, `TELEGRAM_POLL_*`.
 
-Feature flags:
-- `FEATURE_NEWS_ENABLED` enable/disable news ingest + `/news` commands
-- `FEATURE_TRANSCRIBE_ENABLED` enable/disable `/transcribe` and audio transcription
-- `FEATURE_TRANSCRIBE_AUTO_URL` when set `1`, private chat plain URLs auto-trigger transcription
-- `FEATURE_OCR_ENABLED` enable/disable image OCR pipeline
-- `FEATURE_OCR_CHOICE_ENABLED` when set `1`, image OCR asks user to choose (`進行 OCR` or `只存圖`)
-- `OCR_CHOICE_SCOPE` OCR choice scope (`private` recommended)
-- `OCR_CHOICE_TIMEOUT_SECONDS` choice timeout seconds before fallback to save-only (default: `60`)
-- `FEATURE_SLACK_ENABLED` enable/disable Slack worker
+### Segment C: Feature Flags
+- Purpose: toggle major functions without code changes.
+- Keys: `FEATURE_NEWS_ENABLED`, `FEATURE_TRANSCRIBE_ENABLED`, `FEATURE_TRANSCRIBE_AUTO_URL`, `FEATURE_OCR_ENABLED`, `FEATURE_OCR_CHOICE_ENABLED`, `FEATURE_SLACK_ENABLED`.
+- OCR choice behavior: `OCR_CHOICE_SCOPE`, `OCR_CHOICE_TIMEOUT_SECONDS`, `OCR_CHOICE_TIMEOUT_DEFAULT`.
 
-OCR (Google Vision):
-- `OCR_PROVIDER` set `google_vision`
-- `OCR_LANG_HINTS` OCR language hints (default: `zh-TW,en`)
-- `GOOGLE_APPLICATION_CREDENTIALS` full path to Google service-account JSON key
-- After downloading the service-account key (for example `vision.json`), place it in the project `gcp` folder and set `GOOGLE_APPLICATION_CREDENTIALS` to its absolute path, for example: `C:\Users\KHUser\jat_telegram_assistant_bot\gcp\vision.json`
+### Segment D: Transcription Engine
+- Purpose: control Whisper quality/speed/memory and chunking.
+- Keys: `TRANSCRIBE_MAX_DURATION_SECONDS`, `TRANSCRIBE_CHUNK_MINUTES`, `TRANSCRIBE_CHECKPOINT_FLUSH_SECONDS`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`, `WHISPER_BEAM_SIZE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_CPU_THREADS`, `WHISPER_BATCH_SIZE`, `FFMPEG_LOCATION`, `TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS`.
 
-Dropbox sync:
-- `DROPBOX_ACCESS_TOKEN` API token (legacy/fallback mode)
-- `DROPBOX_REFRESH_TOKEN` long-lived refresh token (recommended)
-- `DROPBOX_APP_KEY` Dropbox app key (required with refresh token)
-- `DROPBOX_APP_SECRET` Dropbox app secret (required with refresh token)
-- `DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS` refresh-ahead buffer in seconds (default: `300`)
-- `DROPBOX_TRANSCRIPTS_PATH` Dropbox transcripts folder to import locally (default: `/Transcripts`)
-- `DROPBOX_TRANSCRIPTS_SYNC_ENABLED` set `1` to sync transcripts from Dropbox before digest (default: `1`)
-- `DROPBOX_ROOT_PATH` cloud root folder (default: `/read`)
-- `DROPBOX_SYNC_ENABLED` set `1` to enable sync worker
-- `DROPBOX_SYNC_TIME` daily sync time in `HH:MM` (default: `00:10`)
-- `DROPBOX_SYNC_TZ` sync timezone (default: `Asia/Taipei`)
-- `DROPBOX_SYNC_ON_STARTUP` set `1` to run one full backfill at startup
+### Segment E: OCR Provider
+- Purpose: configure image OCR backend.
+- Keys: `OCR_PROVIDER`, `OCR_LANG_HINTS`, `GOOGLE_APPLICATION_CREDENTIALS`.
 
-Get `DROPBOX_REFRESH_TOKEN` (Windows CLI quick path):
+### Segment F: News / Digest
+- Purpose: collect, filter, and summarize news.
+- Keys: `NEWS_ENABLED`, `NEWS_FETCH_INTERVAL_MINUTES`, `NEWS_PUSH_ENABLED`, `NEWS_PUSH_MAX_ITEMS`, `NEWS_GNEWS_*`, `NEWS_RSS_URLS`, `NEWS_RSS_URLS_FILE`, `NEWS_URL_FETCH_*`, `NEWS_DIGEST_*`, `NOTE_DIGEST_MAX_ITEMS`.
 
-0. Dropbox Console prep:
-- Go to Dropbox Developer Console -> your App -> `Settings`.
-- Under `OAuth 2` -> `Redirect URIs`, keep exactly one URI:
-- `http://localhost:8000/dropbox/callback`
-- Use the exact same string in all later steps.
+### Segment G: AI Summary Providers
+- Purpose: shared AI config for `/summary` and transcript summary blocks.
+- Keys: `AI_SUMMARY_ENABLED`, `AI_SUMMARY_PROVIDER`, `AI_SUMMARY_TIMEOUT_SECONDS`, `AI_SUMMARY_MAX_CHARS`.
+- Provider keys: `OPENAI_*`, `GEMINI_*`, `ANTHROPIC_*`, `HUGGINGFACE_*`, `OLLAMA_*`.
 
-1. Open this authorize URL in browser (replace `YOUR_APP_KEY`):
+### Segment H: Dropbox Sync
+- Purpose: sync notes/images and import transcript files.
+- Keys: `DROPBOX_ACCESS_TOKEN`, `DROPBOX_REFRESH_TOKEN`, `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS`, `DROPBOX_ROOT_PATH`, `DROPBOX_SYNC_ENABLED`, `DROPBOX_SYNC_TIME`, `DROPBOX_SYNC_TZ`, `DROPBOX_SYNC_ON_STARTUP`, `DROPBOX_TRANSCRIPTS_PATH`, `DROPBOX_TRANSCRIPTS_SYNC_ENABLED`.
 
-```text
-https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&response_type=code&token_access_type=offline&redirect_uri=http://localhost:8000/dropbox/callback
-```
+### Segment I: Notion (mainly chitchat)
+- Purpose: append chitchat logs/images/transcripts to Notion pages.
+- Keys: `NOTION_ENABLED`, `NOTION_TOKEN`, `NOTION_VERSION`, `NOTION_CHATLOG_YEAR_PAGES_JSON`, `NOTION_CHATLOG_FALLBACK_PAGE_ID`, `NOTION_CHATLOG_IMAGE_MODE`, `NOTION_CHATLOG_OCR_MODE`, `NOTION_CHATLOG_INCLUDE_TIME`.
 
-- After approve, browser redirects to:
-- `http://localhost:8000/dropbox/callback?code=XXXX`
-- `ERR_CONNECTION_REFUSED` is expected; copy the full callback URL from address bar.
+### Segment J: Slack (optional)
+- Purpose: enable Socket Mode DM logging.
+- Keys: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_USER_ID`, `SLACK_DEBUG`.
 
-2. Extract `code` from full callback URL (avoid copy pollution):
+### Templates
 
-```powershell
-$url = "http://localhost:8000/dropbox/callback?code=XXXXXXXX"
-$code = $url -replace '^.*code=', ''
-$code = $code -replace '&.*$', ''
-$code = $code.Trim()
-
-$code.Length
-```
-
-- `Length` should usually be 40+ chars.
-
-3. Exchange `code` for `refresh_token`:
-
-```powershell
-$appKey = "YOUR_APP_KEY"
-$appSecret = "YOUR_APP_SECRET"
-$redirect = "http://localhost:8000/dropbox/callback"
-
-$body = "code=$code&grant_type=authorization_code&client_id=$appKey&client_secret=$appSecret&redirect_uri=$([uri]::EscapeDataString($redirect))"
-
-Invoke-RestMethod -Method Post `
-  -Uri "https://api.dropboxapi.com/oauth2/token" `
-  -ContentType "application/x-www-form-urlencoded" `
-  -Body $body
-```
-
-- Success JSON includes `access_token`, `refresh_token`, `expires_in`.
-- Save `refresh_token` into `.env.main` / `.env.chitchat` as needed.
-
-4. Use `refresh_token` to get a new `access_token` later:
-
-```powershell
-$refresh = "YOUR_REFRESH_TOKEN"
-$appKey = "YOUR_APP_KEY"
-$appSecret = "YOUR_APP_SECRET"
-
-$body = "grant_type=refresh_token&refresh_token=$refresh&client_id=$appKey&client_secret=$appSecret"
-
-Invoke-RestMethod -Method Post `
-  -Uri "https://api.dropboxapi.com/oauth2/token" `
-  -ContentType "application/x-www-form-urlencoded" `
-  -Body $body
-```
-
-Common errors:
-- `redirect_uri mismatch`: `redirect_uri` in request is not exactly the same as Dropbox Console setting.
-- `code expired`: authorization code is one-time and short-lived; regenerate and retry immediately.
-- Bad copy/paste code: always extract from full callback URL using the PowerShell snippet above.
-
-Slack (Socket Mode):
-- `SLACK_BOT_TOKEN` (xoxb-...)
-- `SLACK_APP_TOKEN` (xapp-...) with `connections:write`
-- `SLACK_USER_ID` your user id (U...)
-
-AI summary for `/summary`:
-- `AI_SUMMARY_ENABLED` set `1` to enable
-- `AI_SUMMARY_PROVIDER` supports `openai`, `gemini`, `anthropic`, `huggingface`, `ollama` (`antropic`, `hf`, `local` aliases also work)
-- `AI_SUMMARY_TIMEOUT_SECONDS` request timeout for all providers
-- `AI_SUMMARY_MAX_CHARS` max context size sent to model
-- OpenAI: `OPENAI_API_KEY`, `OPENAI_MODEL`
-- Gemini: `GEMINI_API_KEY`, `GEMINI_MODEL`
-- Anthropic: `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`
-- Hugging Face: `HUGGINGFACE_API_KEY`, `HUGGINGFACE_MODEL`, `HUGGINGFACE_BASE_URL`
-- Ollama: `OLLAMA_BASE_URL`, `OLLAMA_MODEL`
-- `start.ps1` will auto-pull `OLLAMA_MODEL` if missing locally.
+- Main profile template: `.env.main.example`
+- Chitchat profile template: `.env.chitchat.example`
+- Legacy generic template: `.env.example`
 
 ## Run
 
@@ -268,12 +91,6 @@ Recommended startup script:
 .\start.ps1
 ```
 
-Run both bots (requires `.env.main` and `.env.chitchat`):
-
-```powershell
-.\start-both.ps1
-```
-
 `start.ps1` behavior:
 - Creates `.venv` automatically if missing.
 - Imports env vars from `-EnvFile`.
@@ -286,6 +103,12 @@ Run with specific env file and port:
 ```powershell
 .\start.ps1 -EnvFile .env.main -Port 8000
 .\start.ps1 -EnvFile .env.chitchat -Port 8001
+```
+
+Start both bots:
+
+```powershell
+.\start-both.ps1
 ```
 
 Stop both bots:
@@ -338,6 +161,7 @@ sort downloads
 ```
 
 `/news` and `/transcribe` availability depends on `FEATURE_NEWS_ENABLED` and `FEATURE_TRANSCRIBE_ENABLED`.
+Transcription flow: bot sends `已�??��??�` right after transcript is saved, then sends AI summary afterward (if enabled).
 
 Group logging (no reply):
 - Messages in allowed groups are stored in SQLite and appended to Markdown files.
@@ -349,9 +173,18 @@ Slack DM logging (no reply):
 - Run uvicorn, then send a DM to your bot.
 
 Image OCR and cloud sync:
-- Telegram private image uploads are saved to `DATA_DIR\inbox\images\YYYY-MM-DD\`.
-- If OCR choice is enabled, bot asks per image: `進行 OCR` or `只存圖`; timeout defaults to save-only.
-- OCR output is appended to `DATA_DIR\notes\ocr\YYYY-MM-DD_ocr.md`.
-- A Dropbox worker syncs local `notes` and `inbox/images` to:
-- `/read/notes`
-- `/read/images`
+- Telegram private image uploads are saved to `DATA_DIR\\images\YYYY-MM-DD\`.
+- If OCR choice is enabled, bot asks per image: `?��? OCR` or `?��??�`; timeout defaults to save-only.
+- OCR output is appended to `DATA_DIR\\notes\\telegram\\YYYY-MM-DD_telegram.md`.
+- A Dropbox worker syncs local `notes` and `images` to:
+- `/read & chat/read/notes`
+- `/read & chat/read/images`
+
+
+## Markdown Cleanup Maintenance
+
+- Use `python tools\cleanup_dropbox_notes_md.py` to normalize existing note markdown (deduplicate duplicated headings/blocks and convert old Telegram line format to `- [HH:MM:SS] text`).
+- Main profile cleanup:
+  - `python tools\cleanup_dropbox_notes_md.py --env-file .env.main --remote-root "/read & chat/read" --local-notes "read/notes"`
+- Chitchat profile cleanup:
+  - `python tools\cleanup_dropbox_notes_md.py --env-file .env.chitchat --remote-root "/read & chat/chitchat" --local-notes "chitchat/notes"`

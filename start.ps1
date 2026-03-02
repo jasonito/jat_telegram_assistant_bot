@@ -2,7 +2,9 @@ param(
   [switch]$HealthCheck,
   [string]$EnvFile = ".env",
   [int]$Port = 8000,
-  [switch]$ShowWindow
+  [switch]$ShowWindow,
+  [string]$LogFile = "",
+  [switch]$SkipDepsInstall
 )
 
  $ErrorActionPreference = 'Stop'
@@ -88,6 +90,42 @@ param(
     return $v -in @('1', 'true', 'yes')
   }
 
+  function Get-NgrokPublicUrlForPort([int]$targetPort) {
+    $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -Method Get -TimeoutSec 2
+    if (-not $resp -or -not $resp.tunnels) {
+      return $null
+    }
+    foreach ($t in $resp.tunnels) {
+      $publicUrl = $t.public_url
+      $proto = $t.proto
+      $addr = ''
+      if ($t.config -and $t.config.addr) {
+        $addr = $t.config.addr.ToString().ToLower()
+      }
+      if (-not $publicUrl -or -not $proto) { continue }
+      if ($proto -ne 'https') { continue }
+      if (-not $addr) { continue }
+      if ($addr -match ":$targetPort$" -or $addr -match "localhost:$targetPort$" -or $addr -match "127\.0\.0\.1:$targetPort$") {
+        return $publicUrl
+      }
+    }
+    return $null
+  }
+
+  function Get-ListeningPidsForPort([int]$targetPort) {
+    $pids = @()
+    try {
+      $lines = netstat -ano -p tcp | Select-String -Pattern "^\s*TCP\s+\S+:$targetPort\s+\S+\s+LISTENING\s+(\d+)\s*$"
+      foreach ($line in $lines) {
+        $text = $line.ToString()
+        if ($text -match "LISTENING\s+(\d+)\s*$") {
+          $pids += [int]$matches[1]
+        }
+      }
+    } catch {}
+    return @($pids | Select-Object -Unique)
+  }
+
   try {
     Ensure-Command 'python'
 
@@ -136,35 +174,39 @@ param(
     $pythonExe = $venvPython
     Ensure-Command $pythonExe
 
-    $requirements = Join-Path $PSScriptRoot 'requirements.txt'
-    if (-not (Test-Path -Path $requirements)) {
-      throw "requirements.txt not found: $requirements"
-    }
+    if (-not $SkipDepsInstall) {
+      $requirements = Join-Path $PSScriptRoot 'requirements.txt'
+      if (-not (Test-Path -Path $requirements)) {
+        throw "requirements.txt not found: $requirements"
+      }
 
-    $requirementsHash = (Get-FileHash -Path $requirements -Algorithm SHA256).Hash
-    $requirementsStamp = Join-Path $venvDir 'requirements.sha256'
-    $installedHash = if (Test-Path -Path $requirementsStamp) {
-      (Get-Content -Path $requirementsStamp -Raw).Trim()
-    } else {
-      ''
-    }
-    $needsInstall = ($installedHash -ne $requirementsHash)
-
-    if ($needsInstall) {
-      $constraints = Join-Path $PSScriptRoot 'constraints.txt'
-      if (Test-Path -Path $constraints) {
-        Write-Info 'Installing Python dependencies (with constraints)...'
-        & $pythonExe -m pip install -r $requirements -c $constraints
+      $requirementsHash = (Get-FileHash -Path $requirements -Algorithm SHA256).Hash
+      $requirementsStamp = Join-Path $venvDir 'requirements.sha256'
+      $installedHash = if (Test-Path -Path $requirementsStamp) {
+        (Get-Content -Path $requirementsStamp -Raw).Trim()
       } else {
-        Write-Info 'Installing Python dependencies...'
-        & $pythonExe -m pip install -r $requirements
+        ''
       }
-      if ($LASTEXITCODE -ne 0) {
-        throw "pip install failed with exit code $LASTEXITCODE"
+      $needsInstall = ($installedHash -ne $requirementsHash)
+
+      if ($needsInstall) {
+        $constraints = Join-Path $PSScriptRoot 'constraints.txt'
+        if (Test-Path -Path $constraints) {
+          Write-Info 'Installing Python dependencies (with constraints)...'
+          & $pythonExe -m pip install -r $requirements -c $constraints
+        } else {
+          Write-Info 'Installing Python dependencies...'
+          & $pythonExe -m pip install -r $requirements
+        }
+        if ($LASTEXITCODE -ne 0) {
+          throw "pip install failed with exit code $LASTEXITCODE"
+        }
+        Set-Content -Path $requirementsStamp -Value $requirementsHash -NoNewline
+      } else {
+        Write-Info 'Dependencies unchanged, skipping pip install.'
       }
-      Set-Content -Path $requirementsStamp -Value $requirementsHash -NoNewline
     } else {
-      Write-Info 'Dependencies unchanged, skipping pip install.'
+      Write-Info 'Skipping dependency install (-SkipDepsInstall).'
     }
 
     if ($HealthCheck) {
@@ -251,39 +293,50 @@ param(
 
     if ($enableNgrok -ne '0') {
       Ensure-Command 'ngrok'
-      Write-Info 'Starting ngrok...'
-      if ($ShowWindow) {
-        Start-Process -FilePath 'ngrok' -ArgumentList "http $Port"
-      } else {
-        Start-Process -FilePath 'ngrok' -ArgumentList "http $Port" -WindowStyle Hidden
-      }
-
       if ($enableWebhook -ne '0') {
         $deadline = (Get-Date).AddSeconds(30)
         $publicUrl = $null
 
-        Write-Info 'Waiting for ngrok public URL...'
-        while ((Get-Date) -lt $deadline) {
-          try {
-            $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -Method Get -TimeoutSec 2
-            foreach ($t in $resp.tunnels) {
-              if ($t.public_url -and $t.public_url.StartsWith('https://')) {
-                $publicUrl = $t.public_url
-                break
-              }
-            }
-            if ($publicUrl) { break }
-          } catch {
-            Start-Sleep -Seconds 1
-            continue
+        try {
+          $publicUrl = Get-NgrokPublicUrlForPort -targetPort $Port
+          if ($publicUrl) {
+            Write-Info "Reusing ngrok tunnel for port ${Port}: $publicUrl"
           }
-          Start-Sleep -Seconds 1
-        }
+        } catch {}
 
         if (-not $publicUrl) {
-          Write-Warn 'Timeout waiting for ngrok public URL. Falling back to long polling.'
+          Write-Info "Starting ngrok for port $Port..."
+          try {
+            if ($ShowWindow) {
+              Start-Process -FilePath 'ngrok' -ArgumentList "http $Port"
+            } else {
+              Start-Process -FilePath 'ngrok' -ArgumentList "http $Port" -WindowStyle Hidden
+            }
+          } catch {
+            Write-Warn "Failed to start ngrok for port ${Port}: $($_.Exception.Message)"
+            Write-Warn 'Falling back to long polling.'
+            $fallbackToLongPolling = $true
+          }
+        }
+
+        if (-not $fallbackToLongPolling) {
+          Write-Info "Waiting for ngrok public URL (port $Port)..."
+          while ((Get-Date) -lt $deadline) {
+            try {
+              $publicUrl = Get-NgrokPublicUrlForPort -targetPort $Port
+              if ($publicUrl) { break }
+            } catch {
+              Start-Sleep -Seconds 1
+              continue
+            }
+            Start-Sleep -Seconds 1
+          }
+        }
+
+        if (-not $fallbackToLongPolling -and -not $publicUrl) {
+          Write-Warn "Timeout waiting for ngrok public URL on port $Port. Falling back to long polling."
           $fallbackToLongPolling = $true
-        } else {
+        } elseif (-not $fallbackToLongPolling) {
           Write-Info "ngrok URL: $publicUrl"
           $webhookUrl = "$publicUrl/telegram"
           try {
@@ -326,16 +379,39 @@ param(
     Write-Info "Using env file: $envFile"
     Write-Info "App module: $appModule"
     Write-Info "Starting on port: $Port"
+    $occupiedPids = Get-ListeningPidsForPort -targetPort $Port
+    if ($occupiedPids.Count -gt 0) {
+      throw "Port $Port is already in use by PID(s): $($occupiedPids -join ', '). Stop old process first."
+    }
     if ($appModule.Contains(':')) {
       $appTarget = $appModule
     } else {
       $appTarget = "$appModule`:app"
     }
-    if ($ShowWindow) {
-      Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn',$appTarget,'--host','0.0.0.0','--port',"$Port"
-    } else {
-      Start-Process -FilePath $pythonExe -WorkingDirectory $PSScriptRoot -ArgumentList '-m','uvicorn',$appTarget,'--host','0.0.0.0','--port',"$Port" -WindowStyle Hidden
+    $uvicornArgs = @('-u','-m','uvicorn',$appTarget,'--host','0.0.0.0','--port',"$Port")
+    $startParams = @{
+      FilePath = $pythonExe
+      WorkingDirectory = $PSScriptRoot
+      ArgumentList = $uvicornArgs
     }
+    if (-not $ShowWindow) {
+      $startParams["WindowStyle"] = "Hidden"
+    }
+    if ($LogFile) {
+      $logBase = if ([System.IO.Path]::IsPathRooted($LogFile)) { $LogFile } else { Join-Path $PSScriptRoot $LogFile }
+      $logDir = Split-Path -Parent $logBase
+      if ($logDir -and -not (Test-Path -Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+      }
+      $stdoutLog = "$logBase.out.log"
+      $stderrLog = "$logBase.err.log"
+      Write-Info "Redirecting uvicorn logs to:"
+      Write-Info "  STDOUT: $stdoutLog"
+      Write-Info "  STDERR: $stderrLog"
+      $startParams["RedirectStandardOutput"] = $stdoutLog
+      $startParams["RedirectStandardError"] = $stderrLog
+    }
+    Start-Process @startParams
   } catch {
     Write-Err $_.Exception.Message
     exit 1
