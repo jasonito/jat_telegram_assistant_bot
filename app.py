@@ -11,6 +11,7 @@ import hashlib
 import json
 import time
 import uuid
+import logging
 from typing import Iterator
 from urllib.parse import quote
 from urllib.parse import urlparse
@@ -39,6 +40,8 @@ from slack_bolt import App as SlackApp
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 load_dotenv()
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger("jat")
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -3564,13 +3567,13 @@ def set_telegram_commands() -> None:
             json={"commands": commands},
             timeout=10,
         )
-        logger.info(f"setMyCommands status={resp.status_code}")
+        print(f"setMyCommands status={resp.status_code}")
         if resp.status_code != 200:
-            logger.error(f"setMyCommands failed: {resp.text}")
+            print(f"setMyCommands failed: {resp.text}")
     except requests.Timeout as e:
-        logger.error(f"setMyCommands timeout: {e}")
+        print(f"setMyCommands timeout: {e}")
     except requests.RequestException as e:
-        logger.error(f"setMyCommands request error: {e}")
+        print(f"setMyCommands request error: {e}")
 
 
 def send_message_sync(chat_id: str, text: str, parse_mode: str | None = None) -> None:
