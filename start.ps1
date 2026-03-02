@@ -375,14 +375,33 @@ param(
       Write-Info 'TELEGRAM_LONG_POLLING forced to 1 due to fallback.'
     }
 
+    $isLongPollingMode = ($env:TELEGRAM_LONG_POLLING -ne $null) -and ($env:TELEGRAM_LONG_POLLING -ne '0')
+    $occupiedPids = Get-ListeningPidsForPort -targetPort $Port
+    if ($occupiedPids.Count -gt 0) {
+      if ($isLongPollingMode) {
+        Write-Warn "Port $Port is already in use by PID(s): $($occupiedPids -join ', '). Searching next available port for long polling mode."
+        $foundPort = $null
+        $scanLimit = [Math]::Min(65535, $Port + 50)
+        for ($candidate = $Port + 1; $candidate -le $scanLimit; $candidate++) {
+          $candidatePids = Get-ListeningPidsForPort -targetPort $candidate
+          if ($candidatePids.Count -eq 0) {
+            $foundPort = $candidate
+            break
+          }
+        }
+        if ($foundPort -eq $null) {
+          throw "Port $Port is in use and no free fallback port found in range $($Port + 1)-$scanLimit."
+        }
+        $Port = $foundPort
+        Write-Info "Using fallback port: $Port"
+      } else {
+        throw "Port $Port is already in use by PID(s): $($occupiedPids -join ', '). Stop old process first or pass -Port."
+      }
+    }
     Write-Info 'Starting uvicorn...'
     Write-Info "Using env file: $envFile"
     Write-Info "App module: $appModule"
     Write-Info "Starting on port: $Port"
-    $occupiedPids = Get-ListeningPidsForPort -targetPort $Port
-    if ($occupiedPids.Count -gt 0) {
-      throw "Port $Port is already in use by PID(s): $($occupiedPids -join ', '). Stop old process first."
-    }
     if ($appModule.Contains(':')) {
       $appTarget = $appModule
     } else {

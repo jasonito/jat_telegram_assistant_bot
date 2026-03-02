@@ -85,6 +85,9 @@ if ($EnableLogs -and $mainLog) {
   $mainParams["LogFile"] = $mainLog
 }
 & "$PSScriptRoot\start.ps1" @mainParams
+if ($LASTEXITCODE -ne 0) {
+  throw "Main bot start failed with exit code $LASTEXITCODE"
+}
 
 Write-Host "[INFO] Starting chitchat bot with $ChitchatEnv on port $ChitchatPort"
 $chitchatParams = @{
@@ -97,6 +100,9 @@ if ($EnableLogs -and $chitchatLog) {
   $chitchatParams["LogFile"] = $chitchatLog
 }
 & "$PSScriptRoot\start.ps1" @chitchatParams
+if ($LASTEXITCODE -ne 0) {
+  throw "Chitchat bot start failed with exit code $LASTEXITCODE"
+}
 
 Write-Host "[INFO] Both start commands submitted."
 if ($EnableLogs) {
