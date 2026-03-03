@@ -111,6 +111,33 @@ Google Vision credential path error:
 
 - ensure `GOOGLE_APPLICATION_CREDENTIALS` points to existing server file path
 
+Long polling enabled but main bot does not receive messages:
+
+- Symptoms:
+  - `TELEGRAM_LONG_POLLING=1` is set.
+  - Messages sent to main bot are not processed.
+  - Logs may show `[Errno 10048] ... bind on address ... port ...`.
+- Root cause:
+  - One bot process failed to start due to port conflict, so only one bot remained alive.
+- Check:
+
+```powershell
+Get-Content .\logs\main.log.out.log,.\logs\main.log.err.log,.\logs\chitchat.log.out.log,.\logs\chitchat.log.err.log -Wait
+```
+
+- Fix:
+  - Stop all bot processes, then start with explicit non-conflicting ports:
+
+```powershell
+.\stop-both.ps1
+.\start-both.ps1 -MainPort 8002 -ChitchatPort 8001 -EnableLogs
+```
+
+- Expected:
+  - `main` and `chitchat` both show `Telegram long polling enabled.`
+  - Each bot shows `Uvicorn running on http://0.0.0.0:<its_port>`.
+  - Verify with a new Telegram message (older confirmed updates cannot be replayed via `getUpdates`).
+
 ## 7) One-Time Markdown Cleanup (Dropbox + Local)
 
 Use this when historical notes contain duplicate headings/blocks or old Telegram line format.
