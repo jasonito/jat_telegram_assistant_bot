@@ -2,6 +2,7 @@
 import asyncio
 import re
 import webbrowser
+import sys
 from html import unescape
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -37,6 +38,14 @@ except Exception:
 
 from slack_bolt import App as SlackApp
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 load_dotenv()
 
@@ -121,7 +130,7 @@ HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
 HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "openai/gpt-oss-120b")
 HUGGINGFACE_BASE_URL = os.getenv("HUGGINGFACE_BASE_URL", "https://router.huggingface.co/v1")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 NEWS_URL_FETCH_MAX_ARTICLES = int(os.getenv("NEWS_URL_FETCH_MAX_ARTICLES", "3"))
 NEWS_URL_FETCH_MAX_CHARS = int(os.getenv("NEWS_URL_FETCH_MAX_CHARS", "3000"))
 NEWS_URL_FETCH_TIMEOUT_SECONDS = int(os.getenv("NEWS_URL_FETCH_TIMEOUT_SECONDS", "6"))
