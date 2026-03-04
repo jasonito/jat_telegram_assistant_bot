@@ -57,6 +57,16 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except Exception:
+        return default
+
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
@@ -98,6 +108,7 @@ NEWS_MD_DIR = DATA_DIR / "news"
 NOTES_DIR = DATA_DIR / "notes"
 TELEGRAM_MD_DIR = NOTES_DIR / "telegram"
 INBOX_IMAGES_DIR = DATA_DIR / "images"
+WEEKLY_REPORT_DIR = DATA_DIR / "weekly report"
 TRANSCRIPTS_DIR = DATA_DIR / "_runtime" / "transcribe"
 TRANSCRIPTS_TMP_DIR = DATA_DIR / "_runtime" / "transcribe_tmp"
 ALLOWED_GROUPS = {
@@ -117,6 +128,7 @@ AI_SUMMARY_TIMEOUT_SECONDS = int(
     os.getenv("AI_SUMMARY_TIMEOUT_SECONDS", os.getenv("OPENAI_TIMEOUT_SECONDS", "20"))
 )
 AI_SUMMARY_MAX_CHARS = int(os.getenv("AI_SUMMARY_MAX_CHARS", "6000"))
+AI_SUMMARY_TEMPERATURE = _env_float("AI_SUMMARY_TEMPERATURE", 0.2)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -158,6 +170,14 @@ DROPBOX_SYNC_ENABLED = os.getenv("DROPBOX_SYNC_ENABLED", "1").lower() in {"1", "
 DROPBOX_SYNC_TIME = os.getenv("DROPBOX_SYNC_TIME", "00:10").strip() or "00:10"
 DROPBOX_SYNC_TZ_NAME = os.getenv("DROPBOX_SYNC_TZ", "Asia/Taipei").strip() or "Asia/Taipei"
 DROPBOX_SYNC_ON_STARTUP = os.getenv("DROPBOX_SYNC_ON_STARTUP", "1").lower() in {"1", "true", "yes"}
+WEEKLY_REPORT_PUSH_ENABLED = _env_flag("WEEKLY_REPORT_PUSH_ENABLED", True)
+WEEKLY_REPORT_PUSH_WEEKDAY = int(os.getenv("WEEKLY_REPORT_PUSH_WEEKDAY", "1"))
+if WEEKLY_REPORT_PUSH_WEEKDAY < 1 or WEEKLY_REPORT_PUSH_WEEKDAY > 7:
+    WEEKLY_REPORT_PUSH_WEEKDAY = 1
+WEEKLY_REPORT_PUSH_TIME = os.getenv("WEEKLY_REPORT_PUSH_TIME", "09:00").strip() or "09:00"
+WEEKLY_REPORT_PUSH_TZ_NAME = os.getenv("WEEKLY_REPORT_PUSH_TZ", "Asia/Taipei").strip() or "Asia/Taipei"
+WEEKLY_REPORT_PUSH_LOOKBACK_DAYS = max(1, int(os.getenv("WEEKLY_REPORT_PUSH_LOOKBACK_DAYS", "14")))
+WEEKLY_REPORT_PUSH_MAX_CHATS = max(1, int(os.getenv("WEEKLY_REPORT_PUSH_MAX_CHATS", "20")))
 
 NEWS_RSS_URLS_ENV = os.getenv("NEWS_RSS_URLS", "")
 NEWS_RSS_URLS_FILE = os.getenv("NEWS_RSS_URLS_FILE", "")
@@ -323,6 +343,7 @@ def init_storage() -> None:
     NOTES_DIR.mkdir(parents=True, exist_ok=True)
     TELEGRAM_MD_DIR.mkdir(parents=True, exist_ok=True)
     INBOX_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    WEEKLY_REPORT_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_TMP_DIR.mkdir(parents=True, exist_ok=True)
     if FEATURE_NEWS_ENABLED:
@@ -1334,26 +1355,28 @@ def handle_command(text: str) -> str:
     text = text.strip()
     text_lower = text.lower()
 
-    if text_lower.startswith("/summary_news"):
+    if text_lower.startswith("/summary_notes_daily"):
+        day = _parse_day_arg(text)
+        parts = build_scoped_summary(day, "note")
+        return "\n".join(parts)
+
+    if text_lower.startswith("/summary_notes_weekly"):
+        day = _parse_day_arg(text)
+        parts = build_scoped_summary(day, "note", recent_days=7)
+        return "\n".join(parts)
+
+    if text_lower.startswith("/summary_news_daily"):
         if not FEATURE_NEWS_ENABLED:
             return "新聞功能已關閉。"
         day = _parse_day_arg(text)
         parts = build_scoped_summary(day, "news")
         return "\n".join(parts)
 
-    if text_lower.startswith("/summary_note"):
+    if text_lower.startswith("/summary_news_weekly"):
+        if not FEATURE_NEWS_ENABLED:
+            return "新聞功能已關閉。"
         day = _parse_day_arg(text)
-        parts = build_scoped_summary(day, "note", recent_days=3)
-        return "\n".join(parts)
-
-    if text_lower.startswith("/summary_weekly"):
-        day = _parse_day_arg(text)
-        parts = summary_weekly(day)
-        return "\n".join(parts)
-
-    if text_lower.startswith("/summary"):
-        scope, day = _parse_summary_args(text)
-        parts = summary_ai(day, scope=scope)
+        parts = build_scoped_summary(day, "news", recent_days=7)
         return "\n".join(parts)
 
     if text_lower.startswith("/status"):
@@ -1389,9 +1412,16 @@ def handle_command(text: str) -> str:
         return sort_downloads()
 
     if text_lower in {"help", "/help"}:
-        cmds = ["open <url>", "notepad", "sort downloads", "/status", "/summary", "/summary_note"]
+        cmds = [
+            "open <url>",
+            "notepad",
+            "sort downloads",
+            "/status",
+            "/summary_notes_daily",
+            "/summary_notes_weekly",
+        ]
         if FEATURE_NEWS_ENABLED:
-            cmds.extend(["/news latest", "/summary news"])
+            cmds.extend(["/news latest", "/summary_news_daily", "/summary_news_weekly"])
         if FEATURE_TRANSCRIBE_ENABLED:
             cmds.append("/transcribe <url>")
             cmds.append("/cancel")
@@ -1417,7 +1447,13 @@ def route_user_text_command(text: str, chat_id: str) -> tuple[list[str], str | N
     reply = handle_command(cmd_text)
     parse_mode = None
     disable_preview = None
-    if FEATURE_NEWS_ENABLED and lower.startswith("/summary_news"):
+    if lower.startswith("/summary_notes_daily") or lower.startswith("/summary_notes_weekly"):
+        parse_mode = "Markdown"
+        disable_preview = True
+    if FEATURE_NEWS_ENABLED and (
+        lower.startswith("/summary_news_daily")
+        or lower.startswith("/summary_news_weekly")
+    ):
         parse_mode = "Markdown"
         disable_preview = True
     return [reply], parse_mode, disable_preview
@@ -1575,7 +1611,7 @@ def _dropbox_create_folder_if_missing(dbx, path: str) -> None:
 def ensure_dropbox_folders(dbx, root_path: str) -> None:
     root = normalize_dropbox_path(root_path)
     _dropbox_create_folder_if_missing(dbx, root)
-    folders = ["notes", "images"]
+    folders = ["notes", "images", "weekly report"]
     if FEATURE_NEWS_ENABLED:
         folders.insert(0, "news")
     for folder in folders:
@@ -1583,7 +1619,7 @@ def ensure_dropbox_folders(dbx, root_path: str) -> None:
 
 
 def iter_sync_files() -> Iterator[tuple[str, Path, str]]:
-    roots = [("notes", NOTES_DIR), ("images", INBOX_IMAGES_DIR)]
+    roots = [("notes", NOTES_DIR), ("images", INBOX_IMAGES_DIR), ("weekly report", WEEKLY_REPORT_DIR)]
     if FEATURE_NEWS_ENABLED:
         roots.insert(0, ("news", NEWS_MD_DIR))
     for category, root in roots:
@@ -2765,7 +2801,7 @@ def generate_ai_summary(
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.2,
+                    "temperature": AI_SUMMARY_TEMPERATURE,
                 },
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
@@ -2787,7 +2823,7 @@ def generate_ai_summary(
                 headers={"Content-Type": "application/json"},
                 json={
                     "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
-                    "generationConfig": {"temperature": 0.2},
+                    "generationConfig": {"temperature": AI_SUMMARY_TEMPERATURE},
                 },
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
@@ -2816,7 +2852,7 @@ def generate_ai_summary(
                 json={
                     "model": ANTHROPIC_MODEL,
                     "max_tokens": 800,
-                    "temperature": 0.2,
+                    "temperature": AI_SUMMARY_TEMPERATURE,
                     "system": system_prompt,
                     "messages": [{"role": "user", "content": user_prompt}],
                 },
@@ -2847,7 +2883,7 @@ def generate_ai_summary(
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.2,
+                    "temperature": AI_SUMMARY_TEMPERATURE,
                 },
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
@@ -2870,7 +2906,7 @@ def generate_ai_summary(
                         {"role": "user", "content": user_prompt},
                     ],
                     "stream": False,
-                    "options": {"temperature": 0.2},
+                    "options": {"temperature": AI_SUMMARY_TEMPERATURE},
                 },
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
@@ -2939,7 +2975,7 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.2,
+                    "temperature": AI_SUMMARY_TEMPERATURE,
                 },
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
@@ -2957,7 +2993,7 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                 headers={"Content-Type": "application/json"},
                 json={
                     "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
-                    "generationConfig": {"temperature": 0.2},
+                    "generationConfig": {"temperature": AI_SUMMARY_TEMPERATURE},
                 },
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
@@ -2983,7 +3019,7 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                 json={
                     "model": ANTHROPIC_MODEL,
                     "max_tokens": 800,
-                    "temperature": 0.2,
+                    "temperature": AI_SUMMARY_TEMPERATURE,
                     "system": system_prompt,
                     "messages": [{"role": "user", "content": user_prompt}],
                 },
@@ -3010,7 +3046,7 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.2,
+                    "temperature": AI_SUMMARY_TEMPERATURE,
                 },
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
@@ -3030,7 +3066,7 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                         {"role": "user", "content": user_prompt},
                     ],
                     "stream": False,
-                    "options": {"temperature": 0.2},
+                    "options": {"temperature": AI_SUMMARY_TEMPERATURE},
                 },
                 timeout=AI_SUMMARY_TIMEOUT_SECONDS,
             )
@@ -3147,30 +3183,6 @@ def _normalize_three_points_output(text: str) -> str:
     if not out:
         return insufficient
     return "\n".join(out[:3])
-
-
-def _parse_summary_args(text: str) -> tuple[str, str]:
-    tokens = text.strip().split()
-    scope = "all"
-    day = datetime.now().strftime("%Y-%m-%d")
-    day_token_idx = 1
-
-    if len(tokens) > 1:
-        t1 = tokens[1].strip().lower()
-        if t1 in {"note", "notes"}:
-            scope = "note"
-            day_token_idx = 2
-        elif t1 == "news":
-            scope = "news"
-            day_token_idx = 2
-        elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", t1):
-            day = t1
-            day_token_idx = 2
-
-    if len(tokens) > day_token_idx and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[day_token_idx]):
-        day = tokens[day_token_idx]
-
-    return scope, day
 
 
 def _parse_day_arg(text: str) -> str:
@@ -3444,12 +3456,72 @@ def _fallback_three_points(text: str) -> list[str]:
 def _extract_note_lines(notes_raw: str, limit: int = 80) -> list[str]:
     if not notes_raw:
         return []
+
+    def _note_line_key(text: str) -> str:
+        k = _clean_plain_text(text or "").lower()
+        k = re.sub(r"\s+", "", k)
+        k = re.sub(r"[^\w\u4e00-\u9fff]", "", k)
+        return k
+
+    def _is_noise_note_line(text: str) -> bool:
+        t = _clean_plain_text(text or "").strip()
+        if not t:
+            return True
+        tl = t.lower()
+        if re.fullmatch(r"\[\d{4}-\d{2}-\d{2}\]", t):
+            return True
+        if tl in {"[]", "[ ]", "test", "testing", "測試"}:
+            return True
+        if tl.startswith("http://") or tl.startswith("https://") or tl.startswith("www."):
+            return True
+        if re.fullmatch(r"(?:https?://|www\.)\S+", tl):
+            return True
+        if re.fullmatch(r"(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/\S*)?", tl):
+            return True
+        if re.fullmatch(r"[a-z]{1,8}=\S+", tl):
+            return True
+        if tl in {"source", "source:", "url", "url:", "link", "link:", "來源", "來源:"}:
+            return True
+        if re.fullmatch(r"type\s*[:：]\s*[a-z0-9_-]+", tl):
+            return True
+        if tl in {"date transcribed", "transcribed date", "轉錄日期"}:
+            return True
+        if re.fullmatch(
+            r"(?:duration|type|source|url|link|date\s*transcribed)\s*[:：]\s*(?:unknown|n/?a|\d{1,2}:\d{2}(?::\d{2})?|[a-z0-9 _-]+)",
+            tl,
+        ):
+            return True
+        if re.fullmatch(r"[\[\]{}()|/\\\-_=+*.,:;!?`~'\"，。！？；：、\s]+", t):
+            return True
+        if len(re.sub(r"\s+", "", t)) <= 2:
+            return True
+        return False
+
+    def _sanitize_note_line_for_summary(text: str) -> str:
+        line = _clean_plain_text(text)
+        line = re.sub(r"[*_`#>]+", "", line)
+        line = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", line)
+        line = re.sub(r"\b(?:https?://|www\.)\S+\b", "", line, flags=re.I)
+        line = re.sub(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s]*)?\b", "", line, flags=re.I)
+        line = re.sub(r"\b[a-z]{1,8}=\S+\b", "", line, flags=re.I)
+        line = re.sub(r"^(?:title|標題|url|source)\s*[:：]\s*", "", line, flags=re.I)
+        line = re.sub(r"^\[\d{2}:\d{2}(?::\d{2})?\]\s*", "", line)
+        line = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", line)
+        line = re.sub(r"\s+", " ", line).strip(" -|:")
+        line = re.sub(r"^[\"'「『“”]+|[\"'」』“”]+$", "", line)
+        return line.strip()
+
     lines: list[str] = []
+    seen_keys: set[str] = set()
     for raw in notes_raw.splitlines():
         line = _clean_plain_text(raw)
         if not line:
             continue
+        if _is_noise_note_line(line):
+            continue
         if line.startswith("# file:"):
+            continue
+        if line.startswith("#"):
             continue
         if re.match(r"^\d{4}-\d{2}-\d{2}", line):
             continue
@@ -3457,14 +3529,153 @@ def _extract_note_lines(notes_raw: str, limit: int = 80) -> list[str]:
             continue
         line = re.sub(r"^\s*-\s*\[[^\]]+\]\s*\([^)]*\)\s*[^|]*\|\s*[^:]+:\s*", "", line).strip()
         line = re.sub(r"^\s*-\s*", "", line).strip()
-        if not line:
+        line = _sanitize_note_line_for_summary(line)
+        if _is_noise_note_line(line):
             continue
         if line.startswith("/"):
             continue
+        key = _note_line_key(line)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
         lines.append(line)
         if len(lines) >= limit:
             break
     return lines
+
+
+def _is_chitchat_profile() -> bool:
+    profile = (APP_PROFILE or "").strip().lower()
+    app_module = (os.getenv("APP_MODULE", "") or "").strip().lower()
+    return profile == "chitchat" or ("chitchat" in app_module)
+
+
+def _is_noise_digest_text(text: str) -> bool:
+    t = _clean_plain_text(text or "").strip()
+    if not t:
+        return True
+    tl = t.lower()
+    if tl in {"[]", "[ ]", "test", "testing", "測試"}:
+        return True
+    if re.fullmatch(r"\[\d{4}-\d{2}-\d{2}\]", t):
+        return True
+    if re.fullmatch(r"[\[\]{}()|/\\\-_=+*.,:;!?`~'\"，。！？；：、\s]+", t):
+        return True
+    return False
+
+
+def _clean_note_items_for_output(note_items: list[tuple[str, list[str]]]) -> list[tuple[str, list[str]]]:
+    def _shorten_point(text: str, max_len: int = 180) -> str:
+        t = (text or "").strip()
+        if len(t) <= max_len:
+            return t
+        window = t[:max_len]
+        cut = max(window.rfind("。"), window.rfind("！"), window.rfind("？"), window.rfind("."), window.rfind("!"), window.rfind("?"), window.rfind("；"), window.rfind(";"), window.rfind("，"), window.rfind(","))
+        if cut >= 24:
+            return f"{window[:cut].rstrip()}..."
+        return f"{window.rstrip()}..."
+
+    def _sanitize_digest_text(text: str, *, title: bool = False) -> str:
+        t = _clean_plain_text(text or "")
+        t = re.sub(r"[*_`#>]+", "", t)
+        t = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", t)
+        t = re.sub(r"\b(?:https?://|www\.)\S+\b", "", t, flags=re.I)
+        t = re.sub(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s]*)?\b", "", t, flags=re.I)
+        t = re.sub(r"\b[a-z]{1,8}=\S+\b", "", t, flags=re.I)
+        t = re.sub(r"^(?:title|標題|url|source)\s*[:：]\s*", "", t, flags=re.I)
+        t = re.sub(r"^\[\d{2}:\d{2}(?::\d{2})?\]\s*", "", t)
+        t = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", t)
+        t = re.sub(r"\s+", " ", t).strip(" -|:")
+        t = re.sub(r"^[\"'「『“”]+|[\"'」』“”]+$", "", t)
+        if title and len(t) > 24:
+            t = f"{t[:24].rstrip()}..."
+        return t.strip()
+
+    def _is_low_information_text(text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return True
+        tl = t.lower()
+        if tl in {"[]", "[ ]", "test", "testing", "測試"}:
+            return True
+        if tl in {"source", "source:", "url", "url:", "link", "link:", "來源", "來源:"}:
+            return True
+        if re.fullmatch(r"type\s*[:：]\s*[a-z0-9_-]+", tl):
+            return True
+        if tl in {"date transcribed", "transcribed date", "轉錄日期"}:
+            return True
+        if re.fullmatch(
+            r"(?:duration|type|source|url|link|date\s*transcribed)\s*[:：]\s*(?:unknown|n/?a|\d{1,2}:\d{2}(?::\d{2})?|[a-z0-9 _-]+)",
+            tl,
+        ):
+            return True
+        if tl.startswith("http://") or tl.startswith("https://") or tl.startswith("www."):
+            return True
+        if re.fullmatch(r"(?:https?://|www\.)\S+", tl):
+            return True
+        if re.fullmatch(r"(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/\S*)?", tl):
+            return True
+        if re.fullmatch(r"[a-z]{1,8}=\S+", tl):
+            return True
+        core = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", t)
+        if len(core) < 4:
+            return True
+        return False
+
+    def _norm_key(text: str) -> str:
+        t = _clean_plain_text(text or "").lower()
+        t = re.sub(r"\s+", "", t)
+        t = re.sub(r"[^\w\u4e00-\u9fff]", "", t)
+        return t
+
+    def _is_near_duplicate(text: str, existing_keys: list[str]) -> bool:
+        key = _norm_key(text)
+        if not key:
+            return True
+        for ek in existing_keys:
+            if not ek:
+                continue
+            if key == ek:
+                return True
+            shorter = key if len(key) <= len(ek) else ek
+            longer = ek if len(key) <= len(ek) else key
+            if len(shorter) >= 10 and shorter in longer:
+                return True
+            if fuzz.ratio(key, ek) >= 92:
+                return True
+        return False
+
+    cleaned: list[tuple[str, list[str]]] = []
+    seen_title: set[str] = set()
+    global_point_keys: list[str] = []
+    for title, points in note_items:
+        t = _sanitize_digest_text(title or "", title=True)
+        if _is_noise_digest_text(t) or _is_low_information_text(t):
+            continue
+        tk = re.sub(r"\W+", "", t.lower())
+        if not tk or tk in seen_title:
+            continue
+        seen_title.add(tk)
+        out_points: list[str] = []
+        seen_p: set[str] = set()
+        for p in points or []:
+            pv = _sanitize_digest_text(p or "", title=False)
+            pv = _shorten_point(pv, max_len=180)
+            if _is_noise_digest_text(pv) or _is_low_information_text(pv):
+                continue
+            pk = re.sub(r"\W+", "", pv.lower())
+            if not pk or pk in seen_p:
+                continue
+            if _is_near_duplicate(pv, global_point_keys):
+                continue
+            seen_p.add(pk)
+            out_points.append(pv)
+            global_point_keys.append(_norm_key(pv))
+            if len(out_points) >= 5:
+                break
+        if out_points:
+            cleaned.append((t, out_points))
+    return cleaned
 
 
 def _extract_digest_tags(text: str, min_tags: int = 5, max_tags: int = 10) -> list[str]:
@@ -3521,7 +3732,11 @@ def _extract_digest_tags(text: str, min_tags: int = 5, max_tags: int = 10) -> li
     return found[:max_tags]
 
 
-def _parse_note_digest_ai(text: str) -> tuple[list[tuple[str, list[str]]], list[str]]:
+def _parse_note_digest_ai(
+    text: str,
+    *,
+    max_items: int = NOTE_DIGEST_MAX_ITEMS,
+) -> tuple[list[tuple[str, list[str]]], list[str]]:
     items: list[tuple[str, list[str]]] = []
     tags: list[str] = []
     cur_title = ""
@@ -3544,7 +3759,7 @@ def _parse_note_digest_ai(text: str) -> tuple[list[tuple[str, list[str]]], list[
                 continue
             seen_points.add(k)
             dedup_points.append(pv)
-        if len(dedup_points) < 3:
+        if len(dedup_points) < 1:
             return
         items.append((cur_title.strip(), dedup_points[:5]))
         cur_title = ""
@@ -3594,7 +3809,113 @@ def _parse_note_digest_ai(text: str) -> tuple[list[tuple[str, list[str]]], list[
     flush_item()
     if not tags:
         tags = _extract_digest_tags(text or "", min_tags=5, max_tags=10)
-    return items[:NOTE_DIGEST_MAX_ITEMS], tags
+    max_keep = max(1, int(max_items))
+    return items[:max_keep], tags
+
+
+def _estimate_note_topic_count(raw_text: str, *, max_items: int, min_items: int = 1) -> int:
+    clean_len = len(_clean_plain_text(raw_text or ""))
+    if clean_len <= 400:
+        target = 1
+    elif clean_len <= 1200:
+        target = 2
+    elif clean_len <= 2500:
+        target = 3
+    elif clean_len <= 4500:
+        target = 4
+    else:
+        target = max_items
+    return max(min_items, min(max_items, target))
+
+
+def _estimate_weekly_topic_count(raw_text: str, line_count: int) -> int:
+    clean_len = len(_clean_plain_text(raw_text or ""))
+    if line_count < 12 or clean_len < 1800:
+        return 3
+    if line_count < 36 or clean_len < 6500:
+        return 5
+    return 7
+
+
+def _normalize_main_weekly_title(title: str) -> str:
+    t = _clean_plain_text(title or "").strip()
+    if not t:
+        return "本週重點"
+    if "主線週摘要" in t:
+        return "本週總覽"
+    if re.search(r"\d{4}-\d{2}-\d{2}\s*(?:至|~|-)\s*\d{4}-\d{2}-\d{2}", t):
+        return "本週總覽"
+    return t
+
+
+def _extract_news_title_url_from_line(line: str) -> tuple[str, str]:
+    text = (line or "").strip()
+    m = re.search(r"\[(.+?)\]\((https?://[^)]+)\)", text)
+    if m:
+        return _clean_plain_text(m.group(1)).strip(), m.group(2).strip()
+    plain = re.sub(r"^##\s*\d+\.\s*", "", text).strip()
+    plain = _clean_plain_text(plain)
+    return plain, ""
+
+
+def _classify_news_title(title: str) -> str:
+    t = _clean_plain_text(title or "").lower()
+    if any(k in t for k in ["ai", "agent", "模型", "openai", "gemini", "anthropic", "llm"]):
+        return "AI 與模型"
+    if any(k in t for k in ["晶片", "半導體", "伺服器", "硬體", "nvidia", "amd", "intel", "台積電"]):
+        return "半導體與硬體"
+    if any(k in t for k in ["監管", "法規", "政策", "政府", "國會", "compliance"]):
+        return "政策與監管"
+    if any(k in t for k in ["融資", "財報", "投資", "估值", "ipo", "併購", "市場"]):
+        return "資本市場與公司"
+    return "其他產業動態"
+
+
+def _build_weekly_news_block(end_day: str, days: int) -> list[str]:
+    if not FEATURE_NEWS_ENABLED:
+        return ["新聞區塊", "- 新聞功能已關閉。"]
+    raw_lines = build_news_digest_recent(end_day, days=days)
+    items: list[tuple[str, str]] = []
+    for ln in raw_lines:
+        if not ln.strip().startswith("## "):
+            continue
+        title, url = _extract_news_title_url_from_line(ln)
+        if not title:
+            continue
+        items.append((title, url))
+    if not items:
+        return ["新聞區塊", "- 本週無可用新聞。"]
+
+    grouped: dict[str, list[tuple[str, str]]] = {
+        "AI 與模型": [],
+        "半導體與硬體": [],
+        "政策與監管": [],
+        "資本市場與公司": [],
+        "其他產業動態": [],
+    }
+    seen: set[str] = set()
+    for title, url in items:
+        key = re.sub(r"\W+", "", title.lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        cat = _classify_news_title(title)
+        grouped[cat].append((title, url))
+
+    out: list[str] = ["新聞區塊"]
+    for cat in ["AI 與模型", "半導體與硬體", "政策與監管", "資本市場與公司", "其他產業動態"]:
+        rows = grouped.get(cat, [])
+        if not rows:
+            continue
+        out.append(f"- {cat}")
+        for title, url in rows[:4]:
+            if url:
+                out.append(f"  - [{_escape_md_link_text(title)}]({_escape_md_url(url)})")
+            else:
+                out.append(f"  - {title}")
+    if len(out) == 1:
+        out.append("- 本週無可用新聞。")
+    return out
 
 
 def build_note_digest(day: str) -> list[str]:
@@ -3605,6 +3926,9 @@ def build_note_digest(day: str) -> list[str]:
 
     note_items: list[tuple[str, list[str]]] = []
     tags: list[str] = []
+    target_topics = _estimate_note_topic_count(notes_raw, max_items=NOTE_DIGEST_MAX_ITEMS, min_items=1)
+    cleaned_lines = _extract_note_lines(notes_raw, limit=140)
+    ai_input = "\n".join(cleaned_lines) if cleaned_lines else notes_raw
 
     if AI_SUMMARY_ENABLED:
         system_prompt = (
@@ -3613,46 +3937,52 @@ def build_note_digest(day: str) -> list[str]:
         )
         user_prompt = (
             f"Summarize notes and transcripts for {day} with scan-friendly structure.\n"
-            f"- Create 3 to {NOTE_DIGEST_MAX_ITEMS} topics.\n"
+            f"- Create 1 to {target_topics} topics based on available material only.\n"
             "- Format each topic exactly:\n"
             "Title: <max 22 chars>\n"
             "Point1: ...\n"
-            "Point2: ...\n"
-            "Point3: ...\n"
+            "Point2: ... (optional)\n"
+            "Point3: ... (optional)\n"
             "Point4: ... (optional)\n"
             "Point5: ... (optional)\n"
             "---\n"
             "- Last line must be: tags: #tag1 #tag2 ... (5 to 10 tags)\n"
-            "- No links, no YAML/HTML, no duplicated fields.\n\n"
-            f"{notes_raw}"
+            "- No links, no YAML/HTML, no duplicated fields, and never add filler text.\n\n"
+            f"{ai_input}"
         )
         out = _run_ai_chat(system_prompt, user_prompt)
-        ai_items, ai_tags = _parse_note_digest_ai(out or "")
-        note_items = ai_items
+        ai_items, ai_tags = _parse_note_digest_ai(out or "", max_items=target_topics)
+        note_items = ai_items[:target_topics]
         tags = ai_tags
 
     if not note_items:
-        lines = _extract_note_lines(notes_raw, limit=120)
+        lines = cleaned_lines if cleaned_lines else _extract_note_lines(notes_raw, limit=120)
         if not lines:
             return [f"{day} 筆記/逐字稿摘要", "沒有可用的筆記或逐字稿文字。"]
-        for line in lines[:NOTE_DIGEST_MAX_ITEMS]:
+        for line in lines[:target_topics]:
             title = re.sub(r"https?://\S+", "", line).strip()
             if len(title) > 28:
                 title = f"{title[:28].rstrip()}..."
             sentence_parts = [x.strip() for x in re.split(r"[。！？!?]\s*", line) if x.strip()]
-            points = sentence_parts[:5]
-            while len(points) < 3:
-                points.append("待補充細節")
+            points = sentence_parts[:5] if sentence_parts else [line]
             note_items.append((title or "當日筆記", points[:5]))
         tags = _extract_digest_tags("\n".join(lines), min_tags=5, max_tags=10)
 
+    note_items = _clean_note_items_for_output(note_items)[:target_topics]
+    if not note_items:
+        return [f"{day} 筆記/逐字稿摘要", "當日沒有可用的有效筆記內容。"]
+
+    use_bullet_points = _is_chitchat_profile()
     point_label = "\u91cd\u9ede"
     tag_label = "標籤"
     out_lines: list[str] = [f"{day} 筆記/逐字稿摘要"]
-    for title, points in note_items[:NOTE_DIGEST_MAX_ITEMS]:
+    for title, points in note_items[:target_topics]:
         out_lines.append(title)
-        for idx, p in enumerate(points[:5], start=1):
-            out_lines.append(f"{point_label}{idx}\uff1a{p}")
+        for idx, p in enumerate([x for x in points[:5] if x.strip()], start=1):
+            if use_bullet_points:
+                out_lines.append(f"- {p}")
+            else:
+                out_lines.append(f"{point_label}{idx}\uff1a{p}")
         out_lines.append("")
     out_lines.append(f"{tag_label}\uff1a{' '.join(tags[:10])}")
     return out_lines
@@ -3665,68 +3995,221 @@ def build_note_digest_recent(end_day: str, days: int = 3) -> list[str]:
     day_list = [(start_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
 
     raw_blocks: list[str] = []
+    day_to_lines: dict[str, list[str]] = {}
     for d in day_list:
         notes_files, _ = _summary_files_for_day(d)
         day_raw = _load_raw_summary_files(notes_files)
         if day_raw:
-            raw_blocks.append(f"[{d}]\n{day_raw}")
+            raw_blocks.append(f"date: {d}\n{day_raw}")
+            day_to_lines[d] = _extract_note_lines(day_raw, limit=40)
 
-    header = f"{start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')} 筆記/逐字稿摘要"
+    is_chitchat = _is_chitchat_profile()
+    if is_chitchat:
+        header = f"{start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')} 筆記/逐字稿摘要"
+    else:
+        header = f"{start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')} 週報"
     if not raw_blocks:
         return [header, "指定期間沒有可用筆記或逐字稿資料。"]
 
     merged_raw = "\n\n".join(raw_blocks)
+    cleaned_blocks: list[str] = []
+    for d in day_list:
+        lines = day_to_lines.get(d, [])
+        if lines:
+            cleaned_blocks.append(f"date: {d}\n" + "\n".join(lines))
+    merged_clean = "\n\n".join(cleaned_blocks) if cleaned_blocks else merged_raw
     note_items: list[tuple[str, list[str]]] = []
     tags: list[str] = []
+    line_count = sum(len(v) for v in day_to_lines.values())
+    if is_chitchat:
+        max_topics = max(NOTE_DIGEST_MAX_ITEMS, 6)
+        target_topics = _estimate_note_topic_count(merged_raw, max_items=max_topics, min_items=2)
+    else:
+        target_topics = _estimate_weekly_topic_count(merged_raw, line_count)
 
     if AI_SUMMARY_ENABLED:
         system_prompt = (
             "Use only provided content. Do not invent facts. "
             "Output must be in Traditional Chinese."
         )
-        user_prompt = (
-            f"Summarize notes and transcripts from {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')} with scan-friendly structure.\n"
-            f"- Create 4 to {max(NOTE_DIGEST_MAX_ITEMS, 6)} topics.\n"
-            "- Format each topic exactly:\n"
-            "Title: <max 22 chars>\n"
-            "Point1: ...\n"
-            "Point2: ...\n"
-            "Point3: ...\n"
-            "Point4: ... (optional)\n"
-            "Point5: ... (optional)\n"
-            "---\n"
-            "- Last line must be: tags: #tag1 #tag2 ... (5 to 10 tags)\n"
-            "- No links, no YAML/HTML, no duplicated fields.\n\n"
-            f"{merged_raw}"
-        )
+        if is_chitchat:
+            user_prompt = (
+                f"Summarize notes and transcripts from {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')} with scan-friendly structure.\n"
+                f"- Create 2 to {target_topics} topics based on available material only.\n"
+                "- Format each topic exactly:\n"
+                "Title: <max 22 chars>\n"
+                "Point1: ...\n"
+                "Point2: ... (optional)\n"
+                "Point3: ... (optional)\n"
+                "Point4: ... (optional)\n"
+                "Point5: ... (optional)\n"
+                "---\n"
+                "- Last line must be: tags: #tag1 #tag2 ... (5 to 10 tags)\n"
+                "- No links, no YAML/HTML, no duplicated fields, and never add filler text.\n\n"
+                f"{merged_clean}"
+            )
+        else:
+            user_prompt = (
+                f"請根據 {start_dt.strftime('%Y-%m-%d')} 到 {end_dt.strftime('%Y-%m-%d')} 的筆記與逐字稿，輸出主線週摘要。\n"
+                "要求：\n"
+                f"1) 僅輸出 3 到 {target_topics} 個當周重點。\n"
+                "2) 每個重點都要有：\n"
+                "   - Point1：重點摘要（1-2 句）\n"
+                "   - Point2：行動建議（可立即執行）\n"
+                "   - Point3：行動建議（可選，偏研究或新專案靈感）\n"
+                "3) 請使用繁體中文、正式語氣、邏輯清晰。\n"
+                "4) Title 與 Point1 不可重複表述；Point1 必須提供比 Title 更多的新資訊。\n"
+                "5) 僅使用提供內容，不可杜撰，不要輸出標籤(tags)。\n"
+                "6) 格式固定如下：\n"
+                "Title: ...\n"
+                "Point1: ...\n"
+                "Point2: ...\n"
+                "Point3: ... (optional)\n"
+                "---\n\n"
+                f"{merged_clean}"
+            )
         out = _run_ai_chat(system_prompt, user_prompt)
-        ai_items, ai_tags = _parse_note_digest_ai(out or "")
-        note_items = ai_items[: max(NOTE_DIGEST_MAX_ITEMS, 6)]
+        ai_items, ai_tags = _parse_note_digest_ai(out or "", max_items=target_topics)
+        note_items = ai_items[:target_topics]
         tags = ai_tags
 
     if not note_items:
-        lines = _extract_note_lines(merged_raw, limit=180)
+        selected: list[str] = []
+        seen: set[str] = set()
+        rev_days = list(reversed(day_list))
+        cursor = {d: 0 for d in rev_days}
+        while len(selected) < max(180, target_topics) and rev_days:
+            progressed = False
+            for d in rev_days:
+                pool = day_to_lines.get(d, [])
+                i = cursor[d]
+                if i >= len(pool):
+                    continue
+                line = pool[i]
+                cursor[d] = i + 1
+                key = re.sub(r"\W+", "", line.lower())
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                selected.append(line)
+                progressed = True
+                if len(selected) >= 180:
+                    break
+            if not progressed:
+                break
+        lines = selected if selected else _extract_note_lines(merged_raw, limit=180)
         if not lines:
             return [header, "沒有可用的筆記或逐字稿文字。"]
-        limit_items = max(NOTE_DIGEST_MAX_ITEMS, 6)
-        for line in lines[:limit_items]:
+        for line in lines[:target_topics]:
             title = re.sub(r"https?://\S+", "", line).strip()
             if len(title) > 28:
                 title = f"{title[:28].rstrip()}..."
             sentence_parts = [x.strip() for x in re.split(r"[。！？!?]\s*", line) if x.strip()]
-            points = sentence_parts[:5]
-            while len(points) < 3:
-                points.append("待補充細節")
-            note_items.append((title or "近期筆記", points[:5]))
+            if is_chitchat:
+                points = sentence_parts[:5] if sentence_parts else [line]
+                note_items.append((title or "近期筆記", points[:5]))
+            else:
+                summary = sentence_parts[0] if sentence_parts else line
+                note_items.append((title or "本週重點", [summary]))
         tags = _extract_digest_tags("\n".join(lines), min_tags=5, max_tags=10)
 
+    note_items = _clean_note_items_for_output(note_items)[:target_topics]
+    if not note_items:
+        return [header, "指定期間沒有可用的有效筆記內容。"]
+
+    if not is_chitchat and len(note_items) < 3:
+        extras = _extract_note_lines(merged_raw, limit=40)
+        for line in extras:
+            if len(note_items) >= 3:
+                break
+            t = (line[:24].rstrip() + "...") if len(line) > 24 else line
+            note_items.append((t or "本週重點", [line]))
+        note_items = _clean_note_items_for_output(note_items)[:target_topics]
+
+    use_bullet_points = is_chitchat
     point_label = "\u91cd\u9ede"
     tag_label = "標籤"
-    out_lines: list[str] = [header]
-    for title, points in note_items[: max(NOTE_DIGEST_MAX_ITEMS, 6)]:
+    if not is_chitchat:
+        def _norm_compact(text: str) -> str:
+            t = _clean_plain_text(text or "").lower()
+            t = re.sub(r"\s+", "", t)
+            t = re.sub(r"[^\w\u4e00-\u9fff]", "", t)
+            return t
+
+        def _is_near_same(a: str, b: str) -> bool:
+            ka = _norm_compact(a)
+            kb = _norm_compact(b)
+            if not ka or not kb:
+                return False
+            if ka == kb:
+                return True
+            shorter = ka if len(ka) <= len(kb) else kb
+            longer = kb if len(ka) <= len(kb) else ka
+            if len(shorter) >= 8 and shorter in longer:
+                return True
+            return fuzz.ratio(ka, kb) >= 90
+
+        def _dedupe_summary_against_title(title: str, summary: str, candidates: list[str]) -> str:
+            t = (title or "").strip()
+            s = (summary or "").strip()
+            if not s:
+                return s
+            if t and "..." not in t and "…" not in t:
+                esc = re.escape(t.rstrip("。:：，,;；.!?！？…"))
+                s2 = re.sub(rf"^\s*{esc}\s*[：:，,。;；.!?！？…-]*\s*", "", s, count=1, flags=re.I).strip()
+                if s2:
+                    s = s2
+            if t and _is_near_same(t, s):
+                fragments = [x.strip() for x in re.split(r"[，,。;；:：]", s) if x.strip()]
+                for frag in fragments:
+                    if len(_norm_compact(frag)) >= 8 and not _is_near_same(t, frag):
+                        return frag
+                for c in candidates:
+                    cv = (c or "").strip()
+                    if cv and not _is_near_same(t, cv):
+                        return cv
+                return s
+            return s
+
+        def _strip_action_prefix(text: str) -> str:
+            return re.sub(r"^(?:行動建議|建議|延伸研究)\s*[:：]\s*", "", (text or "").strip())
+
+        def _default_actions(topic: str) -> list[str]:
+            seed = _clean_plain_text(topic).strip() or "本週主題"
+            if len(seed) > 22:
+                seed = seed[:22].rstrip() + "..."
+            return [
+                f"針對「{seed}」彙整 3 個可驗證觀點，並補上來源證據。",
+                f"以「{seed}」規劃一個可於本週完成的小型實作或研究筆記。",
+            ]
+
+        out_lines: list[str] = [header]
+        for idx, (title, points) in enumerate(note_items[:target_topics], start=1):
+            title = _normalize_main_weekly_title(title)
+            valid_points = [x.strip() for x in points[:5] if x.strip()]
+            summary = valid_points[0] if valid_points else title
+            summary = _dedupe_summary_against_title(title, summary, [])
+            if not summary:
+                summary = title
+            actions = [_strip_action_prefix(x) for x in valid_points[1:] if _strip_action_prefix(x)]
+            if not actions:
+                actions = _default_actions(title or summary)
+            out_lines.append(f"重點{idx}：{summary}")
+            out_lines.append(f"- 行動建議：{actions[0]}")
+            if len(actions) > 1:
+                out_lines.append(f"- 行動建議：{actions[1]}")
+            out_lines.append("")
+        out_lines.extend([""] + _build_weekly_news_block(end_day, days))
+        return out_lines
+
+    out_lines = [header]
+    for title, points in note_items[:target_topics]:
         out_lines.append(title)
-        for idx, p in enumerate(points[:5], start=1):
-            out_lines.append(f"{point_label}{idx}\uff1a{p}")
+        for idx, p in enumerate([x for x in points[:5] if x.strip()], start=1):
+            if use_bullet_points:
+                out_lines.append(f"- {p}")
+            else:
+                out_lines.append(f"{point_label}{idx}\uff1a{p}")
         out_lines.append("")
     out_lines.append(f"{tag_label}\uff1a{' '.join(tags[:10])}")
     return out_lines
@@ -3951,54 +4434,114 @@ def build_news_digest_recent(end_day: str, days: int = 3) -> list[str]:
     return lines
 
 
+def _weekly_report_week_key(day: str) -> str:
+    dt = datetime.strptime(day, "%Y-%m-%d").date()
+    iso_year, iso_week, _ = dt.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
+def _weekly_report_window(end_day: str) -> tuple[str, str]:
+    end_dt = datetime.strptime(end_day, "%Y-%m-%d").replace(tzinfo=get_local_tz())
+    start_dt = (end_dt - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+
+
+def _weekly_report_file_path(end_day: str) -> Path:
+    week_key = _weekly_report_week_key(end_day)
+    filename = f"{week_key}_{APP_PROFILE}_weekly_report.md"
+    return WEEKLY_REPORT_DIR / filename
+
+
+def _compose_weekly_report_prompt(
+    start_day: str,
+    end_day: str,
+    notes_context: str,
+    news_context: str,
+    include_actions: bool,
+) -> str:
+    if APP_PROFILE == "main":
+        action_block = (
+            "3) 針對每個重點提供 1-2 個具體行動建議，格式：\n"
+            "   - 行動建議：...\n"
+            "   - 延伸研究：...（可選）\n"
+        )
+        if not include_actions:
+            action_block = ""
+        return (
+            f"請根據 {start_day} 到 {end_day} 的資料，產出主線週報。\n"
+            "要求：\n"
+            "1) 使用繁體中文、正式語氣、邏輯清晰。\n"
+            "2) 先列出 5-7 個當周重點，每點 2-4 句，重視自我提升、書籍重點、KOL 評論與趨勢分析。\n"
+            f"{action_block}"
+            "4) 最後補上「下週優先任務」3 點（條列）。\n"
+            "5) 僅使用提供內容，不可杜撰。\n\n"
+            f"[筆記與逐字稿]\n{notes_context}\n\n"
+            f"[新聞摘要]\n{news_context}"
+        )
+
+    return (
+        f"請根據 {start_day} 到 {end_day} 的資料，產出 chitchat 週回顧。\n"
+        "要求：\n"
+        "1) 使用繁體中文，語氣自然但條理清楚。\n"
+        "2) 先列出 5-7 個本週趣事或對話亮點，每點 2-3 句。\n"
+        "3) 補上「本週關鍵詞」8-12 個（#tag）。\n"
+        "4) 最後給一段 3-5 句的下週聊天主題建議。\n"
+        "5) 僅使用提供內容，不可杜撰。\n\n"
+        f"[筆記與逐字稿]\n{notes_context}"
+    )
+
+
+def _save_weekly_report(end_day: str, lines: list[str]) -> Path | None:
+    if not lines:
+        return None
+    report_path = _weekly_report_file_path(end_day)
+    try:
+        WEEKLY_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+        get_or_create_dropbox_shared_link_for_local_file(report_path, prefer_temporary=False)
+        return report_path
+    except Exception as e:
+        print(f"[WARN] weekly report save failed: {e}")
+        return None
+
+
+def generate_weekly_report(day: str, *, include_actions: bool, save_report: bool = False) -> list[str]:
+    start_day, end_day = _weekly_report_window(day)
+    notes_parts = build_scoped_summary(end_day, "note", recent_days=7)
+    notes_context = "\n".join(notes_parts)
+
+    news_context = "新聞功能未啟用。"
+    if FEATURE_NEWS_ENABLED:
+        news_parts = build_scoped_summary(end_day, "news", recent_days=7)
+        news_context = "\n".join(news_parts)
+
+    prompt = _compose_weekly_report_prompt(
+        start_day=start_day,
+        end_day=end_day,
+        notes_context=notes_context,
+        news_context=news_context,
+        include_actions=include_actions,
+    )
+    system_prompt = "Use only provided content. Do not invent facts. Output must be in Traditional Chinese."
+    body = _run_ai_chat(system_prompt, prompt)
+
+    header = f"{start_day} ~ {end_day} {APP_PROFILE} 週報"
+    if not body:
+        fallback = [header, "", "（AI 生成失敗，以下為週摘要原始內容）", "", notes_context]
+        if FEATURE_NEWS_ENABLED:
+            fallback.extend(["", news_context])
+        if save_report:
+            _save_weekly_report(end_day, fallback)
+        return fallback
+
+    lines = [header, "", body.strip()]
+    if save_report:
+        _save_weekly_report(end_day, lines)
+    return lines
+
+
 def summary_weekly(day: str) -> list[str]:
-    end_day = datetime.strptime(day, "%Y-%m-%d")
-    days = [(end_day - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
-
-    daily_sections: list[str] = []
-    for d in days:
-        parts = summary_ai(d, scope="all")
-        if len(parts) >= 6 and parts[0].endswith("(AI)"):
-            daily_sections.append(
-                "\n".join(
-                    [
-                        f"## {d}",
-                        parts[1],
-                        parts[2],
-                        parts[4],
-                        parts[5],
-                    ]
-                )
-            )
-            continue
-
-        fallback = merge_all(d)
-        fallback_text = "\n".join(fallback)
-        daily_sections.append(f"## {d}\n{fallback_text[:600]}")
-
-    context_text = "\n\n".join(daily_sections)
-    if len(context_text) > AI_SUMMARY_MAX_CHARS:
-        context_text = context_text[:AI_SUMMARY_MAX_CHARS]
-
-    system_prompt = (
-        "Use only provided content. Do not invent facts. "
-        "Output must be in Traditional Chinese."
-    )
-    weekly_prompt = (
-        f"隢?撠??{day} ?? 7 憭拙摰寧?粹望?閬n"
-        "頛詨?澆?嚗n"
-        "A. ?啗?\n"
-        "- 5-10 暺???頞典???萄?貉?鈭辣嚗?雯?隢??n\n"
-        "B. 蝑?\n"
-        "- 5-10 暺?瘙箇???颲艾◢?芾?銝梯??n\n"
-        "隢蝺券?閮n\n"
-        f"{context_text}"
-    )
-    weekly = _run_ai_chat(system_prompt, weekly_prompt)
-
-    if not weekly:
-        return [f"{day} summary_weekly", context_text]
-    return [f"{day} summary_weekly (AI)", weekly]
+    return generate_weekly_report(day, include_actions=(APP_PROFILE == "main"), save_report=False)
 
 
 def summary_ai(day: str, scope: str = "all") -> list[str]:
@@ -4010,7 +4553,7 @@ def summary_ai(day: str, scope: str = "all") -> list[str]:
             return ["新聞功能已關閉。"]
         return build_scoped_summary(day, "news")
     if scope not in {"all", "note"}:
-        return ["不支援的摘要範圍，請使用 /summary、/summary note 或 /summary news。"]
+        return ["不支援的摘要範圍，請使用 /summary_notes_daily 或 /summary_news_daily。"]
     return build_note_digest(day)
 
 
@@ -4496,7 +5039,10 @@ def handle_news_command(text: str, chat_id: str) -> list[str]:
 
 
 def set_telegram_commands() -> None:
-    commands = [{"command": "summary_note", "description": "3-day note digest"}]
+    commands = [
+        {"command": "summary_notes_daily", "description": "Daily notes digest"},
+        {"command": "summary_notes_weekly", "description": "Weekly notes digest"},
+    ]
     if FEATURE_NEWS_ENABLED:
         commands.extend(
             [
@@ -4504,6 +5050,8 @@ def set_telegram_commands() -> None:
                 {"command": "news_sources", "description": "List news sources"},
                 {"command": "news_debug", "description": "Debug ingestion"},
                 {"command": "news_help", "description": "News command help"},
+                {"command": "summary_news_daily", "description": "Daily news digest"},
+                {"command": "summary_news_weekly", "description": "Weekly news digest"},
             ]
         )
     if FEATURE_TRANSCRIBE_ENABLED:
@@ -4617,6 +5165,7 @@ def build_status_report() -> str:
         f"status time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
         f"ai summary: {'on' if AI_SUMMARY_ENABLED else 'off'}",
         f"ai provider/model: {AI_SUMMARY_PROVIDER}/{_resolve_ai_model_name()}",
+        f"ai temperature: {AI_SUMMARY_TEMPERATURE}",
         f"ollama health: {_ollama_health()}",
         f"db path exists: {'yes' if DB_PATH.exists() else 'no'}",
     ]
@@ -4642,6 +5191,12 @@ def build_status_report() -> str:
     lines.extend([
         f"note markdown files (3d): {notes_3d}",
         f"dropbox sync: {'on' if DROPBOX_SYNC_ENABLED else 'off'} ({DROPBOX_SYNC_TIME} {DROPBOX_SYNC_TZ_NAME})",
+        "weekly report push: "
+        + (
+            f"on (weekday={WEEKLY_REPORT_PUSH_WEEKDAY} {WEEKLY_REPORT_PUSH_TIME} {WEEKLY_REPORT_PUSH_TZ_NAME})"
+            if WEEKLY_REPORT_PUSH_ENABLED
+            else "off"
+        ),
         f"today: {day}",
     ])
     return "\n".join(lines)
@@ -4706,6 +5261,85 @@ def push_news_to_subscribers() -> None:
             conn.commit()
 
 
+def _get_weekly_report_push_tz():
+    try:
+        return ZoneInfo(WEEKLY_REPORT_PUSH_TZ_NAME)
+    except ZoneInfoNotFoundError:
+        return get_local_tz()
+
+
+def _weekly_push_sent(provider_key: str, key: str) -> bool:
+    return bool(get_sync_state(provider_key, key))
+
+
+def _mark_weekly_push_sent(provider_key: str, key: str) -> None:
+    upsert_sync_state(provider_key, key, datetime.now(tz=get_local_tz()).isoformat())
+
+
+def _list_recent_telegram_chats_for_weekly_push(limit: int) -> list[str]:
+    now = datetime.now(tz=get_local_tz())
+    cutoff_iso = (now - timedelta(days=WEEKLY_REPORT_PUSH_LOOKBACK_DAYS)).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT chat_id, MAX(received_ts) AS last_seen
+            FROM messages
+            WHERE platform = 'telegram'
+              AND chat_id IS NOT NULL
+              AND chat_id <> ''
+              AND received_ts >= ?
+            GROUP BY chat_id
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
+            (cutoff_iso, limit),
+        ).fetchall()
+    return [str(row[0]) for row in rows if row and row[0]]
+
+
+def push_weekly_report_to_recent_chats(force_day: str | None = None) -> None:
+    if not WEEKLY_REPORT_PUSH_ENABLED:
+        return
+
+    now = datetime.now(tz=_get_weekly_report_push_tz())
+    report_day = force_day or now.strftime("%Y-%m-%d")
+    week_key = _weekly_report_week_key(report_day)
+    week_guard_key = f"{APP_PROFILE}:{week_key}"
+    provider_report = "weekly_report_generated"
+    if not _weekly_push_sent(provider_report, week_guard_key):
+        if APP_PROFILE == "main":
+            payload = build_scoped_summary(report_day, "note", recent_days=7)
+            _save_weekly_report(report_day, payload)
+        else:
+            generate_weekly_report(report_day, include_actions=(APP_PROFILE == "main"), save_report=True)
+        _mark_weekly_push_sent(provider_report, week_guard_key)
+
+    report_path = _weekly_report_file_path(report_day)
+    report_link = get_or_create_dropbox_shared_link_for_local_file(report_path) if report_path.exists() else None
+    if report_path.exists():
+        text = report_path.read_text(encoding="utf-8", errors="replace").strip()
+    else:
+        if APP_PROFILE == "main":
+            payload = build_scoped_summary(report_day, "note", recent_days=7)
+        else:
+            payload = generate_weekly_report(report_day, include_actions=(APP_PROFILE == "main"), save_report=False)
+        text = "\n".join(payload)
+    if report_link:
+        text = f"{text}\n\n週報檔案：{report_link}"
+
+    chat_ids = _list_recent_telegram_chats_for_weekly_push(WEEKLY_REPORT_PUSH_MAX_CHATS)
+    if not chat_ids:
+        return
+
+    provider_push = "weekly_report_push"
+    for chat_id in chat_ids:
+        sent_key = f"{APP_PROFILE}:{week_key}:{chat_id}"
+        if _weekly_push_sent(provider_push, sent_key):
+            continue
+        send_message_sync(chat_id, text)
+        _mark_weekly_push_sent(provider_push, sent_key)
+
+
 def start_news_thread() -> None:
     if not FEATURE_NEWS_ENABLED:
         print("[INFO] News worker disabled by FEATURE_NEWS_ENABLED=0")
@@ -4719,6 +5353,32 @@ def start_news_thread() -> None:
             except Exception as e:
                 print(f"news worker error: {e}")
             time.sleep(max(1, NEWS_FETCH_INTERVAL_MINUTES) * 60)
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
+def start_weekly_report_thread() -> None:
+    if not WEEKLY_REPORT_PUSH_ENABLED:
+        return
+
+    run_hour, run_minute = parse_hhmm(WEEKLY_REPORT_PUSH_TIME, default_hour=9, default_minute=0)
+
+    def loop():
+        last_run_key = ""
+        while True:
+            try:
+                now = datetime.now(tz=_get_weekly_report_push_tz())
+                day_key = now.strftime("%Y-%m-%d")
+                weekday = now.isoweekday()
+                minute_ok = now.hour == run_hour and now.minute == run_minute
+                run_key = f"{APP_PROFILE}:{day_key}:{run_hour:02d}:{run_minute:02d}"
+                if weekday == WEEKLY_REPORT_PUSH_WEEKDAY and minute_ok and run_key != last_run_key:
+                    push_weekly_report_to_recent_chats(force_day=day_key)
+                    last_run_key = run_key
+            except Exception as e:
+                print(f"[WARN] Weekly report worker error: {e}")
+            time.sleep(60)
 
     t = threading.Thread(target=loop, daemon=True)
     t.start()
@@ -5172,6 +5832,26 @@ async def process_telegram_update(update: dict) -> None:
             await send_message(chat_id, f"指令處理失敗：{type(e).__name__}")
         return
 
+    # Group chats: only handle explicit slash commands.
+    if is_group and chat_id and text and is_slash_command and not has_image and not has_audio_attachment:
+        try:
+            print(f"[ROUTE][GROUP_CMD] chat_id={chat_id} text={cmd_text[:180]!r}")
+            replies, parse_mode, disable_preview = route_user_text_command(cmd_text, str(chat_id))
+            for reply in replies:
+                for chunk in _chunk_text_for_telegram(reply):
+                    sent_id = await send_message(
+                        chat_id,
+                        chunk,
+                        parse_mode=parse_mode,
+                        disable_web_page_preview=disable_preview,
+                    )
+                    if sent_id is None:
+                        print(f"[WARN] group reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
+        except Exception as e:
+            print(f"[WARN] group command handling failed: {type(e).__name__}: {e}")
+            await send_message(chat_id, f"指令處理失敗：{type(e).__name__}")
+        return
+
     if FEATURE_OCR_ENABLED and (is_private or is_group) and chat_id and has_image:
         file_id = None
         file_unique_id = None
@@ -5301,12 +5981,20 @@ def start_slack_socket_mode() -> None:
         ok, msg = process_slack_note(channel_id, user_id, user_name, text, msg_ts)
         respond(msg)
 
-    @slack_app.command("/summary_note")
-    def handle_slack_summary_note(ack, respond, command):
+    @slack_app.command("/summary_notes_daily")
+    def handle_slack_summary_notes_daily(ack, respond, command):
         ack()
         text = (command.get("text") or "").strip()
         day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
         parts = build_scoped_summary(day, "note")
+        respond("\n".join(parts))
+
+    @slack_app.command("/summary_notes_weekly")
+    def handle_slack_summary_notes_weekly(ack, respond, command):
+        ack()
+        text = (command.get("text") or "").strip()
+        day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
+        parts = build_scoped_summary(day, "note", recent_days=7)
         respond("\n".join(parts))
 
     @slack_app.command("/status")
@@ -5314,12 +6002,26 @@ def start_slack_socket_mode() -> None:
         ack()
         respond(build_status_report())
 
-    @slack_app.command("/summary_weekly")
-    def handle_slack_summary_weekly(ack, respond, command):
+    @slack_app.command("/summary_news_daily")
+    def handle_slack_summary_news_daily(ack, respond, command):
         ack()
+        if not FEATURE_NEWS_ENABLED:
+            respond("新聞功能已關閉。")
+            return
         text = (command.get("text") or "").strip()
         day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
-        parts = summary_weekly(day)
+        parts = build_scoped_summary(day, "news")
+        respond("\n".join(parts))
+
+    @slack_app.command("/summary_news_weekly")
+    def handle_slack_summary_news_weekly(ack, respond, command):
+        ack()
+        if not FEATURE_NEWS_ENABLED:
+            respond("新聞功能已關閉。")
+            return
+        text = (command.get("text") or "").strip()
+        day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
+        parts = build_scoped_summary(day, "news", recent_days=7)
         respond("\n".join(parts))
 
     @slack_app.event("message")
@@ -5365,16 +6067,34 @@ def start_slack_socket_mode() -> None:
                 ok, msg = process_slack_note(channel_id, user_id, user_name, payload, msg_ts)
                 say(msg)
                 return
-        if text.startswith("/summary_weekly"):
+        if text.startswith("/summary_notes_weekly"):
             tokens = text.split()
             day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
-            parts = summary_weekly(day)
+            parts = build_scoped_summary(day, "note", recent_days=7)
             say("\n".join(parts))
             return
-        if text.startswith("/summary_note"):
+        if text.startswith("/summary_notes_daily"):
             tokens = text.split()
             day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
             parts = build_scoped_summary(day, "note")
+            say("\n".join(parts))
+            return
+        if text.startswith("/summary_news_daily"):
+            if not FEATURE_NEWS_ENABLED:
+                say("新聞功能已關閉。")
+                return
+            tokens = text.split()
+            day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
+            parts = build_scoped_summary(day, "news")
+            say("\n".join(parts))
+            return
+        if text.startswith("/summary_news_weekly"):
+            if not FEATURE_NEWS_ENABLED:
+                say("新聞功能已關閉。")
+                return
+            tokens = text.split()
+            day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
+            parts = build_scoped_summary(day, "news", recent_days=7)
             say("\n".join(parts))
             return
         if text.startswith("/status"):
@@ -5407,6 +6127,7 @@ def start_background_workers_once() -> None:
             return
         set_telegram_commands()
         start_news_thread()
+        start_weekly_report_thread()
         start_slack_thread()
         start_dropbox_sync_thread()
         start_ocr_choice_expire_thread()

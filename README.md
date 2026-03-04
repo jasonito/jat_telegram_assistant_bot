@@ -55,13 +55,17 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 - Keys: `NEWS_ENABLED`, `NEWS_FETCH_INTERVAL_MINUTES`, `NEWS_PUSH_ENABLED`, `NEWS_PUSH_MAX_ITEMS`, `NEWS_GNEWS_*`, `NEWS_RSS_URLS`, `NEWS_RSS_URLS_FILE`, `NEWS_URL_FETCH_*`, `NEWS_DIGEST_*`, `NOTE_DIGEST_MAX_ITEMS`.
 
 ### Segment G: AI Summary Providers
-- Purpose: shared AI config for `/summary` and transcript summary blocks.
-- Keys: `AI_SUMMARY_ENABLED`, `AI_SUMMARY_PROVIDER`, `AI_SUMMARY_TIMEOUT_SECONDS`, `AI_SUMMARY_MAX_CHARS`.
+- Purpose: shared AI config for digest/weekly report and transcript summary blocks.
+- Keys: `AI_SUMMARY_ENABLED`, `AI_SUMMARY_PROVIDER`, `AI_SUMMARY_TIMEOUT_SECONDS`, `AI_SUMMARY_MAX_CHARS`, `AI_SUMMARY_TEMPERATURE`.
 - Provider keys: `OPENAI_*`, `GEMINI_*`, `ANTHROPIC_*`, `HUGGINGFACE_*`, `OLLAMA_*`.
 
 ### Segment H: Dropbox Sync
-- Purpose: sync notes/images and import transcript files.
+- Purpose: sync notes/images/weekly report and import transcript files.
 - Keys: `DROPBOX_ACCESS_TOKEN`, `DROPBOX_REFRESH_TOKEN`, `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS`, `DROPBOX_ROOT_PATH`, `DROPBOX_SYNC_ENABLED`, `DROPBOX_SYNC_TIME`, `DROPBOX_SYNC_TZ`, `DROPBOX_SYNC_ON_STARTUP`, `DROPBOX_TRANSCRIPTS_PATH`, `DROPBOX_TRANSCRIPTS_SYNC_ENABLED`.
+
+### Segment H-2: Weekly Report Push
+- Purpose: auto-push weekly recap to recent Telegram chats and persist markdown report.
+- Keys: `WEEKLY_REPORT_PUSH_ENABLED`, `WEEKLY_REPORT_PUSH_WEEKDAY` (1=Mon ... 7=Sun), `WEEKLY_REPORT_PUSH_TIME` (`HH:MM`), `WEEKLY_REPORT_PUSH_TZ`, `WEEKLY_REPORT_PUSH_LOOKBACK_DAYS`, `WEEKLY_REPORT_PUSH_MAX_CHATS`.
 
 ### Segment I: Notion (mainly chitchat)
 - Purpose: append chitchat logs/images/transcripts to Notion pages.
@@ -111,6 +115,12 @@ Start both bots:
 .\start-both.ps1
 ```
 
+Troubleshoot startup/command routing (keep logs streaming in current terminal):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start-both.ps1 -EnableLogs -Monitor
+```
+
 Stop both bots:
 
 ```powershell
@@ -152,10 +162,10 @@ Private chat commands:
 open https://google.com
 notepad
 sort downloads
-/summary
-/summary 2026-02-12
-/summary note
-/summary note 2026-02-12
+/summary_notes_daily
+/summary_notes_weekly
+/summary_news_daily
+/summary_news_weekly
 /news latest
 /transcribe https://www.youtube.com/watch?v=VIDEO_ID
 ```
@@ -179,6 +189,7 @@ Image OCR and cloud sync:
 - A Dropbox worker syncs local `notes` and `images` to:
 - `/read & chat/read/notes`
 - `/read & chat/read/images`
+- Weekly report markdown is saved under `DATA_DIR\\weekly report\\` and also synced to Dropbox.
 
 
 ## Markdown Cleanup Maintenance

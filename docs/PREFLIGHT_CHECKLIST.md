@@ -64,8 +64,8 @@ Use this before production launch.
 ## F. Go-Live Validation
 
 - [ ] Bot responds to a normal message in Telegram.
-- [ ] `/summary` works.
-- [ ] `/summary note` includes expected note/transcript content.
+- [ ] `/summary_notes_daily` works.
+- [ ] `/summary_notes_weekly` includes expected note/transcript content.
 - [ ] Dropbox sync log shows successful cycle.
 - [ ] Optional one-time markdown cleanup completed (main/chitchat notes) if historical files used legacy format.
 - [ ] Reboot test passed:

@@ -404,6 +404,11 @@ param(
         throw "Port $Port is already in use by PID(s): $($occupiedPids -join ', '). Stop old process first or pass -Port."
       }
     }
+    if ($isLongPollingMode) {
+      $localWebhookUrl = "http://127.0.0.1:$Port/telegram"
+      $env:TELEGRAM_LOCAL_WEBHOOK_URL = $localWebhookUrl
+      Write-Info "Long polling local forward URL: $localWebhookUrl"
+    }
     Write-Info 'Starting uvicorn...'
     Write-Info "Using env file: $envFile"
     Write-Info "App module: $appModule"
