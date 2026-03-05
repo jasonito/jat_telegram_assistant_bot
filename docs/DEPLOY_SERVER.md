@@ -45,7 +45,7 @@ Optional AI on server:
   - Install Ollama on server.
   - Set `AI_SUMMARY_PROVIDER=ollama`
   - Set `OLLAMA_BASE_URL=http://127.0.0.1:11434`
-  - Set `OLLAMA_MODEL=qwen2.5:7b` (or your model)
+  - Set `OLLAMA_MODEL=qwen3.5:9b` (or your model)
 - If server has no Ollama, switch provider (OpenAI/Gemini/Anthropic/HF).
 
 ## 5) Verify Before Service

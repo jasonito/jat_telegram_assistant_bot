@@ -147,6 +147,12 @@ param(
       $envFile = Join-Path $PSScriptRoot $EnvFile
     }
     Import-EnvFile -path $envFile
+    if (-not $env:PYTHONUTF8) {
+      $env:PYTHONUTF8 = '1'
+    }
+    if (-not $env:PYTHONIOENCODING) {
+      $env:PYTHONIOENCODING = 'utf-8'
+    }
     $token = Get-EnvValueFromFile -path $envFile -key 'TELEGRAM_BOT_TOKEN'
     $appModule = Get-EnvValueFromFile -path $envFile -key 'APP_MODULE'
     if (-not $appModule) {
@@ -259,7 +265,7 @@ param(
       if (-not $ollamaReady) {
         throw "Ollama service did not become ready at $tagsUrl"
       }
-      $modelName = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL.Trim() } else { 'qwen2.5:7b' }
+      $modelName = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL.Trim() } else { 'qwen3.5:9b' }
       if ($modelName) {
         $tagsResp = Invoke-RestMethod -Method Get -Uri $tagsUrl -TimeoutSec 5
         $modelExists = $false
@@ -397,6 +403,11 @@ param(
       } else {
         throw "Port $Port is already in use by PID(s): $($occupiedPids -join ', '). Stop old process first or pass -Port."
       }
+    }
+    if ($isLongPollingMode) {
+      $localWebhookUrl = "http://127.0.0.1:$Port/telegram"
+      $env:TELEGRAM_LOCAL_WEBHOOK_URL = $localWebhookUrl
+      Write-Info "Long polling local forward URL: $localWebhookUrl"
     }
     Write-Info 'Starting uvicorn...'
     Write-Info "Using env file: $envFile"

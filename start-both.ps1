@@ -11,6 +11,34 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-ListeningPidsForPort([int]$TargetPort) {
+  $pids = @()
+  try {
+    $lines = netstat -ano -p tcp | Select-String -Pattern "^\s*TCP\s+\S+:$TargetPort\s+\S+\s+LISTENING\s+(\d+)\s*$"
+    foreach ($line in $lines) {
+      $text = $line.ToString()
+      if ($text -match "LISTENING\s+(\d+)\s*$") {
+        $pids += [int]$matches[1]
+      }
+    }
+  } catch {}
+  return @($pids | Select-Object -Unique)
+}
+
+function Get-NextFreePort([int]$StartPort, [int[]]$ReservedPorts) {
+  $scanLimit = [Math]::Min(65535, $StartPort + 50)
+  for ($candidate = $StartPort; $candidate -le $scanLimit; $candidate++) {
+    if ($ReservedPorts -contains $candidate) {
+      continue
+    }
+    $pids = Get-ListeningPidsForPort -TargetPort $candidate
+    if ($pids.Count -eq 0) {
+      return $candidate
+    }
+  }
+  throw "No free port found in range $StartPort-$scanLimit."
+}
+
 function Ensure-SharedDependencies {
   $venvDir = Join-Path $PSScriptRoot '.venv'
   $venvPython = Join-Path $venvDir 'Scripts\python.exe'
@@ -74,10 +102,23 @@ if ($Monitor) {
 
 Ensure-SharedDependencies
 
-Write-Host "[INFO] Starting main bot with $MainEnv on port $MainPort"
+$mainSelectedPort = Get-NextFreePort -StartPort $MainPort -ReservedPorts @()
+if ($mainSelectedPort -ne $MainPort) {
+  Write-Host "[WARN] Requested main port $MainPort is unavailable. Preselected fallback: $mainSelectedPort"
+}
+
+$chitchatSelectedPort = Get-NextFreePort -StartPort $ChitchatPort -ReservedPorts @($mainSelectedPort)
+if ($chitchatSelectedPort -ne $ChitchatPort) {
+  Write-Host "[WARN] Requested chitchat port $ChitchatPort is unavailable/conflicts. Preselected fallback: $chitchatSelectedPort"
+}
+if ($mainSelectedPort -eq $chitchatSelectedPort) {
+  throw "Internal port selection conflict: both bots resolved to port $mainSelectedPort."
+}
+
+Write-Host "[INFO] Starting main bot with $MainEnv on port $mainSelectedPort"
 $mainParams = @{
   EnvFile = $MainEnv
-  Port = $MainPort
+  Port = $mainSelectedPort
   SkipDepsInstall = $true
   ShowWindow = $effectiveShowShell
 }
@@ -89,10 +130,10 @@ if ($LASTEXITCODE -ne 0) {
   throw "Main bot start failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "[INFO] Starting chitchat bot with $ChitchatEnv on port $ChitchatPort"
+Write-Host "[INFO] Starting chitchat bot with $ChitchatEnv on port $chitchatSelectedPort"
 $chitchatParams = @{
   EnvFile = $ChitchatEnv
-  Port = $ChitchatPort
+  Port = $chitchatSelectedPort
   SkipDepsInstall = $true
   ShowWindow = $effectiveShowShell
 }
