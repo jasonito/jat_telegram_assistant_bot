@@ -65,7 +65,7 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 
 ### Segment I: Notion (mainly chitchat)
 - Purpose: append chitchat logs/images/transcripts to Notion pages.
-- Keys: `NOTION_ENABLED`, `NOTION_TOKEN`, `NOTION_VERSION`, `NOTION_CHATLOG_YEAR_PAGES_JSON`, `NOTION_CHATLOG_FALLBACK_PAGE_ID`, `NOTION_CHATLOG_IMAGE_MODE`, `NOTION_CHATLOG_OCR_MODE`, `NOTION_CHATLOG_INCLUDE_TIME`.
+- Keys: `NOTION_ENABLED`, `NOTION_TOKEN`, `NOTION_VERSION`, `NOTION_CHATLOG_YEAR_PAGES_JSON`, `NOTION_CHATLOG_FALLBACK_PAGE_ID`, `NOTION_CHATLOG_IMAGE_MODE`, `NOTION_FILE_UPLOAD_VERSION`, `NOTION_CHATLOG_OCR_MODE`, `NOTION_CHATLOG_INCLUDE_TIME`.
 
 ### Segment J: Slack (optional)
 - Purpose: enable Socket Mode DM logging.

@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import hashlib
 import json
+import mimetypes
 import time
 import uuid
 import logging
@@ -179,6 +180,9 @@ APP_PROFILE = (os.getenv("APP_PROFILE", "main") or "main").strip().lower()
 NOTION_ENABLED = _env_flag("NOTION_ENABLED", False)
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28").strip() or "2022-06-28"
+NOTION_FILE_UPLOAD_VERSION = (
+    os.getenv("NOTION_FILE_UPLOAD_VERSION", "2025-09-03").strip() or "2025-09-03"
+)
 NOTION_CHATLOG_YEAR_PAGES_JSON = os.getenv("NOTION_CHATLOG_YEAR_PAGES_JSON", "").strip()
 NOTION_CHATLOG_FALLBACK_PAGE_ID = os.getenv("NOTION_CHATLOG_FALLBACK_PAGE_ID", "").strip()
 NOTION_CHATLOG_IMAGE_MODE = (os.getenv("NOTION_CHATLOG_IMAGE_MODE", "link") or "link").strip().lower()
@@ -1354,6 +1358,9 @@ def handle_command(text: str) -> str:
     if text_lower.startswith("/status"):
         return build_status_report()
 
+    if text_lower.startswith("/notion_test"):
+        return "請在私訊中使用 /notion_test。"
+
     if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_latest"):
         suffix = text.strip()[len("/news_latest") :].strip()
         return "\n".join(handle_news_command(f"/news latest {suffix}".strip(), ""))
@@ -1385,6 +1392,8 @@ def handle_command(text: str) -> str:
 
     if text_lower in {"help", "/help"}:
         cmds = ["open <url>", "notepad", "sort downloads", "/status", "/summary", "/summary_note"]
+        if APP_PROFILE == "chitchat":
+            cmds.append("/notion_test")
         if FEATURE_NEWS_ENABLED:
             cmds.extend(["/news latest", "/summary news"])
         if FEATURE_TRANSCRIBE_ENABLED:
@@ -1998,20 +2007,37 @@ def _notion_is_chitchat_enabled() -> bool:
     return True
 
 
-def _notion_headers() -> dict[str, str]:
-    return {
+def _notion_headers(
+    *,
+    notion_version: str | None = None,
+    include_content_type: bool = True,
+) -> dict[str, str]:
+    headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": NOTION_VERSION,
-        "Content-Type": "application/json",
+        "Notion-Version": notion_version or NOTION_VERSION,
     }
+    if include_content_type:
+        headers["Content-Type"] = "application/json"
+    return headers
 
 
-def _notion_request(method: str, path: str, payload: dict | None = None) -> dict:
+def _notion_request(
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    notion_version: str | None = None,
+) -> dict:
     url = f"https://api.notion.com/v1/{path.lstrip('/')}"
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            resp = requests.request(method.upper(), url, headers=_notion_headers(), json=payload, timeout=20)
+            resp = requests.request(
+                method.upper(),
+                url,
+                headers=_notion_headers(notion_version=notion_version),
+                json=payload,
+                timeout=20,
+            )
             if resp.status_code in {429, 500, 502, 503, 504}:
                 time.sleep(0.6 * (attempt + 1))
                 continue
@@ -2062,11 +2088,17 @@ def _notion_iter_block_children(block_id: str, page_size: int = 100) -> Iterator
             break
 
 
-def _notion_append_block_children(block_id: str, children: list[dict], after: str | None = None) -> list[dict]:
+def _notion_append_block_children(
+    block_id: str,
+    children: list[dict],
+    after: str | None = None,
+    *,
+    notion_version: str | None = None,
+) -> list[dict]:
     payload: dict[str, object] = {"children": children}
     if after:
         payload["after"] = after
-    data = _notion_request("PATCH", f"blocks/{block_id}/children", payload)
+    data = _notion_request("PATCH", f"blocks/{block_id}/children", payload, notion_version=notion_version)
     return list(data.get("results") or [])
 
 
@@ -2108,6 +2140,74 @@ def _notion_external_image_block(url: str, caption: str | None = None) -> dict:
             "caption": caption_rich_text,
         },
     }
+
+
+def _notion_file_upload_image_block(file_upload_id: str, caption: str | None = None) -> dict:
+    cap = (caption or "").strip()
+    caption_rich_text = []
+    if cap:
+        caption_rich_text = [{"type": "text", "text": {"content": cap}}]
+    return {
+        "object": "block",
+        "type": "image",
+        "image": {
+            "type": "file_upload",
+            "file_upload": {"id": file_upload_id},
+            "caption": caption_rich_text,
+        },
+    }
+
+
+def _notion_upload_image_file(image_path: Path) -> str:
+    if not image_path.exists():
+        raise RuntimeError(f"image path not found: {image_path}")
+    filename = image_path.name or "image"
+    content_type, _encoding = mimetypes.guess_type(filename)
+    if not content_type:
+        content_type = "application/octet-stream"
+    create_payload = {
+        "mode": "single_part",
+        "filename": filename,
+        "content_type": content_type,
+    }
+    created = _notion_request(
+        "POST",
+        "file_uploads",
+        create_payload,
+        notion_version=NOTION_FILE_UPLOAD_VERSION,
+    )
+    upload_id = str(created.get("id") or "").strip()
+    if not upload_id:
+        raise RuntimeError("Notion file upload create failed: missing upload id")
+
+    url = f"https://api.notion.com/v1/file_uploads/{upload_id}/send"
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            with image_path.open("rb") as fp:
+                files = {"file": (filename, fp, content_type)}
+                resp = requests.post(
+                    url,
+                    headers=_notion_headers(
+                        notion_version=NOTION_FILE_UPLOAD_VERSION,
+                        include_content_type=False,
+                    ),
+                    files=files,
+                    timeout=60,
+                )
+            if resp.status_code in {429, 500, 502, 503, 504}:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Notion file upload send {resp.status_code}: {resp.text[:300]}")
+            return upload_id
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            break
+    raise RuntimeError(str(last_exc) if last_exc else "Notion file upload send failed")
 
 
 def _notion_day_label(dt: datetime | None) -> str:
@@ -2322,7 +2422,7 @@ def notion_append_chitchat_image(
 ) -> None:
     if not _notion_is_chitchat_enabled():
         return
-    if NOTION_CHATLOG_IMAGE_MODE not in {"link", "embed"}:
+    if NOTION_CHATLOG_IMAGE_MODE not in {"link", "embed", "upload"}:
         return
     page_id = _notion_get_chatlog_year_page_id(msg_ts or _infer_message_dt_from_image_path(image_path))
     if not page_id:
@@ -2330,32 +2430,57 @@ def notion_append_chitchat_image(
         return
     day_label = _notion_day_label(msg_ts or _infer_message_dt_from_image_path(image_path))
     blocks: list[dict] = []
+    append_notion_version: str | None = None
     cap = (caption or "").strip()
-    image_url = get_or_create_dropbox_shared_link_for_local_file(
-        image_path,
-        prefer_temporary=(NOTION_CHATLOG_IMAGE_MODE == "embed"),
-    )
-    if image_url and NOTION_CHATLOG_IMAGE_MODE == "embed":
-        blocks.append(_notion_external_image_block(image_url, caption=cap or None))
-    elif image_url:
-        bullet = "[圖片]"
-        if cap:
-            bullet = f"{bullet} {cap}"
-        blocks.append(_notion_bullet_block(bullet))
-        blocks.append(_notion_paragraph_block(f"圖片：{image_url}"))
-    else:
-        if cap:
-            blocks.append(_notion_bullet_block(f"[圖片] {cap}"))
-        blocks.append(_notion_paragraph_block("圖片：本地已儲存（尚未取得雲端連結）"))
+    image_url: str | None = None
+    if NOTION_CHATLOG_IMAGE_MODE == "upload":
+        try:
+            upload_id = _notion_upload_image_file(image_path)
+            blocks.append(_notion_file_upload_image_block(upload_id, caption=cap or None))
+            append_notion_version = NOTION_FILE_UPLOAD_VERSION
+        except Exception as e:
+            print(f"[WARN] Notion image direct upload failed, fallback to link mode: {e}")
+
+    if not blocks:
+        image_url = get_or_create_dropbox_shared_link_for_local_file(
+            image_path,
+            # Temporary Dropbox links expire quickly and break Notion embeds.
+            prefer_temporary=False,
+        )
+        if image_url and NOTION_CHATLOG_IMAGE_MODE == "embed":
+            blocks.append(_notion_external_image_block(image_url, caption=cap or None))
+        elif image_url:
+            bullet = "[圖片]"
+            if cap:
+                bullet = f"{bullet} {cap}"
+            blocks.append(_notion_bullet_block(bullet))
+            blocks.append(_notion_paragraph_block(f"圖片：{image_url}"))
+        else:
+            if cap:
+                blocks.append(_notion_bullet_block(f"[圖片] {cap}"))
+            blocks.append(_notion_paragraph_block("圖片：本地已儲存（尚未取得雲端連結）"))
     ocr_summary = _notion_summarize_ocr_text(ocr_text) if NOTION_CHATLOG_OCR_MODE == "optional" else None
     if ocr_summary:
         blocks.append(_notion_paragraph_block(f"OCR 摘要：{ocr_summary}"))
     try:
         heading_id = _notion_ensure_date_heading(page_id, day_label)
-        _notion_append_block_children(page_id, blocks, after=heading_id)
+        _notion_append_block_children(
+            page_id,
+            blocks,
+            after=heading_id,
+            notion_version=append_notion_version,
+        )
     except Exception as e:
-        if NOTION_CHATLOG_IMAGE_MODE == "embed" and image_url:
-            print(f"[WARN] Notion image embed failed, fallback to link mode: {e}")
+        if NOTION_CHATLOG_IMAGE_MODE in {"embed", "upload"}:
+            print(f"[WARN] Notion image append failed, fallback to link mode: {e}")
+            if not image_url:
+                image_url = get_or_create_dropbox_shared_link_for_local_file(
+                    image_path,
+                    prefer_temporary=False,
+                )
+            if not image_url:
+                print("[WARN] Notion image fallback skipped: shared link unavailable")
+                return
             fallback_blocks: list[dict] = []
             bullet = "[圖片]"
             if cap:
@@ -2372,6 +2497,98 @@ def notion_append_chitchat_image(
                 print(f"[WARN] Notion image fallback append failed: {e2}")
         else:
             print(f"[WARN] Notion image append failed: {e}")
+
+
+def _find_latest_local_image_for_notion_test() -> Path | None:
+    if not INBOX_IMAGES_DIR.exists():
+        return None
+    candidates: list[Path] = []
+    for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.gif", "*.bmp"):
+        candidates.extend(INBOX_IMAGES_DIR.rglob(ext))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _notion_test_append_image(page_id: str, heading_id: str, image_path: Path, now: datetime) -> str:
+    mode = NOTION_CHATLOG_IMAGE_MODE
+    caption = f"[notion_test] {now.strftime('%Y-%m-%d %H:%M:%S')}"
+    if mode == "upload":
+        upload_id = _notion_upload_image_file(image_path)
+        _notion_append_block_children(
+            page_id,
+            [_notion_file_upload_image_block(upload_id, caption=caption)],
+            after=heading_id,
+            notion_version=NOTION_FILE_UPLOAD_VERSION,
+        )
+        return "image: ok (uploaded to Notion)"
+
+    image_url = get_or_create_dropbox_shared_link_for_local_file(
+        image_path,
+        prefer_temporary=False,
+    )
+    if not image_url:
+        raise RuntimeError("image link unavailable (Dropbox shared link failed)")
+    if mode == "embed":
+        _notion_append_block_children(
+            page_id,
+            [_notion_external_image_block(image_url, caption=caption)],
+            after=heading_id,
+        )
+        return "image: ok (embedded via link)"
+    _notion_append_block_children(
+        page_id,
+        [
+            _notion_bullet_block(f"[notion_test][圖片] {caption}"),
+            _notion_paragraph_block(f"圖片：{image_url}"),
+        ],
+        after=heading_id,
+    )
+    return "image: ok (linked)"
+
+
+def run_notion_test() -> str:
+    now = datetime.now()
+    lines = [f"notion_test time: {now.strftime('%Y-%m-%d %H:%M:%S')}"]
+    if APP_PROFILE != "chitchat":
+        lines.append(f"profile: {APP_PROFILE} (must be chitchat)")
+        return "\n".join(lines)
+    if not _notion_is_chitchat_enabled():
+        lines.append("notion: disabled")
+        lines.append("check NOTION_ENABLED / NOTION_TOKEN")
+        return "\n".join(lines)
+
+    page_id = _notion_get_chatlog_year_page_id(now)
+    if not page_id:
+        lines.append("page: missing")
+        lines.append("check NOTION_CHATLOG_YEAR_PAGES_JSON")
+        return "\n".join(lines)
+    lines.append(f"page: {page_id}")
+    lines.append(f"image_mode: {NOTION_CHATLOG_IMAGE_MODE}")
+
+    day_label = _notion_day_label(now)
+    try:
+        heading_id = _notion_ensure_date_heading(page_id, day_label)
+        test_text = f"[notion_test] text {now.strftime('%Y-%m-%d %H:%M:%S')}"
+        _notion_append_block_children(page_id, [_notion_bullet_block(test_text)], after=heading_id)
+        lines.append("text: ok")
+    except Exception as e:
+        lines.append(f"text: fail ({type(e).__name__}: {e})")
+        return "\n".join(lines)
+
+    image_path = _find_latest_local_image_for_notion_test()
+    if not image_path:
+        lines.append("image: skipped (no local images found)")
+        return "\n".join(lines)
+    try:
+        result = _notion_test_append_image(page_id, heading_id, image_path, now)
+        lines.append(result)
+        lines.append(f"image_path: {image_path}")
+    except Exception as e:
+        lines.append(f"image: fail ({type(e).__name__}: {e})")
+        lines.append(f"image_path: {image_path}")
+    return "\n".join(lines)
 
 
 def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
@@ -4492,6 +4709,8 @@ def handle_news_command(text: str, chat_id: str) -> list[str]:
 
 def set_telegram_commands() -> None:
     commands = [{"command": "summary_note", "description": "3-day note digest"}]
+    if APP_PROFILE == "chitchat":
+        commands.append({"command": "notion_test", "description": "Run Notion text/image diagnostics"})
     if FEATURE_NEWS_ENABLED:
         commands.extend(
             [
@@ -5140,6 +5359,12 @@ async def process_telegram_update(update: dict) -> None:
                 f"transcribe_enabled={FEATURE_TRANSCRIBE_ENABLED} auto_url={FEATURE_TRANSCRIBE_AUTO_URL} "
                 f"text={cmd_text[:180]!r}"
             )
+            if cmd_text.lower().startswith("/notion_test"):
+                diag = await asyncio.to_thread(run_notion_test)
+                for chunk in _chunk_text_for_telegram(diag):
+                    await send_message(chat_id, chunk)
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=notion_test")
+                return
             if await handle_transcribe_cancel_command(chat_id, cmd_text):
                 print(f"[ROUTE][HANDLED] chat_id={chat_id} by=cancel")
                 return
