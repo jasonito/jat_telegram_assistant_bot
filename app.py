@@ -198,6 +198,9 @@ FEATURE_NEWS_ENABLED = _env_flag("FEATURE_NEWS_ENABLED", NEWS_ENABLED)
 FEATURE_TRANSCRIBE_ENABLED = _env_flag("FEATURE_TRANSCRIBE_ENABLED", True)
 FEATURE_TRANSCRIBE_AUTO_URL = _env_flag("FEATURE_TRANSCRIBE_AUTO_URL", False)
 TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS = max(10, int(os.getenv("TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS", "30")))
+TRANSCRIBE_NO_PROGRESS_TIMEOUT_SECONDS = max(
+    0, int(os.getenv("TRANSCRIBE_NO_PROGRESS_TIMEOUT_SECONDS", "1200"))
+)
 FEATURE_OCR_ENABLED = _env_flag("FEATURE_OCR_ENABLED", True)
 FEATURE_OCR_CHOICE_ENABLED = _env_flag("FEATURE_OCR_CHOICE_ENABLED", False)
 OCR_CHOICE_SCOPE = (os.getenv("OCR_CHOICE_SCOPE", "private") or "private").strip().lower()
@@ -906,8 +909,13 @@ def _build_transcript_ai_summary(transcript_path: Path) -> str | None:
         "2. 補一段 2-3 句的整體結論\n\n"
         f"{clipped}"
     )
-    ai = _run_ai_chat(system_prompt, user_prompt)
-    return ai or fallback
+    ai = _normalize_text_value(_run_ai_chat(system_prompt, user_prompt))
+    if not ai:
+        return fallback
+    # Guardrail: if model output is too close to the source transcript, use fallback summary.
+    if _looks_like_transcript_dump(ai, clipped):
+        return fallback
+    return ai
 
 
 def _prepend_summary_to_transcript(transcript_path: Path, summary_text: str | list[str] | tuple[str, ...]) -> None:
@@ -977,26 +985,26 @@ def _localize_transcribe_status(status: str) -> str:
         return ""
     lower = s.lower()
     if lower.startswith("checking video info"):
-        return "進度：正在取得媒體資訊..."
+        return "正在取得媒體資訊..."
     if lower.startswith("downloading"):
-        return "進度：正在下載音訊..."
+        return "正在下載音訊..."
     if lower.startswith("preparing"):
-        return "進度：正在準備音訊..."
+        return "正在準備音訊..."
     if lower.startswith("transcribing segment"):
         m = re.search(r"transcribing segment\s+(\d+/\d+)", lower)
         if m:
-            return f"進度：正在分段轉錄（{m.group(1)}）..."
-        return "進度：正在分段轉錄..."
+            return f"正在分段轉錄（{m.group(1)}）..."
+        return "正在分段轉錄..."
     if lower.startswith("resolving media url"):
-        return "進度：正在解析媒體網址..."
+        return "正在取得媒體資訊..."
     if lower.startswith("transcribing..."):
         m = re.search(r"transcribing\.\.\.\s*(\d+)%", lower)
         if m:
-            return f"進度：正在轉錄語音（{m.group(1)}%）..."
-        return "進度：正在轉錄語音..."
+            return f"正在轉錄語音（{m.group(1)}%）..."
+        return "正在轉錄語音..."
     if lower.startswith("transcribing"):
-        return "進度：正在轉錄語音..."
-    return f"進度：{s}"
+        return "正在轉錄語音..."
+    return s
 
 
 def _build_transcribe_status_message(intro_text: str, status_text: str, title: str | None = None) -> str:
@@ -1004,6 +1012,11 @@ def _build_transcribe_status_message(intro_text: str, status_text: str, title: s
     if title:
         lines.append(f"轉錄完成：{_normalize_text_value(title)}")
     return "\n".join(x for x in lines if x)
+
+
+def _format_wait_mmss(elapsed_sec: int) -> str:
+    elapsed = max(0, int(elapsed_sec))
+    return f"{elapsed // 60:02d}:{elapsed % 60:02d}"
 
 
 async def _cancellable_to_thread(cancel_event: Event, func, *args):
@@ -1037,7 +1050,7 @@ async def _run_transcribe_job_with_progress(
             return
         loop.call_soon_threadsafe(queue.put_nowait, text)
 
-    progress_text = _build_transcribe_status_message(intro_text, "進度：處理中...")
+    progress_text = _build_transcribe_status_message(intro_text, "處理中...")
     progress_message_id = await send_message(chat_id, progress_text)
     _set_transcribe_progress_message_id(chat_id, job_id, progress_message_id)
     job = asyncio.create_task(_cancellable_to_thread(cancel_event, worker, on_status))
@@ -1045,6 +1058,9 @@ async def _run_transcribe_job_with_progress(
     last_sent_at = 0.0
     started_at = time.time()
     last_heartbeat_at = started_at
+    transcribe_zero_since: float | None = None
+    transcribe_stage_started_at: float | None = None
+    transcribe_percent_text = "--%"
     while True:
         if job.done() and queue.empty():
             break
@@ -1059,11 +1075,29 @@ async def _run_transcribe_job_with_progress(
             if (now - last_heartbeat_at) < TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS:
                 continue
             elapsed_sec = int(now - started_at)
-            heartbeat = f"進度：處理中（已等待 {elapsed_sec // 60} 分 {elapsed_sec % 60} 秒）"
+            if transcribe_stage_started_at is not None:
+                transcribe_wait = _format_wait_mmss(int(now - transcribe_stage_started_at))
+                heartbeat = f"轉錄中：{transcribe_percent_text}（已等待 {transcribe_wait}）｜仍可輸入文字"
+            else:
+                heartbeat = (
+                    f"{last_status}\n"
+                    f"（此階段已等待 {elapsed_sec // 60} 分 {elapsed_sec % 60} 秒）"
+                )
             heartbeat_text = _build_transcribe_status_message(intro_text, heartbeat)
             if progress_message_id:
                 await edit_message(chat_id, progress_message_id, heartbeat_text)
             last_heartbeat_at = now
+            if (
+                TRANSCRIBE_NO_PROGRESS_TIMEOUT_SECONDS > 0
+                and transcribe_zero_since is not None
+                and (now - transcribe_zero_since) >= TRANSCRIBE_NO_PROGRESS_TIMEOUT_SECONDS
+            ):
+                waited = int(now - transcribe_zero_since)
+                raise TimeoutError(
+                    "Transcription appears stalled at 0% "
+                    f"for {waited // 60}m {waited % 60}s. "
+                    "Please retry with a shorter clip or a smaller Whisper model."
+                )
             continue
         localized = _localize_transcribe_status(raw_status)
         now = time.time()
@@ -1073,10 +1107,28 @@ async def _run_transcribe_job_with_progress(
             continue
         if (now - last_sent_at) < 1.2:
             continue
+        ui_status = localized
+        if "正在轉錄語音" in localized:
+            if transcribe_stage_started_at is None:
+                transcribe_stage_started_at = now
+            m_pct = re.search(r"(\d+)%", localized)
+            if m_pct:
+                transcribe_percent_text = f"{m_pct.group(1)}%"
+            transcribe_wait = _format_wait_mmss(int(now - transcribe_stage_started_at))
+            ui_status = f"轉錄中：{transcribe_percent_text}（已等待 {transcribe_wait}）｜仍可輸入文字"
+            if transcribe_percent_text == "0%":
+                if transcribe_zero_since is None:
+                    transcribe_zero_since = now
+            else:
+                transcribe_zero_since = None
+        else:
+            transcribe_stage_started_at = None
+            transcribe_percent_text = "--%"
+            transcribe_zero_since = None
         if progress_message_id:
-            text = _build_transcribe_status_message(intro_text, localized)
+            text = _build_transcribe_status_message(intro_text, ui_status)
             await edit_message(chat_id, progress_message_id, text)
-        last_status = localized
+        last_status = ui_status
         last_sent_at = now
         last_heartbeat_at = now
 
@@ -1100,7 +1152,7 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
     job_id = str(uuid.uuid4())
     cancel_event = Event()
     if not _register_transcribe_job(chat_id, job_id, cancel_event):
-        await send_message(chat_id, "目前已有一個轉錄任務進行中，請先 /cancel 或等待完成。")
+        await send_message(chat_id, "已有轉錄任務進行中，請/cancel停止或等待完成")
         return True
 
     intro_text = ""
@@ -1277,7 +1329,7 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
     job_id = str(uuid.uuid4())
     cancel_event = Event()
     if not _register_transcribe_job(chat_id, job_id, cancel_event):
-        await send_message(chat_id, "目前已有一個轉錄任務進行中，請先 /cancel 或等待完成。")
+        await send_message(chat_id, "已有轉錄任務進行中，請/cancel停止或等待完成")
         return True
     intro_text = ""
     progress_msg_id: int | None = None
@@ -3306,8 +3358,20 @@ def _strip_markdown_noise(text: str) -> str:
     return text.replace("**", "").replace("__", "").replace("`", "")
 
 
+def _looks_like_transcript_dump(summary: str, transcript: str) -> bool:
+    s = _clean_plain_text(summary)
+    t = _clean_plain_text(transcript)
+    if not s or not t:
+        return False
+    if len(s) > 1200:
+        return True
+    if len(s) >= int(len(t) * 0.7):
+        return True
+    return s[:160] == t[:160]
+
+
 def _normalize_news_output(text: str) -> str:
-    insufficient = "鞈?銝雲"
+    insufficient = "資訊不足"
     if not text:
         return insufficient
 
@@ -3359,7 +3423,7 @@ def _normalize_news_output(text: str) -> str:
 
 
 def _normalize_notes_output(text: str) -> str:
-    insufficient = "鞈?銝雲"
+    insufficient = "資訊不足"
     if not text:
         return insufficient
 
@@ -3384,7 +3448,7 @@ def _normalize_notes_output(text: str) -> str:
 
 
 def _normalize_three_points_output(text: str) -> str:
-    insufficient = "鞈?銝雲"
+    insufficient = "資訊不足"
     if not text:
         return insufficient
 
@@ -3554,12 +3618,11 @@ def _summarize_news_from_urls(day: str, news_raw: str) -> str:
         "Output must be in Traditional Chinese."
     )
     user_prompt = (
-        f"隢??{day} ??摰對??渡?????暺n"
-        "?澆?閬?嚗n"
-        "- ?芾撓?箔?暺n"
-        "- 瘥? 1-2 ?功n"
-        "- 瘥??敺?銝???URL嚗????皞?券???嚗n"
-        "隢蝺券n\n"
+        f"請根據 {day} 的以下新聞內文，整理三個重點摘要。\n"
+        "要求：\n"
+        "- 每點 1-2 句，使用繁體中文。\n"
+        "- 只使用提供內容，不可杜撰。\n"
+        "- 不要輸出多餘前言或結語。\n\n"
         f"{chr(10).join(snippets)}"
     )
     out = _run_ai_chat(system_prompt, user_prompt)
@@ -3666,11 +3729,11 @@ def _extract_point_lines(text: str) -> list[str]:
 def _fallback_three_points(text: str) -> list[str]:
     clean = _clean_plain_text(text)
     if not clean:
-        return ["鞈?銝雲", "鞈?銝雲", "鞈?銝雲"]
+        return ["資訊不足", "資訊不足", "資訊不足"]
     parts = [x.strip() for x in re.split(r"[?.!????;]\s*", clean) if x.strip()]
-    points = parts[:3]
+    points = [p[:120].rstrip(" ,;:") for p in parts[:3] if p]
     while len(points) < 3:
-        points.append("鞈?銝雲")
+        points.append("資訊不足")
     return points
 
 

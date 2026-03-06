@@ -52,8 +52,9 @@ WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "0"))
 WHISPER_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "16"))
 CHECKPOINT_FLUSH_INTERVAL = int(os.getenv("TRANSCRIBE_CHECKPOINT_FLUSH_SECONDS", "30"))
 FFMPEG_LOCATION = os.getenv("FFMPEG_LOCATION", "").strip()
+YTDLP_SOCKET_TIMEOUT_SECONDS = max(5, int(os.getenv("TRANSCRIBE_YTDLP_SOCKET_TIMEOUT_SECONDS", "30")))
 
-ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".aac", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".opus"}
+ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".aac", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".opus", ".webm"}
 
 YOUTUBE_RE = re.compile(
     r"^https?://((www|m)\.)?(youtube\.com/(watch\?v=[\w-]+|shorts/[\w-]+)|youtu\.be/[\w-]+)(?:[/?#].*)?$"
@@ -97,8 +98,17 @@ def _resolve_media_tool(tool: str) -> str:
     return found or tool
 
 
+def _tool_available(tool_cmd: str) -> bool:
+    p = Path(tool_cmd)
+    if p.exists():
+        return True
+    return shutil.which(tool_cmd) is not None
+
+
 FFMPEG_BIN = _resolve_media_tool("ffmpeg")
 FFPROBE_BIN = _resolve_media_tool("ffprobe")
+FFMPEG_AVAILABLE = _tool_available(FFMPEG_BIN)
+FFPROBE_AVAILABLE = _tool_available(FFPROBE_BIN)
 
 
 def get_model():
@@ -184,7 +194,11 @@ def _clean_transcript_text(text: str) -> str:
     if not raw:
         return ""
     no_urls = re.sub(r"https?://\S+", " ", raw, flags=re.IGNORECASE)
-    units = [u.strip() for u in re.split(r"(?<=[\.\!\?。！？])\s+|\n+", no_urls) if u and u.strip()]
+    units = [
+        u.strip()
+        for u in re.split(r"(?<=[\.\!\?\u3002\uff01\uff1f])\s+|\n+", no_urls)
+        if u and u.strip()
+    ]
     if not units:
         return re.sub(r"\s+", " ", no_urls).strip()
     deduped: list[str] = []
@@ -341,6 +355,33 @@ def _is_youtube_url(url: str) -> bool:
     return False
 
 
+def _canonicalize_youtube_url(url: str) -> str:
+    """Normalize YouTube URL variants (shorts/live/youtu.be) into watch URL."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return url
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    if host == "youtu.be":
+        vid = (parsed.path or "").strip("/").split("/", 1)[0]
+        if vid:
+            return f"https://www.youtube.com/watch?v={vid}"
+        return url
+
+    if host not in {"youtube.com", "m.youtube.com"}:
+        return url
+
+    path = (parsed.path or "").rstrip("/")
+    if path.startswith("/shorts/") or path.startswith("/live/"):
+        parts = path.split("/")
+        if len(parts) >= 3 and parts[2]:
+            return f"https://www.youtube.com/watch?v={parts[2]}"
+    return url
+
+
 def classify_url(url: str) -> tuple[str | None, str | None]:
     """Return (url_type, error)."""
     if not url:
@@ -439,26 +480,46 @@ def normalize_audio(input_path: Path, temp_dir: Path, job_id: str) -> Path:
 
 
 def get_audio_duration(file_path: Path) -> float:
-    try:
-        result = subprocess.run(
-            [
-                FFPROBE_BIN,
-                "-v",
-                "quiet",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(file_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode == 0:
-            return float(result.stdout.strip())
-    except Exception:
-        pass
+    if FFPROBE_AVAILABLE:
+        try:
+            result = subprocess.run(
+                [
+                    FFPROBE_BIN,
+                    "-v",
+                    "quiet",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(file_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                return float(result.stdout.strip())
+        except Exception:
+            pass
+
+    # Fallback for environments missing ffprobe: parse ffmpeg probe output.
+    if FFMPEG_AVAILABLE:
+        try:
+            result = subprocess.run(
+                [FFMPEG_BIN, "-i", str(file_path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            meta = f"{result.stdout}\n{result.stderr}"
+            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", meta)
+            if m:
+                h = int(m.group(1))
+                mm = int(m.group(2))
+                ss = float(m.group(3))
+                return h * 3600 + mm * 60 + ss
+        except Exception:
+            pass
     return 0
 
 
@@ -525,13 +586,16 @@ def transcribe_audio(
         raise ValueError(f"Audio file is too small ({file_size} bytes).")
 
     duration = get_audio_duration(audio_path)
-    if duration <= 0.1:
+    duration_known = duration > 0.1
+    if 0 < duration <= 0.1:
         raise ValueError(f"Audio is too short ({duration:.2f} seconds).")
+    if not duration_known and on_status:
+        on_status("Warning: cannot detect duration, continuing without progress percentage.")
     _raise_if_cancelled(cancel_event)
 
     fp_path = fingerprint_path if fingerprint_path and fingerprint_path.exists() else audio_path
     fingerprint = _compute_audio_fingerprint(fp_path)
-    checkpoint = _load_checkpoint(temp_dir, fingerprint, duration)
+    checkpoint = _load_checkpoint(temp_dir, fingerprint, duration) if duration_known else None
     resume_from = 0.0
     previous_segments: list[dict] = []
     previous_text_parts: list[str] = []
@@ -543,7 +607,7 @@ def transcribe_audio(
             pct = min(99, int((resume_from / duration) * 100))
             on_status(f"Transcribing... {pct}% (resuming)")
 
-    if resume_from > 0 and (duration - resume_from) < 5.0:
+    if duration_known and resume_from > 0 and (duration - resume_from) < 5.0:
         _delete_checkpoint(temp_dir, fingerprint)
         return _clean_transcript_text(" ".join(previous_text_parts).strip())
 
@@ -581,7 +645,7 @@ def transcribe_audio(
             pct = min(99, int((seg_data["end"] / duration) * 100))
             on_status(f"Transcribing... {pct}%")
             last_status_update = now
-        if now - last_checkpoint_flush >= CHECKPOINT_FLUSH_INTERVAL:
+        if duration_known and now - last_checkpoint_flush >= CHECKPOINT_FLUSH_INTERVAL:
             _save_checkpoint(temp_dir, fingerprint, duration, accumulated_segments, source_info=source_info)
             last_checkpoint_flush = now
 
@@ -637,7 +701,7 @@ def transcribe_audio(
         _delete_checkpoint(temp_dir, fingerprint)
         return _clean_transcript_text(" ".join(previous_text_parts + new_texts).strip())
     except Exception:
-        if len(accumulated_segments) > len(previous_segments):
+        if duration_known and len(accumulated_segments) > len(previous_segments):
             _save_checkpoint(temp_dir, fingerprint, duration, accumulated_segments, source_info=source_info)
         raise
 
@@ -694,8 +758,9 @@ def _pipeline_youtube(
         _raise_if_cancelled(cancel_event)
         if on_status:
             on_status("Checking video info...")
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
+        media_url = _canonicalize_youtube_url(url)
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
+            info = ydl.extract_info(media_url, download=False)
 
         duration = int(info.get("duration", 0) or 0)
         if duration and duration > MAX_DURATION_SECONDS:
@@ -708,31 +773,46 @@ def _pipeline_youtube(
             on_status(f"Downloading '{title}'...")
         _raise_if_cancelled(cancel_event)
 
-        output_path = temp_dir / job_id
+        output_path = temp_dir / f"{job_id}.%(ext)s"
         ydl_opts = {
             "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
-            "postprocessors": [
+            "outtmpl": str(output_path),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
+            "retries": 3,
+            "fragment_retries": 3,
+        }
+        if FFMPEG_AVAILABLE:
+            ydl_opts["postprocessors"] = [
                 {
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
                     "preferredquality": "192",
                 }
-            ],
-            "outtmpl": str(output_path),
-            "quiet": True,
-            "no_warnings": True,
-            "retries": 3,
-            "fragment_retries": 3,
-        }
+            ]
         if FFMPEG_LOCATION:
             ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            ydl.download([media_url])
         _raise_if_cancelled(cancel_event)
 
-        audio_file = output_path.with_suffix(".mp3")
+        audio_file = (temp_dir / job_id).with_suffix(".mp3")
         if not audio_file.exists():
-            raise FileNotFoundError("Failed to download audio.")
+            matches = sorted(temp_dir.glob(f"{job_id}*"))
+            audio_matches = [p for p in matches if p.suffix.lower() in (ALLOWED_AUDIO_EXTENSIONS | {".webm"})]
+            if audio_matches:
+                audio_file = max(audio_matches, key=lambda p: p.stat().st_size)
+            elif (temp_dir / job_id).exists():
+                # Some yt-dlp cases can output a file without extension.
+                audio_file = temp_dir / job_id
+            else:
+                raise FileNotFoundError(
+                    "Failed to download audio. No media file found after yt-dlp download."
+                )
+        if audio_file.stat().st_size < 1024:
+            raise ValueError("Downloaded audio file is too small.")
 
         original_audio = audio_file
         normalized = normalize_audio(audio_file, temp_dir, job_id)
@@ -795,22 +875,25 @@ def _pipeline_podcast(
         else:
             if on_status:
                 on_status("Resolving media URL...")
-            output_path = temp_dir / job_id
+            output_path = temp_dir / f"{job_id}.%(ext)s"
             ydl_opts = {
                 "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
-                "postprocessors": [
+                "outtmpl": str(output_path),
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
+                "retries": 3,
+                "fragment_retries": 3,
+            }
+            if FFMPEG_AVAILABLE:
+                ydl_opts["postprocessors"] = [
                     {
                         "key": "FFmpegExtractAudio",
                         "preferredcodec": "mp3",
                         "preferredquality": "192",
                     }
-                ],
-                "outtmpl": str(output_path),
-                "quiet": True,
-                "no_warnings": True,
-                "retries": 3,
-                "fragment_retries": 3,
-            }
+                ]
             if FFMPEG_LOCATION:
                 ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
             try:
@@ -819,14 +902,16 @@ def _pipeline_podcast(
             except Exception as e:
                 raise ValueError(f"Failed to resolve/download podcast audio: {e}") from e
             _raise_if_cancelled(cancel_event)
-            candidate = output_path.with_suffix(".mp3")
+            candidate = (temp_dir / job_id).with_suffix(".mp3")
             if candidate.exists():
                 audio_file = candidate
             else:
-                matches = sorted(temp_dir.glob(f"{job_id}.*"))
+                matches = sorted(temp_dir.glob(f"{job_id}*"))
                 audio_matches = [p for p in matches if p.suffix.lower() in ALLOWED_AUDIO_EXTENSIONS]
                 if audio_matches:
                     audio_file = max(audio_matches, key=lambda p: p.stat().st_size)
+                elif (temp_dir / job_id).exists():
+                    audio_file = temp_dir / job_id
 
         if not audio_file.exists():
             raise FileNotFoundError("Failed to download audio.")
