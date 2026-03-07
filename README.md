@@ -34,7 +34,7 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 
 ### Segment B: Telegram Core
 - Purpose: Telegram token, webhook/polling mode, and network retry behavior.
-- Keys: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_GROUPS`, `TELEGRAM_LONG_POLLING`, `TELEGRAM_LOCAL_WEBHOOK_URL`.
+- Keys: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_GROUPS`, `TELEGRAM_ALLOWED_CONTROL_USERS`, `TELEGRAM_LONG_POLLING`, `TELEGRAM_LOCAL_WEBHOOK_URL`.
 - Optional tuning: `TELEGRAM_FILE_FETCH_*`, `TELEGRAM_POLL_*`.
 
 ### Segment C: Feature Flags
@@ -156,9 +156,16 @@ Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:BOT_TOKEN/
 
 ## Test
 
+Run smoke tests:
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py"
+```
+
 Private chat commands:
 
 ```text
+/whoami
 open https://google.com
 notepad
 sort downloads
@@ -171,6 +178,11 @@ sort downloads
 ```
 
 `/news` and `/transcribe` availability depends on `FEATURE_NEWS_ENABLED` and `FEATURE_TRANSCRIBE_ENABLED`.
+
+Local control white list:
+- Set `TELEGRAM_ALLOWED_CONTROL_USERS` to a comma-separated list of Telegram `user_id` and/or `username`.
+- Example: `TELEGRAM_ALLOWED_CONTROL_USERS=123456789,my_telegram_username`
+- Use `/whoami` in Telegram to see your current `user_id` and `chat_id`.
 Transcription flow: bot sends `已�??��??�` right after transcript is saved, then sends AI summary afterward (if enabled).
 
 Group logging (no reply):

@@ -15,6 +15,7 @@ import time
 import uuid
 import logging
 import traceback
+import calendar
 
 from typing import Iterator
 from urllib.parse import quote
@@ -22,6 +23,7 @@ from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -107,6 +109,9 @@ TELEGRAM_POLL_ERROR_BACKOFF_MAX_SECONDS = max(
     float(os.getenv("TELEGRAM_POLL_ERROR_BACKOFF_MAX_SECONDS", "20")),
 )
 
+TELEGRAM_UPDATE_MAX_WORKERS = max(1, int(os.getenv("TELEGRAM_UPDATE_MAX_WORKERS", "8")))
+SQLITE_BUSY_TIMEOUT_MS = max(1000, int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "15000")))
+
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "read")).resolve()
 DB_PATH = DATA_DIR / "messages.sqlite"
 NEWS_MD_DIR = DATA_DIR / "news"
@@ -120,6 +125,11 @@ ALLOWED_GROUPS = {
     g.strip()
     for g in os.getenv("TELEGRAM_ALLOWED_GROUPS", "").split(",")
     if g.strip()
+}
+ALLOWED_CONTROL_USERS = {
+    user.strip().lstrip("@").lower()
+    for user in os.getenv("TELEGRAM_ALLOWED_CONTROL_USERS", "").split(",")
+    if user.strip()
 }
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
@@ -247,6 +257,12 @@ _telegram_send_last_status = ""
 _telegram_send_last_error = ""
 _recent_update_ids: dict[int, float] = {}
 _recent_update_ids_lock = threading.Lock()
+_telegram_update_slots = threading.BoundedSemaphore(max(1, TELEGRAM_UPDATE_MAX_WORKERS * 4))
+
+_telegram_update_executor = ThreadPoolExecutor(
+    max_workers=TELEGRAM_UPDATE_MAX_WORKERS,
+    thread_name_prefix="telegram-update",
+)
 
 ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".aac", ".wav", ".flac", ".m4a", ".ogg", ".wma", ".opus"}
 URL_RE = re.compile(r"https?://[^\s<>()]+", flags=re.I)
@@ -270,6 +286,25 @@ def _normalize_text_value(value, default: str = "") -> str:
     else:
         txt = str(value).strip()
     return txt or default
+
+
+def _is_local_control_text(text: str) -> bool:
+    lower_text = (text or "").strip().lower()
+    return (
+        lower_text.startswith("open ")
+        or lower_text in {"notepad", "open notepad", "sort downloads", "help", "/help"}
+    )
+
+
+def _is_allowed_control_user(user_id: str | None, user_name: str | None) -> bool:
+    if not ALLOWED_CONTROL_USERS:
+        return False
+    candidates = set()
+    if user_id:
+        candidates.add(str(user_id).strip().lower())
+    if user_name:
+        candidates.add(str(user_name).strip().lstrip("@").lower())
+    return bool(candidates & ALLOWED_CONTROL_USERS)
 
 
 def _mark_update_seen(update_id: int | None, ttl_seconds: int = 600) -> bool:
@@ -349,6 +384,41 @@ def _load_transcription_module():
     return tx
 
 
+def _connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=max(1.0, SQLITE_BUSY_TIMEOUT_MS / 1000.0))
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _local_datetime_from_unix(ts: int | float | None) -> datetime | None:
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(ts), tz=get_local_tz())
+    except Exception:
+        return None
+
+
+def _submit_telegram_update(update: dict) -> None:
+    _telegram_update_slots.acquire()
+    try:
+        future = _telegram_update_executor.submit(_process_telegram_update_sync, update)
+    except Exception:
+        _telegram_update_slots.release()
+        raise
+    future.add_done_callback(lambda _f: _telegram_update_slots.release())
+
+
+def _process_telegram_update_sync(update: dict) -> None:
+    try:
+        asyncio.run(process_telegram_update(update))
+    except Exception as e:
+        print(f"[WARN] telegram update process error: {type(e).__name__}: {e}")
+        print(traceback.format_exc())
+
+
 def init_storage() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     NOTES_DIR.mkdir(parents=True, exist_ok=True)
@@ -359,7 +429,7 @@ def init_storage() -> None:
     TRANSCRIPTS_TMP_DIR.mkdir(parents=True, exist_ok=True)
     if FEATURE_NEWS_ENABLED:
         NEWS_MD_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -740,7 +810,7 @@ def _create_ocr_choice_job(
 ) -> str:
     now = datetime.now()
     expires = now + timedelta(seconds=max(5, OCR_CHOICE_TIMEOUT_SECONDS))
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute(
             """
             INSERT INTO ocr_pending_choices
@@ -766,7 +836,7 @@ def _create_ocr_choice_job(
 
 
 def _get_ocr_choice_job(job_id: str) -> tuple | None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         return conn.execute(
             """
             SELECT job_id, chat_id, prompt_message_id, image_path, source_msg_id,
@@ -779,7 +849,7 @@ def _get_ocr_choice_job(job_id: str) -> tuple | None:
 
 
 def _update_ocr_choice_job_status(job_id: str, status: str, ocr_done: int = 0, ocr_md_saved: int = 0) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute(
             """
             UPDATE ocr_pending_choices
@@ -793,7 +863,7 @@ def _update_ocr_choice_job_status(job_id: str, status: str, ocr_done: int = 0, o
 
 def _list_expired_ocr_choice_jobs(now_dt: datetime | None = None) -> list[tuple]:
     now = (now_dt or datetime.now()).isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         return conn.execute(
             """
             SELECT job_id, chat_id, prompt_message_id, image_path, caption, message_ts
@@ -1249,11 +1319,14 @@ def _extract_audio_attachment(message: dict) -> tuple[str, str] | None:
 
 def _download_telegram_file(file_id: str, dest_path: Path) -> None:
     file_url, _file_path = telegram_get_file_info(file_id)
-    resp = requests.get(file_url, timeout=300)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Telegram file download failed: {resp.status_code}")
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    dest_path.write_bytes(resp.content)
+    with requests.get(file_url, stream=True, timeout=(TELEGRAM_FILE_FETCH_CONNECT_TIMEOUT, 300)) as resp:
+        if resp.status_code != 200:
+            raise RuntimeError(f"Telegram file download failed: {resp.status_code}")
+        with dest_path.open("wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
 
 
 async def handle_transcribe_text_command(chat_id: int, text: str, message_ts: datetime | None = None) -> bool:
@@ -1411,7 +1484,7 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
     return True
 
 
-def handle_command(text: str) -> str:
+def handle_command(text: str, user_id: str | None = None, user_name: str | None = None) -> str:
     text = text.strip()
     text_lower = text.lower()
 
@@ -1442,6 +1515,9 @@ def handle_command(text: str) -> str:
     if text_lower.startswith("/status"):
         return build_status_report()
 
+    if text_lower.startswith("/whoami"):
+        return "請在 Telegram 對話中使用 /whoami。"
+
     if text_lower.startswith("/notion_test"):
         return "請在私訊中使用 /notion_test。"
 
@@ -1461,6 +1537,8 @@ def handle_command(text: str) -> str:
         return "用法：/news latest | /news search <keywords> | /news sources | /news help"
 
     if text_lower.startswith("open "):
+        if not _is_allowed_control_user(user_id, user_name):
+            return "未授權使用本機控制指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"
         url = text[5:].strip()
         if not re.match(r"^https?://", url, re.I):
             url = "https://" + url
@@ -1468,10 +1546,14 @@ def handle_command(text: str) -> str:
         return f"Opened: {url}"
 
     if text_lower in {"notepad", "open notepad"}:
+        if not _is_allowed_control_user(user_id, user_name):
+            return "未授權使用本機控制指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"
         open_notepad()
         return "Opened Notepad."
 
     if text_lower == "sort downloads":
+        if not _is_allowed_control_user(user_id, user_name):
+            return "未授權使用本機控制指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"
         return sort_downloads()
 
     if text_lower in {"help", "/help"}:
@@ -1479,6 +1561,7 @@ def handle_command(text: str) -> str:
             "open <url>",
             "notepad",
             "sort downloads",
+            "/whoami",
             "/status",
             "/summary_notes_daily",
             "/summary_notes_weekly",
@@ -1497,7 +1580,12 @@ def handle_command(text: str) -> str:
     return "已成功紀錄"
 
 
-def route_user_text_command(text: str, chat_id: str) -> tuple[list[str], str | None, bool | None]:
+def route_user_text_command(
+    text: str,
+    chat_id: str,
+    user_id: str | None = None,
+    user_name: str | None = None,
+) -> tuple[list[str], str | None, bool | None]:
     cmd_text = (text or "").strip()
     lower = cmd_text.lower()
 
@@ -1509,7 +1597,7 @@ def route_user_text_command(text: str, chat_id: str) -> tuple[list[str], str | N
         disable_preview = True if sub == "latest" else None
         return replies, parse_mode, disable_preview
 
-    reply = handle_command(cmd_text)
+    reply = handle_command(cmd_text, user_id=user_id, user_name=user_name)
     parse_mode = None
     disable_preview = None
     if lower.startswith("/summary_notes_daily") or lower.startswith("/summary_notes_weekly"):
@@ -1534,7 +1622,7 @@ def store_message(
     message_ts: datetime,
 ) -> None:
     received_ts = datetime.now().isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute(
             """
             INSERT INTO messages
@@ -1805,7 +1893,7 @@ def compute_file_fingerprint(path: Path) -> str:
 
 
 def get_sync_state(provider: str, local_path: str) -> str | None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         row = conn.execute(
             """
             SELECT fingerprint
@@ -1818,7 +1906,7 @@ def get_sync_state(provider: str, local_path: str) -> str | None:
 
 
 def upsert_sync_state(provider: str, local_path: str, fingerprint: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute(
             """
             INSERT INTO sync_state(provider, local_path, fingerprint, last_synced_at)
@@ -2783,7 +2871,7 @@ def store_note(
     bucket: str,
 ) -> None:
     received_ts = datetime.now().isoformat(timespec="seconds")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         conn.execute(
             """
             INSERT INTO notes
@@ -2812,7 +2900,7 @@ def search_notes(keyword: str, channel_id: str | None, limit: int = 8) -> list[t
     if channel_id:
         where += " AND channel_id = ?"
         params.append(channel_id)
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         rows = conn.execute(
             f"""
             SELECT platform, channel_id, user_name, text, received_ts, bucket, meeting_id
@@ -2854,7 +2942,7 @@ def search_messages(keyword: str, limit: int = 10, day: str | None = None) -> li
     if day:
         where += " AND received_ts LIKE ?"
         params.append(f"{day}%")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         rows = conn.execute(
             f"""
             SELECT platform, chat_title, user_name, text, received_ts
@@ -2869,7 +2957,7 @@ def search_messages(keyword: str, limit: int = 10, day: str | None = None) -> li
 
 
 def summarize_day(day: str) -> tuple[int, dict, list[tuple]]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         total = conn.execute(
             """
             SELECT COUNT(*)
@@ -4547,7 +4635,7 @@ def _summarize_single_news_item(
 
 def build_news_digest(day: str) -> list[str]:
     day_compact = day.replace("-", "")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         clusters = conn.execute(
             """
             SELECT id, cluster_seq, canonical_title, canonical_url, canonical_source,
@@ -4630,7 +4718,7 @@ def build_news_digest_recent(end_day: str, days: int = 3) -> list[str]:
     start_dt = (end_dt - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
     end_bound = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         rows = conn.execute(
             """
             SELECT id, cluster_seq, canonical_title, canonical_url, canonical_source,
@@ -4900,7 +4988,7 @@ def parse_entry_datetime(entry) -> datetime | None:
     dt_struct = entry.get("published_parsed") or entry.get("updated_parsed")
     if not dt_struct:
         return None
-    ts = time.mktime(dt_struct)
+    ts = calendar.timegm(dt_struct)
     return datetime.fromtimestamp(ts, tz=get_local_tz())
 
 
@@ -5064,7 +5152,7 @@ def fetch_and_store_news() -> set[str]:
     now = datetime.now(tz=get_local_tz())
     cutoff_dt = now - timedelta(hours=12)
     cutoff_iso = cutoff_dt.isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         recent_rows = conn.execute(
             """
             SELECT cluster_id, title_norm
@@ -5139,7 +5227,7 @@ def yaml_escape(text: str | None) -> str:
 
 
 def write_news_markdown_for_date(cluster_date: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         clusters = conn.execute(
             """
             SELECT id, cluster_seq, canonical_title, canonical_url, canonical_source,
@@ -5195,7 +5283,7 @@ def write_news_markdown_for_date(cluster_date: str) -> None:
 
 
 def upsert_news_subscription(chat_id: str, enabled: bool) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         row = conn.execute(
             "SELECT chat_id FROM news_subscriptions WHERE chat_id = ?",
             (chat_id,),
@@ -5219,7 +5307,7 @@ def upsert_news_subscription(chat_id: str, enabled: bool) -> None:
 def get_latest_clusters(limit: int) -> list[tuple]:
     now = datetime.now(tz=get_local_tz())
     cutoff_iso = (now - timedelta(hours=12)).isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         rows = conn.execute(
             """
             SELECT id, canonical_title, canonical_url, canonical_source, canonical_published_at,
@@ -5238,7 +5326,7 @@ def search_clusters(keyword: str, limit: int) -> list[tuple]:
     kw = f"%{keyword}%"
     now = datetime.now(tz=get_local_tz())
     cutoff_iso = (now - timedelta(hours=12)).isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         rows = conn.execute(
             """
             SELECT DISTINCT c.id, c.canonical_title, c.canonical_url, c.canonical_source,
@@ -5292,7 +5380,7 @@ def handle_news_command(text: str, chat_id: str) -> list[str]:
         fetch_and_store_news()
         now = datetime.now(tz=get_local_tz())
         cutoff_iso = (now - timedelta(hours=12)).isoformat()
-        with sqlite3.connect(DB_PATH) as conn:
+        with _connect_db() as conn:
             rows = conn.execute(
                 """
                 SELECT source, COUNT(*) AS cnt
@@ -5440,7 +5528,7 @@ def build_status_report() -> str:
 
     if FEATURE_NEWS_ENABLED:
         try:
-            with sqlite3.connect(DB_PATH) as conn:
+            with _connect_db() as conn:
                 row = conn.execute(
                     """
                     SELECT COUNT(*)
@@ -5498,7 +5586,7 @@ def build_status_report() -> str:
 def push_news_to_subscribers() -> None:
     if not FEATURE_NEWS_ENABLED or not NEWS_PUSH_ENABLED:
         return
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         subs = conn.execute(
             "SELECT chat_id, enabled, last_sent_at FROM news_subscriptions WHERE enabled = 1"
         ).fetchall()
@@ -5518,7 +5606,7 @@ def push_news_to_subscribers() -> None:
                     effective_last = cutoff_iso
             except Exception:
                 effective_last = cutoff_iso
-        with sqlite3.connect(DB_PATH) as conn:
+        with _connect_db() as conn:
             if effective_last:
                 rows = conn.execute(
                     """
@@ -5572,7 +5660,7 @@ def _mark_weekly_push_sent(provider_key: str, key: str) -> None:
 def _list_recent_telegram_chats_for_weekly_push(limit: int) -> list[str]:
     now = datetime.now(tz=get_local_tz())
     cutoff_iso = (now - timedelta(days=WEEKLY_REPORT_PUSH_LOOKBACK_DAYS)).isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect_db() as conn:
         rows = conn.execute(
             """
             SELECT chat_id, MAX(received_ts) AS last_seen
@@ -5992,11 +6080,7 @@ def telegram_polling_loop() -> None:
                 # Mark update as seen immediately so /status reflects the latest received update.
                 _telegram_poll_last_update_at = time.time()
                 try:
-                    t = threading.Thread(
-                        target=lambda u=update: asyncio.run(process_telegram_update(u)),
-                        daemon=True,
-                    )
-                    t.start()
+                    _submit_telegram_update(update)
                 except Exception as e:
                     print(f"[WARN] telegram update process error: {e}")
                     print(traceback.format_exc())
@@ -6047,7 +6131,7 @@ async def process_telegram_update(update: dict) -> None:
 
     msg_ts = None
     if message.get("date"):
-        msg_ts = datetime.fromtimestamp(message.get("date"))
+        msg_ts = _local_datetime_from_unix(message.get("date"))
 
     is_group = chat_type in {"group", "supergroup"}
     is_private = chat_type == "private"
@@ -6063,10 +6147,7 @@ async def process_telegram_update(update: dict) -> None:
 
     cmd_text = text.strip()
     lower_text = cmd_text.lower()
-    is_local_control_text = (
-        lower_text.startswith("open ")
-        or lower_text in {"notepad", "open notepad", "sort downloads", "help", "/help"}
-    )
+    is_local_control_text = _is_local_control_text(cmd_text)
     is_slash_command = cmd_text.startswith("/")
     should_store_text = bool(cmd_text) and not is_slash_command and not is_local_control_text
 
@@ -6082,6 +6163,15 @@ async def process_telegram_update(update: dict) -> None:
         handled = await handle_transcribe_audio_message(chat_id, message, message_ts=msg_ts)
         if handled:
             return
+
+    if chat_id and cmd_text.lower().startswith("/whoami") and not has_image and not has_audio_attachment:
+        details = [f"user_id={user_id or 'unknown'}"]
+        if sender.get("username"):
+            details.append(f"username=@{sender.get('username')}")
+        details.append(f"chat_id={chat_id}")
+        await send_message(chat_id, "\n".join(details))
+        print(f"[ROUTE][HANDLED] chat_id={chat_id} by=whoami")
+        return
 
     if is_private and chat_id and text and not has_image and not has_audio_attachment:
         try:
@@ -6115,7 +6205,12 @@ async def process_telegram_update(update: dict) -> None:
                     print(f"[WARN] ack send failed chat_id={chat_id}")
                 return
 
-            replies, parse_mode, disable_preview = route_user_text_command(cmd_text, str(chat_id))
+            replies, parse_mode, disable_preview = route_user_text_command(
+                cmd_text,
+                str(chat_id),
+                user_id=user_id,
+                user_name=sender.get("username") or user_name,
+            )
             for reply in replies:
                 for chunk in _chunk_text_for_telegram(reply):
                     sent_id = await send_message(
@@ -6135,7 +6230,12 @@ async def process_telegram_update(update: dict) -> None:
     if is_group and chat_id and text and is_slash_command and not has_image and not has_audio_attachment:
         try:
             print(f"[ROUTE][GROUP_CMD] chat_id={chat_id} text={cmd_text[:180]!r}")
-            replies, parse_mode, disable_preview = route_user_text_command(cmd_text, str(chat_id))
+            replies, parse_mode, disable_preview = route_user_text_command(
+                cmd_text,
+                str(chat_id),
+                user_id=user_id,
+                user_name=sender.get("username") or user_name,
+            )
             for reply in replies:
                 for chunk in _chunk_text_for_telegram(reply):
                     sent_id = await send_message(
@@ -6274,7 +6374,7 @@ def start_slack_socket_mode() -> None:
         msg_ts = None
         if command.get("command_ts"):
             try:
-                msg_ts = datetime.fromtimestamp(float(command.get("command_ts")))
+                msg_ts = _local_datetime_from_unix(command.get("command_ts"))
             except Exception:
                 msg_ts = None
         ok, msg = process_slack_note(channel_id, user_id, user_name, text, msg_ts)
@@ -6352,7 +6452,7 @@ def start_slack_socket_mode() -> None:
         msg_ts = None
         if event.get("ts"):
             try:
-                msg_ts = datetime.fromtimestamp(float(event.get("ts")))
+                msg_ts = _local_datetime_from_unix(event.get("ts"))
             except Exception:
                 msg_ts = None
 
