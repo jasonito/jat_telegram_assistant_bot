@@ -1,0 +1,79 @@
+# Project Memory
+
+## Purpose
+
+This file is a running memory for changes that are easy to break later.
+Use it to record:
+
+- pitfalls discovered during fixes
+- assumptions that must stay true
+- technical components touched by a change
+- validation steps that caught regressions
+
+Keep entries short and concrete. Prefer facts over narrative.
+
+## Update Rules
+
+Add a new entry when a change:
+
+- modifies message routing, background workers, or persistence
+- changes time handling, filesystem layout, or sync behavior
+- introduces a new env var, feature gate, or external integration
+- fixes a bug that could plausibly be reintroduced
+
+For each entry, capture:
+
+- date
+- change summary
+- files touched
+- technologies involved
+- pitfalls
+- validation
+
+## Known Pitfalls
+
+### Runtime and Concurrency
+
+- Telegram long polling must not spawn unbounded threads per update. Keep bounded worker execution and backpressure in place.
+- SQLite is used from multiple execution paths. New DB writes should go through the shared connection helper so `busy_timeout`, `WAL`, and `foreign_keys` remain enabled.
+- Startup side effects belong in FastAPI startup hooks, not module import paths, to avoid duplicate workers and accidental execution during tests.
+
+### Time and Data Boundaries
+
+- Telegram and Slack timestamps must be converted to timezone-aware local datetimes before generating note dates or Notion log dates.
+- RSS/pubDate-style values that are already UTC should use UTC-safe conversion. Do not use `time.mktime(...)` for UTC tuples.
+
+### File Handling
+
+- Telegram media downloads should stream to disk. Avoid loading full audio files into memory with `.content`.
+- Runtime artifacts under `read/`, `logs/`, and local `.env*` files are operational data and should stay out of commits unless there is an explicit reason.
+
+### Access Control
+
+- Local machine control commands (`open`, `notepad`, `sort downloads`) must stay behind `TELEGRAM_ALLOWED_CONTROL_USERS`.
+- `/whoami` exists specifically to make whitelist setup maintainable. Do not remove it unless there is a replacement admin path.
+
+## Change Log
+
+### 2026-03-09 - Reliability and control hardening
+
+- Summary: reduced Telegram processing contention, fixed timestamp handling, streamed file downloads, and added control-command allowlisting.
+- Files: `app.py`, `tests/test_smoke.py`, `README.md`, `.env*.example`
+- Technologies: FastAPI startup lifecycle, `ThreadPoolExecutor`, `threading.BoundedSemaphore`, SQLite WAL, Telegram Bot API file fetch, Slack event timestamps, RSS date parsing, Python `zoneinfo`, `unittest`
+- Pitfalls:
+  - Replacing bounded execution with per-update threads will reintroduce resource spikes and SQLite lock errors.
+  - Using naive datetimes for message timestamps will misfile notes by date on hosts outside the intended timezone.
+  - Reading Telegram downloads with `requests.get(...).content` will spike memory on large audio uploads.
+  - Local control commands are a host-level capability; they must always remain allowlisted.
+- Validation:
+  - `python -m unittest discover -s tests -p "test_*.py"`
+  - `python -m py_compile app.py app_main.py app_chitchat.py transcription.py tests\\test_smoke.py`
+
+## Recommended Workflow
+
+Before making non-trivial changes:
+
+1. Read this file.
+2. Check whether the change touches routing, persistence, timestamp handling, or local control commands.
+3. Update or add smoke tests if one of the known pitfalls is in scope.
+4. Add a new entry after the change lands.

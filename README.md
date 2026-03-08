@@ -18,6 +18,7 @@ Notes:
 - Preflight checklist: `docs/PREFLIGHT_CHECKLIST.md`
 - systemd template: `deploy/jat-bot.service.example`
 - Server operation runbook: `docs/SERVER_RUNBOOK.md`
+- Project memory / recurring pitfalls: `docs/PROJECT_MEMORY.md`
 
 ## Env
 
