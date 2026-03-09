@@ -55,6 +55,21 @@ For each entry, capture:
 
 ## Change Log
 
+### 2026-03-09 - Weekly digest pipeline and transcription chunking
+
+- Summary: weekly note/report generation now pre-syncs Dropbox notes for the requested date window, preserves larger raw transcript sections for AI summarization, and transcription now chunks long audio with `small` as the default Whisper model.
+- Files: `app.py`, `transcription.py`, `tests/test_smoke.py`, `.env.main`, `README.md`
+- Technologies: Dropbox API sync, Markdown note ingestion, AI summarization prompt assembly, Faster Whisper, ffmpeg-based audio chunking, Python `unittest`
+- Pitfalls:
+  - Do not reintroduce `raw[:AI_SUMMARY_MAX_CHARS]` as the main weekly note input path; it biases the summary toward the first long transcript block.
+  - `/summary_notes_weekly` is AI-backed in current behavior. Treat it as an AI feature, not a pure local rule-based formatter.
+  - Weekly note/report generation depends on pre-syncing the full requested Dropbox note date range, not just locally existing files.
+  - Chunking in `transcribe_audio()` must preserve absolute timestamps when merging chunk results back together.
+  - Current transcription runtime is CPU-oriented by default; increasing the model size without checking host capacity will regress turnaround time quickly.
+- Validation:
+  - `python -m py_compile app.py transcription.py tests\\test_smoke.py`
+  - `python -m unittest tests.test_smoke`
+
 ### 2026-03-09 - Reliability and control hardening
 
 - Summary: reduced Telegram processing contention, fixed timestamp handling, streamed file downloads, and added control-command allowlisting.

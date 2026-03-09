@@ -46,6 +46,9 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 ### Segment D: Transcription Engine
 - Purpose: control Whisper quality/speed/memory and chunking.
 - Keys: `TRANSCRIBE_MAX_DURATION_SECONDS`, `TRANSCRIBE_CHUNK_MINUTES`, `TRANSCRIBE_CHECKPOINT_FLUSH_SECONDS`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`, `WHISPER_BEAM_SIZE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_CPU_THREADS`, `WHISPER_BATCH_SIZE`, `FFMPEG_LOCATION`, `TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS`.
+- Current default: `WHISPER_MODEL=small`.
+- Long audio is now chunked inside `transcribe_audio()` before Whisper runs, then merged back with original timestamps.
+- Current code path initializes Whisper on `cpu`. GPU use requires both a working CUDA stack on the host and code changes.
 
 ### Segment E: OCR Provider
 - Purpose: configure image OCR backend.
@@ -54,6 +57,7 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 ### Segment F: News / Digest
 - Purpose: collect, filter, and summarize news.
 - Keys: `NEWS_ENABLED`, `NEWS_FETCH_INTERVAL_MINUTES`, `NEWS_PUSH_ENABLED`, `NEWS_PUSH_MAX_ITEMS`, `NEWS_GNEWS_*`, `NEWS_RSS_URLS`, `NEWS_RSS_URLS_FILE`, `NEWS_URL_FETCH_*`, `NEWS_DIGEST_*`, `NOTE_DIGEST_MAX_ITEMS`.
+- Note/transcript AI input budget: `NOTE_AI_INPUT_MAX_CHARS` (current default `28000`).
 
 ### Segment G: AI Summary Providers
 - Purpose: shared AI config for digest/weekly report and transcript summary blocks.
@@ -180,6 +184,21 @@ sort downloads
 
 `/news` and `/transcribe` availability depends on `FEATURE_NEWS_ENABLED` and `FEATURE_TRANSCRIBE_ENABLED`.
 
+## Weekly Note Digest And Weekly Report
+
+- `/summary_notes_weekly` uses AI summarization when `AI_SUMMARY_ENABLED=1`.
+- Before note daily/weekly summary runs, the bot syncs Dropbox note markdown for the requested date range into local `DATA_DIR\notes\...`.
+- Weekly note AI input now prefers larger raw transcript sections over aggressively compressed extracted lines, to preserve more source material.
+- Raw URL-only lines and note metadata lines are removed before the AI call.
+- Weekly note / weekly report output rules currently aim for:
+  - dynamic topic count based on available content, up to 10 points
+  - at most 1 action item per point
+  - merged duplicate event chains
+  - same-topic bucket limits to reduce over-concentration
+  - Traditional Chinese news titles in the weekly report news block
+- Weekly report generation logs a Dropbox pre-sync step before summarization.
+- For debugging, a pre-AI weekly note input snapshot can be written under `tests\weekly_note_ai_input_YYYY-MM-DD_YYYY-MM-DD.txt`.
+
 Local control white list:
 - Set `TELEGRAM_ALLOWED_CONTROL_USERS` to a comma-separated list of Telegram `user_id` and/or `username`.
 - Example: `TELEGRAM_ALLOWED_CONTROL_USERS=123456789,my_telegram_username`
@@ -194,6 +213,64 @@ Group logging (no reply):
 Slack DM logging (no reply):
 - DMs from the configured `SLACK_USER_ID` are stored in the same SQLite/Markdown.
 - Run uvicorn, then send a DM to your bot.
+
+Transcription runtime behavior:
+- Long audio is transcribed chunk-by-chunk and reports `Transcribing segment n/m...` while running.
+- If transcription appears stuck at `0%`, the usual bottleneck is Whisper not producing its first segment yet; model size, CPU speed, chunking, and `ffmpeg/ffprobe` availability all matter.
+
+## Debug Recipes
+
+Generate a pre-AI weekly note input snapshot for inspection:
+
+```powershell
+@'
+from pathlib import Path
+import app
+
+end_day = "2026-03-09"
+days = 7
+start_day = app.shift_day(end_day, -(days - 1))
+day_to_raw = {}
+for day in app.day_range(start_day, end_day):
+    files = app._summary_files_for_day(day)
+    raw = app._load_raw_summary_files(files, clip_chars=None).strip()
+    if raw:
+        day_to_raw[day] = raw
+
+text = app._compose_note_ai_input_from_raw(day_to_raw, max_chars=app.NOTE_AI_INPUT_MAX_CHARS)
+out = Path("tests") / f"weekly_note_ai_input_{start_day}_{end_day}.txt"
+out.write_text(text, encoding="utf-8")
+print(out)
+'@ | python -
+```
+
+What this gives you:
+- the exact note/transcript text assembled before the first AI weekly note summary call
+- useful to confirm which days and which transcript sections were actually included
+
+Diagnose a transcription job that appears stuck:
+
+1. Check whether the bot is still in download / normalization / Whisper stage by watching the progress message text.
+2. If the message stays at `0%` for a long time, assume Whisper has not emitted its first segment yet.
+3. Confirm chunking is active by looking for status updates like `Transcribing segment 1/3...`.
+4. Verify media tooling:
+   - `ffmpeg -version`
+   - `ffprobe -version`
+5. Verify the active Whisper model in the env file used by the running bot:
+   - `.env.main` or `.env.chitchat`
+   - current recommended baseline is `WHISPER_MODEL=small`
+6. Restart the bot after env changes; model changes do not apply to an already-running process.
+
+Useful local checks:
+
+```powershell
+python -c "import transcription; print(transcription.get_transcribe_runtime_info())"
+```
+
+```powershell
+ffmpeg -version
+ffprobe -version
+```
 
 Image OCR and cloud sync:
 - Telegram private image uploads are saved to `DATA_DIR\\images\YYYY-MM-DD\`.

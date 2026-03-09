@@ -44,7 +44,7 @@ except Exception:
 
 MAX_DURATION_SECONDS = int(os.getenv("TRANSCRIBE_MAX_DURATION_SECONDS", "10800"))
 CHUNK_MINUTES = int(os.getenv("TRANSCRIBE_CHUNK_MINUTES", "25"))
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip() or "base"
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small").strip() or "small"
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "auto").strip() or "auto"
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8"
@@ -628,15 +628,15 @@ def transcribe_audio(
     last_status_update = time.time()
     last_checkpoint_flush = time.time()
 
-    def collect_segment(start_s: float, end_s: float, text: str) -> None:
+    def collect_segment(start_s: float, end_s: float, text: str, offset_s: float = 0.0) -> None:
         nonlocal last_status_update, last_checkpoint_flush
         seg_text = (text or "").strip()
         if not seg_text:
             return
         new_texts.append(seg_text)
         seg_data = {
-            "start": round(start_s + resume_from, 3),
-            "end": round(end_s + resume_from, 3),
+            "start": round(start_s + resume_from + offset_s, 3),
+            "end": round(end_s + resume_from + offset_s, 3),
             "text": seg_text,
         }
         accumulated_segments.append(seg_data)
@@ -652,52 +652,68 @@ def transcribe_audio(
     try:
         _raise_if_cancelled(cancel_event)
         resolved_language = _resolve_whisper_language()
-        use_batched = (
-            BatchedInferencePipeline is not None and get_batched_model() is not None and duration > CHUNK_MINUTES * 60
-        )
-        if use_batched:
-            if on_status and resume_from == 0:
-                on_status("Transcribing... 0%")
-            batched_model = get_batched_model()
-            kwargs = {
-                "beam_size": WHISPER_BEAM_SIZE,
-                "batch_size": WHISPER_BATCH_SIZE,
-                "condition_on_previous_text": False,
-                "vad_filter": True,
-                "vad_parameters": dict(min_silence_duration_ms=500),
-            }
-            if resolved_language:
-                kwargs["language"] = resolved_language
-            segments, _info = batched_model.transcribe(str(transcribe_path), **kwargs)
-            for seg in segments:
-                _raise_if_cancelled(cancel_event)
-                collect_segment(float(seg.start), float(seg.end), str(seg.text))
-        elif WhisperModel is not None:
-            if on_status and resume_from == 0:
-                on_status("Transcribing... 0%")
-            kwargs = {
-                "beam_size": WHISPER_BEAM_SIZE,
-                "condition_on_previous_text": False,
-                "vad_filter": True,
-                "vad_parameters": dict(min_silence_duration_ms=500),
-            }
-            if resolved_language:
-                kwargs["language"] = resolved_language
-            segments, _info = model.transcribe(str(transcribe_path), **kwargs)
-            for seg in segments:
-                _raise_if_cancelled(cancel_event)
-                collect_segment(float(seg.start), float(seg.end), str(seg.text))
-        else:
+        chunk_paths = split_audio(transcribe_path, temp_dir, job_id) if duration_known else [transcribe_path]
+        chunk_total = len(chunk_paths)
+        chunk_offset = 0.0
+        for idx, chunk_path in enumerate(chunk_paths, start=1):
+            _raise_if_cancelled(cancel_event)
+            chunk_duration = get_audio_duration(chunk_path)
             if on_status:
-                on_status("Transcribing...")
-            kwargs = {"beam_size": WHISPER_BEAM_SIZE}
-            if resolved_language:
-                kwargs["language"] = resolved_language
-            result = model.transcribe(str(transcribe_path), **kwargs)
-            full_text = (result.get("text") or "").strip()
-            if full_text:
-                new_texts.append(full_text)
-                accumulated_segments.append({"start": resume_from, "end": duration, "text": full_text})
+                if chunk_total > 1:
+                    on_status(f"Transcribing segment {idx}/{chunk_total}...")
+                elif idx == 1 and resume_from == 0:
+                    on_status("Transcribing... 0%")
+            use_batched = (
+                BatchedInferencePipeline is not None
+                and get_batched_model() is not None
+                and chunk_duration > CHUNK_MINUTES * 60
+            )
+            if use_batched:
+                batched_model = get_batched_model()
+                kwargs = {
+                    "beam_size": WHISPER_BEAM_SIZE,
+                    "batch_size": WHISPER_BATCH_SIZE,
+                    "condition_on_previous_text": False,
+                    "vad_filter": True,
+                    "vad_parameters": dict(min_silence_duration_ms=500),
+                }
+                if resolved_language:
+                    kwargs["language"] = resolved_language
+                segments, _info = batched_model.transcribe(str(chunk_path), **kwargs)
+                for seg in segments:
+                    _raise_if_cancelled(cancel_event)
+                    collect_segment(float(seg.start), float(seg.end), str(seg.text), offset_s=chunk_offset)
+            elif WhisperModel is not None:
+                kwargs = {
+                    "beam_size": WHISPER_BEAM_SIZE,
+                    "condition_on_previous_text": False,
+                    "vad_filter": True,
+                    "vad_parameters": dict(min_silence_duration_ms=500),
+                }
+                if resolved_language:
+                    kwargs["language"] = resolved_language
+                segments, _info = model.transcribe(str(chunk_path), **kwargs)
+                for seg in segments:
+                    _raise_if_cancelled(cancel_event)
+                    collect_segment(float(seg.start), float(seg.end), str(seg.text), offset_s=chunk_offset)
+            else:
+                if on_status and chunk_total == 1 and idx == 1 and resume_from == 0:
+                    on_status("Transcribing...")
+                kwargs = {"beam_size": WHISPER_BEAM_SIZE}
+                if resolved_language:
+                    kwargs["language"] = resolved_language
+                result = model.transcribe(str(chunk_path), **kwargs)
+                full_text = (result.get("text") or "").strip()
+                if full_text:
+                    new_texts.append(full_text)
+                    accumulated_segments.append(
+                        {
+                            "start": round(chunk_offset + resume_from, 3),
+                            "end": round(chunk_offset + resume_from + (chunk_duration if chunk_duration > 0 else 0.0), 3),
+                            "text": full_text,
+                        }
+                    )
+            chunk_offset += chunk_duration if chunk_duration > 0 else CHUNK_MINUTES * 60
         _delete_checkpoint(temp_dir, fingerprint)
         return _clean_transcript_text(" ".join(previous_text_parts + new_texts).strip())
     except Exception:

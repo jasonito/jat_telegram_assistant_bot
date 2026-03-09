@@ -16,6 +16,7 @@ import uuid
 import logging
 import traceback
 import calendar
+from contextlib import contextmanager
 
 from typing import Iterator
 from urllib.parse import quote
@@ -143,6 +144,7 @@ AI_SUMMARY_TIMEOUT_SECONDS = int(
     os.getenv("AI_SUMMARY_TIMEOUT_SECONDS", os.getenv("OPENAI_TIMEOUT_SECONDS", "20"))
 )
 AI_SUMMARY_MAX_CHARS = int(os.getenv("AI_SUMMARY_MAX_CHARS", "6000"))
+NOTE_AI_INPUT_MAX_CHARS = int(os.getenv("NOTE_AI_INPUT_MAX_CHARS", "28000"))
 AI_SUMMARY_TEMPERATURE = _env_float("AI_SUMMARY_TEMPERATURE", 0.2)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -384,12 +386,16 @@ def _load_transcription_module():
     return tx
 
 
-def _connect_db() -> sqlite3.Connection:
+@contextmanager
+def _connect_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH, timeout=max(1.0, SQLITE_BUSY_TIMEOUT_MS / 1000.0))
     conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def _local_datetime_from_unix(ts: int | float | None) -> datetime | None:
@@ -1820,12 +1826,110 @@ def _safe_transcript_relpath(root_path: str, remote_path: str) -> str:
     return "/".join(parts)
 
 
+def _safe_dropbox_relpath(root_path: str, remote_path: str) -> str:
+    root = normalize_dropbox_path(root_path).rstrip("/")
+    full = normalize_dropbox_path(remote_path)
+    rel = full[len(root) :].lstrip("/") if full.startswith(f"{root}/") else full.lstrip("/")
+    parts = [p for p in PurePosixPath(rel).parts if p not in {"", ".", ".."}]
+    return "/".join(parts)
+
+
 def _transcript_fingerprint(entry) -> str:
     rev = str(getattr(entry, "rev", "") or "")
     content_hash = str(getattr(entry, "content_hash", "") or "")
     modified = getattr(entry, "server_modified", None)
     modified_text = modified.isoformat() if modified else ""
     return f"{rev}:{content_hash}:{modified_text}"
+
+
+def _dropbox_entry_fingerprint(entry) -> str:
+    rev = str(getattr(entry, "rev", "") or "")
+    content_hash = str(getattr(entry, "content_hash", "") or "")
+    modified = getattr(entry, "server_modified", None)
+    modified_text = modified.isoformat() if modified else ""
+    size = str(getattr(entry, "size", "") or "")
+    return f"{rev}:{content_hash}:{modified_text}:{size}"
+
+
+def _day_strings_in_range(start_day: str, end_day: str) -> list[str]:
+    start_dt = datetime.strptime(start_day, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(end_day, "%Y-%m-%d").date()
+    if end_dt < start_dt:
+        start_dt, end_dt = end_dt, start_dt
+    out: list[str] = []
+    cur = start_dt
+    while cur <= end_dt:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return out
+
+
+def sync_dropbox_notes_range_to_local(start_day: str, end_day: str) -> dict[str, int]:
+    stats = {
+        "notes_remote_scanned": 0,
+        "notes_remote_downloaded": 0,
+        "notes_remote_skipped": 0,
+        "notes_remote_failed": 0,
+    }
+    if not DROPBOX_SYNC_ENABLED:
+        return stats
+
+    root = normalize_dropbox_path(DROPBOX_ROOT_PATH)
+    remote_root = f"{root}/notes".replace("//", "/")
+    wanted_days = _day_strings_in_range(start_day, end_day)
+    wanted_prefixes = {day for day in wanted_days} | {day.replace("-", "") for day in wanted_days}
+
+    try:
+        entries = _dropbox_list_folder_entries_recursive(remote_root)
+    except Exception as e:
+        print(f"[WARN] Dropbox ranged notes sync failed to list notes: {e}")
+        stats["notes_remote_failed"] += 1
+        return stats
+
+    for entry in entries:
+        remote_path = str(getattr(entry, "path_lower", "") or getattr(entry, "path_display", "") or "").strip()
+        name = str(getattr(entry, "name", "") or "").strip()
+        if not remote_path or not name:
+            continue
+        if Path(name).suffix.lower() not in {".md", ".markdown"}:
+            continue
+        basename = Path(name).name
+        if not any(basename.startswith(prefix) for prefix in wanted_prefixes):
+            continue
+
+        stats["notes_remote_scanned"] += 1
+        rel = _safe_dropbox_relpath(remote_root, remote_path)
+        if not rel:
+            stats["notes_remote_skipped"] += 1
+            continue
+        local_path = NOTES_DIR / Path(rel)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        state_key = rel.replace("\\", "/")
+        fingerprint = _dropbox_entry_fingerprint(entry)
+        last_fp = get_sync_state("dropbox_notes_remote", state_key)
+        if last_fp == fingerprint and local_path.exists():
+            stats["notes_remote_skipped"] += 1
+            continue
+        try:
+            remote_bytes = _dropbox_download_file_bytes(remote_path)
+            if remote_bytes is None:
+                stats["notes_remote_failed"] += 1
+                continue
+            remote_text = remote_bytes.decode("utf-8", errors="replace")
+            if local_path.exists():
+                local_text = local_path.read_text(encoding="utf-8")
+                merged_text = merge_markdown_content(remote_text, local_text)
+            else:
+                merged_text = remote_text.replace("\r\n", "\n")
+                if merged_text and not merged_text.endswith("\n"):
+                    merged_text += "\n"
+            local_path.write_text(merged_text, encoding="utf-8")
+            upsert_sync_state("dropbox_notes_remote", state_key, fingerprint)
+            stats["notes_remote_downloaded"] += 1
+        except Exception as e:
+            stats["notes_remote_failed"] += 1
+            print(f"[WARN] Dropbox ranged notes sync failed for {remote_path}: {e}")
+    return stats
 
 
 def sync_dropbox_transcripts_to_local(full_scan: bool = False) -> dict[str, int]:
@@ -3577,6 +3681,7 @@ def build_scoped_summary(day: str, scope: str, *, recent_days: int | None = None
             return build_news_digest_recent(day, days=days)
         return build_news_digest(day)
     if scope_norm == "note":
+        _sync_dropbox_before_weekly_report(day, days)
         if days > 1:
             return build_note_digest_recent(day, days=days)
         return build_note_digest(day)
@@ -3633,7 +3738,7 @@ def _summary_files_for_day(day: str) -> tuple[list[Path], list[Path]]:
     return notes_files, news_files
 
 
-def _load_raw_summary_files(files: list[Path]) -> str:
+def _load_raw_summary_files(files: list[Path], clip_chars: int | None = AI_SUMMARY_MAX_CHARS) -> str:
     chunks: list[str] = []
     for fp in files:
         try:
@@ -3642,7 +3747,9 @@ def _load_raw_summary_files(files: list[Path]) -> str:
             content = f"[read error] {e}"
         chunks.append(f"# file: {fp}\n{content or '[empty]'}")
     raw = "\n\n".join(chunks)
-    return raw[:AI_SUMMARY_MAX_CHARS] if len(raw) > AI_SUMMARY_MAX_CHARS else raw
+    if clip_chars and len(raw) > clip_chars:
+        return raw[:clip_chars]
+    return raw
 
 
 def _extract_news_urls(news_raw: str, limit: int = 20) -> list[str]:
@@ -3825,6 +3932,254 @@ def _fallback_three_points(text: str) -> list[str]:
     return points
 
 
+def _split_note_candidate_segments(text: str) -> list[str]:
+    clean = _clean_plain_text(text)
+    if not clean:
+        return []
+    sentence_marks = len(re.findall(r"[。！？!?；;]", clean))
+    if len(clean) <= 220 and not (len(clean) > 80 and sentence_marks >= 2):
+        return [clean]
+
+    normalized = re.sub(r"\[(\d{2}:\d{2}(?::\d{2})?)\]", r"\n[\1] ", clean)
+    normalized = re.sub(
+        r"\s+(?=(?:好啦?|那接下來|那再來|講完這個|今天第[一二三四五六七八九十\d]則|首先|另外|再來|最後|總結來說|簡單來說))",
+        "\n",
+        normalized,
+    )
+    parts = re.split(r"(?<=[。！？!?；;])\s*|\n+", normalized)
+    segments: list[str] = []
+    for part in parts:
+        part = _clean_plain_text(part)
+        if not part:
+            continue
+        if len(part) <= 240:
+            segments.append(part)
+            continue
+        chunks = re.split(r"(?<=[，,])\s+", part)
+        if len(chunks) == 1:
+            chunks = re.split(
+                r"\s+(?=(?:因為|所以|但是|不過|然後|另外|而且|如果|例如|比如說|對啊|那就是|我們就))",
+                part,
+            )
+        for chunk in chunks:
+            chunk = _clean_plain_text(chunk)
+            if chunk:
+                segments.append(chunk)
+    return segments or [clean]
+
+
+def _trim_note_intro_prefix(text: str) -> str:
+    line = _clean_plain_text(text)
+    if not line:
+        return ""
+
+    prefix_patterns = [
+        r"^(?:歡迎收看|歡迎回到|歡迎收聽)\S{0,30}",
+        r"^(?:哈囉|hello|嗨)\s*(?:大家好)?",
+        r"^(?:大家早安|大家好)",
+        r"^(?:我是主持人|主持人是|我是)\S{0,24}",
+        r"^(?:在我旁邊的是)(?:\s+\S+){0,8}",
+        r"^(?:今天要聊|這集要聊|本集要聊|今天這集|今天這一集)\S{0,24}",
+    ]
+    filler_tokens = {"哈囉", "大家好", "大家早安", "我是", "主持人", "podcast", "sky", "tony", "ester"}
+    content_markers = (
+        "市場", "股市", "油價", "原油", "通膨", "降息", "戰爭", "海峽", "供應鏈",
+        "公司", "營收", "財報", "投資", "晶片", "AI", "模型", "資料中心", "無人機",
+    )
+
+    trimmed = line
+    changed = True
+    while changed and trimmed:
+        changed = False
+        for pattern in prefix_patterns:
+            updated = re.sub(pattern, "", trimmed, count=1, flags=re.I).strip(" ，,:：-")
+            if updated != trimmed:
+                trimmed = updated
+                changed = True
+        words = trimmed.split()
+        while words and (
+            words[0] in filler_tokens
+            or words[0].lower() in filler_tokens
+            or re.fullmatch(r"(?:我是|我們是)\S{0,8}", words[0])
+        ):
+            words.pop(0)
+            changed = True
+        if words:
+            trimmed = " ".join(words).strip(" ，,:：-")
+
+    if trimmed and not any(marker in trimmed for marker in content_markers):
+        for marker in content_markers:
+            idx = trimmed.find(marker)
+            if idx > 0 and idx <= 48:
+                trimmed = trimmed[idx:]
+                break
+
+    return trimmed.strip(" ，,:：-")
+
+
+def _compose_note_ai_input(day_to_lines: dict[str, list[str]], max_chars: int = NOTE_AI_INPUT_MAX_CHARS) -> str:
+    if not day_to_lines:
+        return ""
+    max_chars = max(2000, int(max_chars or NOTE_AI_INPUT_MAX_CHARS))
+    lines_by_day = {day: list(lines or []) for day, lines in day_to_lines.items() if lines}
+    if not lines_by_day:
+        return ""
+
+    sampled_by_day: dict[str, list[str]] = {day: [] for day in lines_by_day}
+    used_keys: set[str] = set()
+
+    def _add_line(day: str, line: str) -> bool:
+        key = re.sub(r"\W+", "", _clean_plain_text(line).lower())
+        if not key or key in used_keys:
+            return False
+        used_keys.add(key)
+        sampled_by_day[day].append(line)
+        return True
+
+    # Keep a few leading lines per day to preserve the main subjects, then round-robin more lines.
+    for day, lines in lines_by_day.items():
+        for line in lines[:5]:
+            _add_line(day, line)
+
+    added = True
+    cursor = {day: min(5, len(lines)) for day, lines in lines_by_day.items()}
+    ordered_days = sorted(lines_by_day.keys())
+    while added:
+        added = False
+        for day in ordered_days:
+            lines = lines_by_day[day]
+            idx = cursor[day]
+            while idx < len(lines):
+                cursor[day] = idx + 1
+                idx += 1
+                if _add_line(day, lines[idx - 1]):
+                    added = True
+                    break
+
+    blocks: list[str] = []
+    current_len = 0
+    for day in ordered_days:
+        picked = sampled_by_day.get(day, [])
+        if not picked:
+            continue
+        block = f"date: {day}\n" + "\n".join(picked)
+        extra_len = len(block) + (2 if blocks else 0)
+        if current_len + extra_len > max_chars:
+            remaining = max_chars - current_len - len(f"date: {day}\n")
+            if remaining <= 80:
+                continue
+            partial: list[str] = []
+            partial_len = 0
+            for line in picked:
+                line_len = len(line) + 1
+                if partial_len + line_len > remaining:
+                    break
+                partial.append(line)
+                partial_len += line_len
+            if not partial:
+                continue
+            block = f"date: {day}\n" + "\n".join(partial)
+            extra_len = len(block) + (2 if blocks else 0)
+        blocks.append(block)
+        current_len += extra_len
+        if current_len >= max_chars:
+            break
+    return "\n\n".join(blocks)
+
+
+def _prepare_note_section_for_ai(text: str) -> str:
+    if not text:
+        return ""
+    kept: list[str] = []
+    for idx, raw in enumerate(text.splitlines()):
+        line = raw.rstrip()
+        if not line.strip():
+            if kept and kept[-1] != "":
+                kept.append("")
+            continue
+        clean_line = line.strip()
+        if line.startswith("# file:"):
+            continue
+        if idx == 0 and re.fullmatch(r".+\.md", line.strip(), re.I):
+            continue
+        if re.fullmatch(r"\s*-\s+\*\*(?:Source|Type|Date transcribed|Duration):\*\*\s*.*", line, re.I):
+            continue
+        if re.fullmatch(r"(?:https?://|www\.)\S+", clean_line, re.I):
+            continue
+        if re.fullmatch(r"\s*-\s*(?:https?://|www\.)\S+", clean_line, re.I):
+            continue
+        kept.append(line)
+    prepared = "\n".join(kept).strip()
+    prepared = re.sub(r"\n{3,}", "\n\n", prepared)
+    return prepared
+
+
+def _split_note_raw_sections(day_raw: str) -> list[str]:
+    if not day_raw:
+        return []
+    normalized = day_raw.replace("\r\n", "\n")
+    file_parts = re.split(r"(?m)^# file:\s+", normalized)
+    sections: list[str] = []
+    for file_part in file_parts:
+        file_part = file_part.strip()
+        if not file_part:
+            continue
+        prepared = _prepare_note_section_for_ai(file_part)
+        if not prepared:
+            continue
+        pieces = [piece.strip() for piece in re.split(r"(?m)^\s*---\s*$", prepared) if piece.strip()]
+        if pieces:
+            sections.extend(pieces)
+        else:
+            sections.append(prepared)
+    return sections
+
+
+def _compose_note_ai_input_from_raw(day_to_raw: dict[str, str], max_chars: int = NOTE_AI_INPUT_MAX_CHARS) -> str:
+    if not day_to_raw:
+        return ""
+    max_chars = max(4000, int(max_chars or NOTE_AI_INPUT_MAX_CHARS))
+    day_sections: list[tuple[str, str]] = []
+    for day in sorted(day_to_raw.keys()):
+        raw = day_to_raw.get(day) or ""
+        for section in _split_note_raw_sections(raw):
+            block = f"date: {day}\n{section}".strip()
+            if block:
+                day_sections.append((day, block))
+    if not day_sections:
+        return ""
+
+    total_len = sum(len(block) for _, block in day_sections) + max(0, len(day_sections) - 1) * 2
+    if total_len <= max_chars:
+        return "\n\n".join(block for _, block in day_sections)
+
+    n = len(day_sections)
+    quota = max(1200, max_chars // n)
+    picked: list[str] = []
+    used = 0
+    leftovers: list[tuple[str, int]] = []
+
+    for _, block in day_sections:
+        allowance = min(len(block), quota)
+        snippet = block[:allowance].rstrip()
+        picked.append(snippet)
+        used += len(snippet)
+        leftovers.append((block, allowance))
+
+    remaining = max_chars - used - max(0, len(picked) - 1) * 2
+    if remaining > 120:
+        for idx, (block, start) in enumerate(leftovers):
+            if remaining <= 0:
+                break
+            if start >= len(block):
+                continue
+            extra = block[start : min(len(block), start + remaining)]
+            picked[idx] = (picked[idx] + extra).rstrip()
+            remaining -= len(extra)
+
+    return "\n\n".join(part for part in picked if part.strip())
+
+
 def _extract_note_lines(notes_raw: str, limit: int = 80) -> list[str]:
     if not notes_raw:
         return []
@@ -3840,6 +4195,13 @@ def _extract_note_lines(notes_raw: str, limit: int = 80) -> list[str]:
         if not t:
             return True
         tl = t.lower()
+        low_signal_patterns = [
+            r"^(?:歡迎收看|歡迎回到|哈囉大家好|大家好|我是主持人|我是|在我旁邊的是)",
+            r"^(?:今天要聊|這集要聊|本集要聊|今天這集|今天這一集)",
+            r"^(?:訂閱|按讚|分享|開啟小鈴鐺|留言)",
+        ]
+        if any(re.search(pattern, t, re.I) for pattern in low_signal_patterns):
+            return True
         if re.fullmatch(r"\[\d{4}-\d{2}-\d{2}\]", t):
             return True
         if tl in {"[]", "[ ]", "test", "testing", "測試"}:
@@ -3867,6 +4229,11 @@ def _extract_note_lines(notes_raw: str, limit: int = 80) -> list[str]:
             return True
         if len(re.sub(r"\s+", "", t)) <= 2:
             return True
+        core = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", t)
+        if len(t) > 180 and len(re.findall(r"[。！？!?；;，,]", t)) <= 1:
+            return True
+        if len(core) > 80 and re.search(r"(?:我是主持人|歡迎收看|哈囉大家好)", t):
+            return True
         return False
 
     def _sanitize_note_line_for_summary(text: str) -> str:
@@ -3879,6 +4246,9 @@ def _extract_note_lines(notes_raw: str, limit: int = 80) -> list[str]:
         line = re.sub(r"^(?:title|標題|url|source)\s*[:：]\s*", "", line, flags=re.I)
         line = re.sub(r"^\[\d{2}:\d{2}(?::\d{2})?\]\s*", "", line)
         line = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", line)
+        line = re.sub(r"^[^-|]{0,80}?podcast\s*[-｜|:：]\s*", "", line, flags=re.I)
+        line = re.sub(r"^[^-|]{0,80}?財報狗\s*[-｜|:：]\s*", "", line, flags=re.I)
+        line = re.sub(r"^\s*\d+[.、)\-]\s*", "", line)
         line = re.sub(r"\s+", " ", line).strip(" -|:")
         line = re.sub(r"^[\"'「『“”]+|[\"'」』“”]+$", "", line)
         return line.strip()
@@ -3886,34 +4256,66 @@ def _extract_note_lines(notes_raw: str, limit: int = 80) -> list[str]:
     lines: list[str] = []
     seen_keys: set[str] = set()
     for raw in notes_raw.splitlines():
-        line = _clean_plain_text(raw)
-        if not line:
-            continue
-        if _is_noise_note_line(line):
-            continue
-        if line.startswith("# file:"):
-            continue
-        if line.startswith("#"):
-            continue
-        if re.match(r"^\d{4}-\d{2}-\d{2}", line):
-            continue
-        if line in {"[empty]", "[no notes files]"}:
-            continue
-        line = re.sub(r"^\s*-\s*\[[^\]]+\]\s*\([^)]*\)\s*[^|]*\|\s*[^:]+:\s*", "", line).strip()
-        line = re.sub(r"^\s*-\s*", "", line).strip()
-        line = _sanitize_note_line_for_summary(line)
-        if _is_noise_note_line(line):
-            continue
-        if line.startswith("/"):
-            continue
-        key = _note_line_key(line)
-        if not key or key in seen_keys:
-            continue
-        seen_keys.add(key)
-        lines.append(line)
+        for candidate in _split_note_candidate_segments(raw):
+            line = _clean_plain_text(candidate)
+            if not line:
+                continue
+            if _is_noise_note_line(line):
+                line = _trim_note_intro_prefix(line)
+                if not line or _is_noise_note_line(line):
+                    continue
+            if line.startswith("# file:"):
+                continue
+            if line.startswith("#"):
+                continue
+            if re.match(r"^\d{4}-\d{2}-\d{2}", line):
+                continue
+            if line in {"[empty]", "[no notes files]"}:
+                continue
+            line = re.sub(r"^\s*-\s*\[[^\]]+\]\s*\([^)]*\)\s*[^|]*\|\s*[^:]+:\s*", "", line).strip()
+            line = re.sub(r"^\s*-\s*", "", line).strip()
+            line = _sanitize_note_line_for_summary(line)
+            line = _trim_note_intro_prefix(line)
+            if _is_noise_note_line(line):
+                continue
+            if line.startswith("/"):
+                continue
+            key = _note_line_key(line)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            lines.append(line)
+            if len(lines) >= limit:
+                break
         if len(lines) >= limit:
             break
     return lines
+
+
+def _compact_note_summary_line(text: str, max_len: int = 88) -> str:
+    line = _clean_plain_text(text or "").strip()
+    if not line:
+        return ""
+    line = re.sub(r"^(?:歡迎收看|歡迎回到|哈囉大家好|大家好)\S{0,20}", "", line).strip(" ，,:：")
+    line = re.sub(r"^(?:我是主持人|主持人是|在我旁邊的是)\S{0,20}", "", line).strip(" ，,:：")
+    line = re.sub(r"^[^-|]{0,80}?podcast\s*[-｜|:：]\s*", "", line, flags=re.I)
+    line = re.sub(r"^[^-|]{0,80}?財報狗\s*[-｜|:：]\s*", "", line, flags=re.I)
+    line = re.sub(r"^\s*\d+[.、)\-]\s*", "", line)
+    clauses = [x.strip(" ，,:：") for x in re.split(r"[。！？!?；;]", line) if x.strip()]
+    if not clauses:
+        clauses = [line]
+    best = clauses[0]
+    for clause in clauses:
+        if 12 <= len(clause) <= max_len:
+            best = clause
+            break
+        if any(k in clause for k in ["市場", "成長", "風險", "需求", "供應", "策略", "競爭", "產品", "監管", "投資", "晶片", "ai", "模型"]):
+            best = clause
+            break
+    best = re.split(r"[，,]", best)[0].strip()
+    if len(best) > max_len:
+        best = best[:max_len].rstrip() + "..."
+    return best
 
 
 def _is_chitchat_profile() -> bool:
@@ -3968,6 +4370,10 @@ def _clean_note_items_for_output(note_items: list[tuple[str, list[str]]]) -> lis
         if not t:
             return True
         tl = t.lower()
+        if re.search(r"^(?:歡迎收看|歡迎回到|哈囉大家好|大家好|我是主持人|在我旁邊的是)", t, re.I):
+            return True
+        if re.search(r"(?:podcast|youtube|頻道|本集|這集)", tl) and len(t) > 32:
+            return True
         if tl in {"[]", "[ ]", "test", "testing", "測試"}:
             return True
         if tl in {"source", "source:", "url", "url:", "link", "link:", "來源", "來源:"}:
@@ -3991,6 +4397,8 @@ def _clean_note_items_for_output(note_items: list[tuple[str, list[str]]]) -> lis
             return True
         core = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", t)
         if len(core) < 4:
+            return True
+        if len(t) > 120 and len(re.findall(r"[。！？!?；;，,]", t)) <= 1:
             return True
         return False
 
@@ -4202,11 +4610,17 @@ def _estimate_note_topic_count(raw_text: str, *, max_items: int, min_items: int 
 
 def _estimate_weekly_topic_count(raw_text: str, line_count: int) -> int:
     clean_len = len(_clean_plain_text(raw_text or ""))
-    if line_count < 12 or clean_len < 1800:
+    if line_count < 8 or clean_len < 900:
+        return 2
+    if line_count < 16 or clean_len < 1800:
         return 3
-    if line_count < 36 or clean_len < 6500:
-        return 5
-    return 7
+    if line_count < 28 or clean_len < 3200:
+        return 4
+    if line_count < 42 or clean_len < 5000:
+        return 6
+    if line_count < 60 or clean_len < 7800:
+        return 8
+    return 10
 
 
 def _normalize_main_weekly_title(title: str) -> str:
@@ -4228,6 +4642,229 @@ def _extract_news_title_url_from_line(line: str) -> tuple[str, str]:
     plain = re.sub(r"^##\s*\d+\.\s*", "", text).strip()
     plain = _clean_plain_text(plain)
     return plain, ""
+
+
+def _extract_weekly_topic_keywords(text: str) -> set[str]:
+    clean = _clean_plain_text(text or "").lower()
+    clean = re.sub(r"https?://\S+", " ", clean)
+    clean = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", clean)
+    tokens: set[str] = set()
+    for token in clean.split():
+        token = token.strip()
+        if len(token) >= 3:
+            tokens.add(token)
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,24}", clean):
+        for size in range(2, min(6, len(chunk)) + 1):
+            for idx in range(0, len(chunk) - size + 1):
+                token = chunk[idx:idx + size]
+                if token not in {"本週", "重點", "摘要", "建議", "行動建議", "市場", "影響"}:
+                    tokens.add(token)
+    return tokens
+
+
+def _collapse_similar_weekly_topics(
+    note_items: list[tuple[str, list[str]]],
+    *,
+    max_items: int,
+) -> list[tuple[str, list[str]]]:
+    def _norm_compact(text: str) -> str:
+        t = _clean_plain_text(text or "").lower()
+        t = re.sub(r"\s+", "", t)
+        t = re.sub(r"[^\w\u4e00-\u9fff]", "", t)
+        return t
+
+    def _topic_text(title: str, points: list[str]) -> str:
+        merged = " ".join([title] + [p for p in points[:3] if p])
+        return _clean_plain_text(merged)
+
+    collapsed: list[tuple[str, list[str], set[str], str]] = []
+    for title, points in note_items:
+        clean_points = [p.strip() for p in points if p and p.strip()]
+        topic_text = _topic_text(title, clean_points)
+        topic_key = _norm_compact(topic_text)
+        topic_keywords = _extract_weekly_topic_keywords(topic_text)
+        merged = False
+        for idx, (existing_title, existing_points, existing_keywords, existing_key) in enumerate(collapsed):
+            shared_keywords = topic_keywords & existing_keywords
+            overlap = len(shared_keywords)
+            shorter, longer = sorted([topic_key, existing_key], key=len)
+            near_same = False
+            if shorter and longer:
+                near_same = shorter == longer
+                if not near_same and len(shorter) >= 10 and shorter in longer:
+                    near_same = True
+                if not near_same and fuzz.token_set_ratio(topic_key, existing_key) >= 88:
+                    near_same = True
+            shares_salient_keyword = any(len(token) >= 4 for token in shared_keywords)
+            if not near_same and not shares_salient_keyword:
+                continue
+
+            merged_points = existing_points[:]
+            for candidate in clean_points:
+                candidate_key = _norm_compact(candidate)
+                if candidate_key and any(fuzz.token_set_ratio(candidate_key, _norm_compact(p)) >= 90 for p in merged_points):
+                    continue
+                merged_points.append(candidate)
+            collapsed[idx] = (
+                existing_title if len(_norm_compact(existing_title)) >= len(_norm_compact(title)) else title,
+                merged_points[:5],
+                existing_keywords | topic_keywords,
+                existing_key if len(existing_key) >= len(topic_key) else topic_key,
+            )
+            merged = True
+            break
+        if not merged:
+            collapsed.append((title, clean_points[:5], topic_keywords, topic_key))
+        if len(collapsed) >= max_items and len(note_items) <= max_items:
+            break
+    return [(title, points) for title, points, _, _ in collapsed[:max_items]]
+
+
+def _classify_weekly_topic_bucket(title: str, points: list[str]) -> str:
+    text = _clean_plain_text(" ".join([title] + [p for p in points[:3] if p])).lower()
+    keyword_groups = [
+        (
+            "geopolitics_macro",
+            [
+                "地緣政治", "中東", "戰爭", "衝突", "制裁", "原油", "油價", "通膨", "央行",
+                "利率", "關稅", "匯率", "宏觀", "景氣", "經濟",
+            ],
+        ),
+        (
+            "ai_software",
+            [
+                "ai", "llm", "agent", "模型", "生成式", "openai", "anthropic", "grok", "gemini",
+                "copilot", "自動化", "軟體", "saas",
+            ],
+        ),
+        (
+            "semis_hardware",
+            [
+                "晶片", "半導體", "gpu", "cpu", "伺服器", "記憶體", "硬體", "nvidia", "amd",
+                "intel", "台積電", "三星", "手機", "裝置",
+            ],
+        ),
+        (
+            "capital_company",
+            [
+                "ipo", "募資", "估值", "財報", "市場", "股價", "投資", "創投", "併購", "公司",
+                "企業", "jio",
+            ],
+        ),
+        (
+            "security_policy",
+            [
+                "資安", "駭客", "隱私", "監管", "法規", "政策", "政府", "國會", "compliance",
+                "huawei", "spyware",
+            ],
+        ),
+    ]
+    best_bucket = "general"
+    best_score = 0
+    for bucket, keywords in keyword_groups:
+        score = sum(1 for keyword in keywords if keyword in text)
+        if score > best_score:
+            best_bucket = bucket
+            best_score = score
+    return best_bucket
+
+
+def _limit_weekly_topic_bucket_diversity(
+    note_items: list[tuple[str, list[str]]],
+    *,
+    max_items: int,
+    per_bucket_limit: int = 2,
+) -> list[tuple[str, list[str]]]:
+    limited: list[tuple[str, list[str]]] = []
+    bucket_counts: dict[str, int] = {}
+
+    for item in note_items:
+        bucket = _classify_weekly_topic_bucket(item[0], item[1])
+        count = bucket_counts.get(bucket, 0)
+        if count < per_bucket_limit:
+            limited.append(item)
+            bucket_counts[bucket] = count + 1
+
+    return limited[:max_items]
+
+
+def _translate_news_titles_to_zh(titles: list[str]) -> dict[str, str]:
+    def _rule_based_title_translation(title: str) -> str:
+        t = _clean_plain_text(title or "").strip()
+        if not t:
+            return ""
+        replacements = [
+            ("Why the AI Boom Will Make", "為何 AI 熱潮將使"),
+            ("More Expensive", "更昂貴"),
+            ("Cars and Electronics", "汽車與電子產品"),
+            ("Phones", "手機"),
+            ("X probes", "X 正在調查"),
+            ("offensive posts", "冒犯性貼文"),
+            ("chatbot", "聊天機器人"),
+            ("Sky News reports", "Sky News 報導"),
+            ("Reuters", "路透"),
+            ("Unveils", "推出"),
+            ("Marketplace", "市集"),
+            ("for AI Software", "AI 軟體市集"),
+            ("Offer Golf, Free Steaks to Lure Workers", "以高爾夫與免費牛排吸引工人"),
+            ("Record India IPO", "印度創紀錄 IPO"),
+            ("Delayed by Regulatory Limbo", "因監管僵局延後"),
+            ("Smart Economy", "智慧經濟"),
+            ("Push Spurs Hunt for New Stock Winners", "政策推動市場尋找新贏家"),
+            ("Is a Privacy-First Powerhouse", "主打隱私優先與高效能"),
+            ("Hackers Pose as", "駭客冒充"),
+            ("to Sneak Spyware Onto", "以植入間諜軟體到"),
+            ("Phones", "手機"),
+            ("Lawmakers Urge US Agencies to Rein In", "議員敦促美國機構收緊對"),
+            ("American Unit", "美國子公司"),
+            ("Can the Tennis Channel Capitalize?", "網球頻道能否把握商機？"),
+            ("Tennis Is Having a Moment.", "網球熱潮正在升溫。"),
+        ]
+        proper_nouns = [
+            ("Anthropic", "Anthropic"),
+            ("Amazon-Inspired", "類 Amazon"),
+            ("Samsung", "三星"),
+            ("Galaxy S26 Ultra", "Galaxy S26 Ultra"),
+            ("Huawei", "華為"),
+            ("Israelis", "以色列民眾"),
+            ("IDF", "以色列國防軍"),
+            ("Jio", "Jio"),
+            ("China", "中國"),
+            ("AI", "AI"),
+            ("xAI", "xAI"),
+            ("Grok", "Grok"),
+        ]
+        for src, dst in proper_nouns + replacements:
+            t = re.sub(re.escape(src), dst, t, flags=re.I)
+        t = re.sub(r"\s+", " ", t).strip(" -|:")
+        return t
+
+    clean_titles = [(_clean_plain_text(t or "").strip()) for t in titles]
+    clean_titles = [t for t in clean_titles if t]
+    if not clean_titles:
+        return {}
+    if not AI_SUMMARY_ENABLED:
+        return {title: _rule_based_title_translation(title) or title for title in clean_titles}
+    numbered = "\n".join(f"{idx}. {title}" for idx, title in enumerate(clean_titles, start=1))
+    system_prompt = "Translate news headlines into Traditional Chinese. Keep facts unchanged."
+    user_prompt = (
+        "請將以下新聞標題翻譯成繁體中文。\n"
+        "要求：\n"
+        "1) 僅翻譯，不補充評論。\n"
+        "2) 保留公司、人名、產品名的常見譯名；若無常見譯名可保留英文。\n"
+        "3) 每行格式固定為「編號. 翻譯後標題」。\n\n"
+        f"{numbered}"
+    )
+    out = _run_ai_chat(system_prompt, user_prompt) or ""
+    translated: dict[str, str] = {}
+    for line in out.splitlines():
+        m = re.match(r"^\s*(\d+)\.\s*(.+?)\s*$", line)
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < len(clean_titles):
+            translated[clean_titles[idx]] = _clean_plain_text(m.group(2)).strip() or clean_titles[idx]
+    return {title: translated.get(title, _rule_based_title_translation(title) or title) for title in clean_titles}
 
 
 def _classify_news_title(title: str) -> str:
@@ -4274,6 +4911,8 @@ def _build_weekly_news_block(end_day: str, days: int) -> list[str]:
         cat = _classify_news_title(title)
         grouped[cat].append((title, url))
 
+    translated_titles = _translate_news_titles_to_zh([title for title, _ in items])
+
     out: list[str] = ["新聞區塊"]
     for cat in ["AI 與模型", "半導體與硬體", "政策與監管", "資本市場與公司", "其他產業動態"]:
         rows = grouped.get(cat, [])
@@ -4281,10 +4920,11 @@ def _build_weekly_news_block(end_day: str, days: int) -> list[str]:
             continue
         out.append(f"- {cat}")
         for title, url in rows[:4]:
+            display_title = translated_titles.get(title, title)
             if url:
-                out.append(f"  - [{_escape_md_link_text(title)}]({_escape_md_url(url)})")
+                out.append(f"  - [{_escape_md_link_text(display_title)}]({_escape_md_url(url)})")
             else:
-                out.append(f"  - {title}")
+                out.append(f"  - {display_title}")
     if len(out) == 1:
         out.append("- 本週無可用新聞。")
     return out
@@ -4292,7 +4932,7 @@ def _build_weekly_news_block(end_day: str, days: int) -> list[str]:
 
 def build_note_digest(day: str) -> list[str]:
     notes_files, _ = _summary_files_for_day(day)
-    notes_raw = _load_raw_summary_files(notes_files)
+    notes_raw = _load_raw_summary_files(notes_files, clip_chars=None)
     if not notes_raw:
         return [f"{day} 筆記/逐字稿摘要", "當日沒有可用筆記或逐字稿資料。"]
 
@@ -4300,7 +4940,9 @@ def build_note_digest(day: str) -> list[str]:
     tags: list[str] = []
     target_topics = _estimate_note_topic_count(notes_raw, max_items=NOTE_DIGEST_MAX_ITEMS, min_items=1)
     cleaned_lines = _extract_note_lines(notes_raw, limit=140)
-    ai_input = "\n".join(cleaned_lines) if cleaned_lines else notes_raw
+    ai_input = _compose_note_ai_input_from_raw({day: notes_raw}, max_chars=NOTE_AI_INPUT_MAX_CHARS)
+    if not ai_input:
+        ai_input = _compose_note_ai_input({day: cleaned_lines}, max_chars=NOTE_AI_INPUT_MAX_CHARS) if cleaned_lines else notes_raw[:NOTE_AI_INPUT_MAX_CHARS]
 
     if AI_SUMMARY_ENABLED:
         system_prompt = (
@@ -4367,12 +5009,14 @@ def build_note_digest_recent(end_day: str, days: int = 3) -> list[str]:
     day_list = [(start_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
 
     raw_blocks: list[str] = []
+    day_to_raw: dict[str, str] = {}
     day_to_lines: dict[str, list[str]] = {}
     for d in day_list:
         notes_files, _ = _summary_files_for_day(d)
-        day_raw = _load_raw_summary_files(notes_files)
+        day_raw = _load_raw_summary_files(notes_files, clip_chars=None)
         if day_raw:
             raw_blocks.append(f"date: {d}\n{day_raw}")
+            day_to_raw[d] = day_raw
             day_to_lines[d] = _extract_note_lines(day_raw, limit=40)
 
     is_chitchat = _is_chitchat_profile()
@@ -4384,12 +5028,9 @@ def build_note_digest_recent(end_day: str, days: int = 3) -> list[str]:
         return [header, "指定期間沒有可用筆記或逐字稿資料。"]
 
     merged_raw = "\n\n".join(raw_blocks)
-    cleaned_blocks: list[str] = []
-    for d in day_list:
-        lines = day_to_lines.get(d, [])
-        if lines:
-            cleaned_blocks.append(f"date: {d}\n" + "\n".join(lines))
-    merged_clean = "\n\n".join(cleaned_blocks) if cleaned_blocks else merged_raw
+    merged_clean = _compose_note_ai_input_from_raw(day_to_raw, max_chars=NOTE_AI_INPUT_MAX_CHARS)
+    if not merged_clean:
+        merged_clean = _compose_note_ai_input(day_to_lines, max_chars=NOTE_AI_INPUT_MAX_CHARS) if day_to_lines else merged_raw[:NOTE_AI_INPUT_MAX_CHARS]
     note_items: list[tuple[str, list[str]]] = []
     tags: list[str] = []
     line_count = sum(len(v) for v in day_to_lines.values())
@@ -4424,19 +5065,19 @@ def build_note_digest_recent(end_day: str, days: int = 3) -> list[str]:
             user_prompt = (
                 f"請根據 {start_dt.strftime('%Y-%m-%d')} 到 {end_dt.strftime('%Y-%m-%d')} 的筆記與逐字稿，輸出主線週摘要。\n"
                 "要求：\n"
-                f"1) 僅輸出 3 到 {target_topics} 個當周重點。\n"
+                f"1) 依內容量動態輸出 2 到 {target_topics} 個當周重點；內容少就少列，內容多才增加。\n"
                 "2) 每個重點都要有：\n"
                 "   - Point1：重點摘要（1-2 句）\n"
-                "   - Point2：行動建議（可立即執行）\n"
-                "   - Point3：行動建議（可選，偏研究或新專案靈感）\n"
+                "   - Point2：行動建議（僅 1 個，可立即執行）\n"
                 "3) 請使用繁體中文、正式語氣、邏輯清晰。\n"
                 "4) Title 與 Point1 不可重複表述；Point1 必須提供比 Title 更多的新資訊。\n"
-                "5) 僅使用提供內容，不可杜撰，不要輸出標籤(tags)。\n"
-                "6) 格式固定如下：\n"
+                "5) 若多段內容其實屬於同一事件、同一因果鏈或同一主題群，必須合併成同一個重點，避免拆成多點。\n"
+                "6) 優先涵蓋不同主題，避免過度集中在單一事件的延伸影響；同一類主題最多保留 2 點。\n"
+                "7) 僅使用提供內容，不可杜撰，不要輸出標籤(tags)。\n"
+                "8) 格式固定如下：\n"
                 "Title: ...\n"
                 "Point1: ...\n"
                 "Point2: ...\n"
-                "Point3: ... (optional)\n"
                 "---\n\n"
                 f"{merged_clean}"
             )
@@ -4473,30 +5114,38 @@ def build_note_digest_recent(end_day: str, days: int = 3) -> list[str]:
         if not lines:
             return [header, "沒有可用的筆記或逐字稿文字。"]
         for line in lines[:target_topics]:
-            title = re.sub(r"https?://\S+", "", line).strip()
+            summary_line = _compact_note_summary_line(line)
+            title = summary_line or re.sub(r"https?://\S+", "", line).strip()
             if len(title) > 28:
                 title = f"{title[:28].rstrip()}..."
-            sentence_parts = [x.strip() for x in re.split(r"[。！？!?]\s*", line) if x.strip()]
+            sentence_parts = [x.strip() for x in re.split(r"[。！？!?]\s*", summary_line or line) if x.strip()]
             if is_chitchat:
-                points = sentence_parts[:5] if sentence_parts else [line]
+                points = sentence_parts[:5] if sentence_parts else [summary_line or line]
                 note_items.append((title or "近期筆記", points[:5]))
             else:
-                summary = sentence_parts[0] if sentence_parts else line
+                summary = sentence_parts[0] if sentence_parts else (summary_line or line)
                 note_items.append((title or "本週重點", [summary]))
         tags = _extract_digest_tags("\n".join(lines), min_tags=5, max_tags=10)
 
-    note_items = _clean_note_items_for_output(note_items)[:target_topics]
+    note_items = _clean_note_items_for_output(note_items)
+    if not is_chitchat:
+        note_items = _collapse_similar_weekly_topics(note_items, max_items=target_topics)
+        note_items = _limit_weekly_topic_bucket_diversity(note_items, max_items=target_topics, per_bucket_limit=2)
+    note_items = note_items[:target_topics]
     if not note_items:
         return [header, "指定期間沒有可用的有效筆記內容。"]
 
-    if not is_chitchat and len(note_items) < 3:
+    if not is_chitchat and len(note_items) < min(2, target_topics):
         extras = _extract_note_lines(merged_raw, limit=40)
         for line in extras:
-            if len(note_items) >= 3:
+            if len(note_items) >= min(2, target_topics):
                 break
-            t = (line[:24].rstrip() + "...") if len(line) > 24 else line
-            note_items.append((t or "本週重點", [line]))
-        note_items = _clean_note_items_for_output(note_items)[:target_topics]
+            summary_line = _compact_note_summary_line(line) or line
+            t = (summary_line[:24].rstrip() + "...") if len(summary_line) > 24 else summary_line
+            note_items.append((t or "本週重點", [summary_line]))
+        note_items = _clean_note_items_for_output(note_items)
+        note_items = _collapse_similar_weekly_topics(note_items, max_items=target_topics)
+        note_items = _limit_weekly_topic_bucket_diversity(note_items, max_items=target_topics, per_bucket_limit=2)[:target_topics]
 
     use_bullet_points = is_chitchat
     point_label = "\u91cd\u9ede"
@@ -4546,14 +5195,11 @@ def build_note_digest_recent(end_day: str, days: int = 3) -> list[str]:
         def _strip_action_prefix(text: str) -> str:
             return re.sub(r"^(?:行動建議|建議|延伸研究)\s*[:：]\s*", "", (text or "").strip())
 
-        def _default_actions(topic: str) -> list[str]:
+        def _default_action(topic: str) -> str:
             seed = _clean_plain_text(topic).strip() or "本週主題"
             if len(seed) > 22:
                 seed = seed[:22].rstrip() + "..."
-            return [
-                f"針對「{seed}」彙整 3 個可驗證觀點，並補上來源證據。",
-                f"以「{seed}」規劃一個可於本週完成的小型實作或研究筆記。",
-            ]
+            return f"針對「{seed}」彙整 3 個可驗證觀點，並補上來源證據。"
 
         out_lines: list[str] = [header]
         for idx, (title, points) in enumerate(note_items[:target_topics], start=1):
@@ -4563,13 +5209,16 @@ def build_note_digest_recent(end_day: str, days: int = 3) -> list[str]:
             summary = _dedupe_summary_against_title(title, summary, [])
             if not summary:
                 summary = title
-            actions = [_strip_action_prefix(x) for x in valid_points[1:] if _strip_action_prefix(x)]
-            if not actions:
-                actions = _default_actions(title or summary)
+            action = ""
+            for candidate in valid_points[1:]:
+                stripped = _strip_action_prefix(candidate)
+                if stripped and not _is_near_same(summary, stripped):
+                    action = stripped
+                    break
+            if not action:
+                action = _default_action(title or summary)
             out_lines.append(f"重點{idx}：{summary}")
-            out_lines.append(f"- 行動建議：{actions[0]}")
-            if len(actions) > 1:
-                out_lines.append(f"- 行動建議：{actions[1]}")
+            out_lines.append(f"- 行動建議：{action}")
             out_lines.append("")
         out_lines.extend([""] + _build_weekly_news_block(end_day, days))
         return out_lines
@@ -4824,6 +5473,29 @@ def _weekly_report_file_path(end_day: str) -> Path:
     return WEEKLY_REPORT_DIR / filename
 
 
+def _sync_dropbox_before_weekly_report(end_day: str, days: int) -> None:
+    if not DROPBOX_SYNC_ENABLED:
+        return
+    start_day, _ = _weekly_report_window(end_day) if days >= 7 else (end_day, end_day)
+    if days > 1 and days < 7:
+        end_dt = datetime.strptime(end_day, "%Y-%m-%d").replace(tzinfo=get_local_tz())
+        start_dt = (end_dt - timedelta(days=max(0, days - 1))).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_day = start_dt.strftime("%Y-%m-%d")
+    try:
+        print(f"[INFO] Weekly report pre-sync: starting Dropbox sync for {start_day} to {end_day}")
+        run_dropbox_sync(full_scan=False)
+        note_stats = sync_dropbox_notes_range_to_local(start_day, end_day)
+        print(
+            "[INFO] Weekly report pre-sync: Dropbox sync completed "
+            f"notes_remote_scanned={note_stats.get('notes_remote_scanned', 0)} "
+            f"notes_remote_downloaded={note_stats.get('notes_remote_downloaded', 0)} "
+            f"notes_remote_skipped={note_stats.get('notes_remote_skipped', 0)} "
+            f"notes_remote_failed={note_stats.get('notes_remote_failed', 0)}"
+        )
+    except Exception as e:
+        print(f"[WARN] Weekly report Dropbox sync failed: {e}")
+
+
 def _compose_weekly_report_prompt(
     start_day: str,
     end_day: str,
@@ -4833,9 +5505,8 @@ def _compose_weekly_report_prompt(
 ) -> str:
     if APP_PROFILE == "main":
         action_block = (
-            "3) 針對每個重點提供 1-2 個具體行動建議，格式：\n"
+            "3) 針對每個重點只提供 1 個具體行動建議，格式：\n"
             "   - 行動建議：...\n"
-            "   - 延伸研究：...（可選）\n"
         )
         if not include_actions:
             action_block = ""
@@ -4843,7 +5514,7 @@ def _compose_weekly_report_prompt(
             f"請根據 {start_day} 到 {end_day} 的資料，產出主線週報。\n"
             "要求：\n"
             "1) 使用繁體中文、正式語氣、邏輯清晰。\n"
-            "2) 先列出 5-7 個當周重點，每點 2-4 句，重視自我提升、書籍重點、KOL 評論與趨勢分析。\n"
+            "2) 依資料量動態列出 2-10 個當周重點，每點 2-4 句，優先涵蓋不同主題；若多條資訊屬於同一事件或因果鏈，必須合併成同一點；同一類主題最多保留 2 點。\n"
             f"{action_block}"
             "4) 最後補上「下週優先任務」3 點（條列）。\n"
             "5) 僅使用提供內容，不可杜撰。\n\n"
