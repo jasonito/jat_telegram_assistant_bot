@@ -55,6 +55,19 @@ For each entry, capture:
 
 ## Change Log
 
+### 2026-03-10 - Telegram-manageable RSS feed registry
+
+- Summary: moved news feed management into SQLite, added Telegram `/news add|remove|enable|disable` subcommands, and changed `/news sources` to show feed ids plus enabled status for operator workflows.
+- Files: `app.py`, `docs/PROJECT_MEMORY.md`
+- Technologies: SQLite schema migration, Telegram slash-command routing, RSS feed validation with `feedparser`
+- Pitfalls:
+  - Feed management commands are restricted by `TELEGRAM_ALLOWED_CONTROL_USERS`; do not bypass that check when extending `/news` subcommands.
+  - News ingestion now prefers DB-managed feeds over built-in defaults when `NEWS_RSS_URLS` and `NEWS_RSS_URLS_FILE` are empty; changing precedence will change runtime behavior.
+  - Operators now act on feed ids from `/news sources`; keep the output stable enough that `remove/enable/disable` remain practical in Telegram chats.
+- Validation:
+  - `python -m py_compile app.py`
+  - `pytest` unavailable in current environment (`pytest` command missing and `.venv` lacks the module), so no automated test suite was run here.
+
 ### 2026-03-09 - Weekly digest pipeline and transcription chunking
 
 - Summary: weekly note/report generation now pre-syncs Dropbox notes for the requested date window, preserves larger raw transcript sections for AI summarization, and transcription now chunks long audio with `small` as the default Whisper model.

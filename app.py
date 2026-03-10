@@ -495,6 +495,19 @@ def init_storage() -> None:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS news_feeds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL UNIQUE,
+                    name TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS notes (
@@ -521,6 +534,36 @@ def init_storage() -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_news_clusters_date_seq ON news_clusters(cluster_date, cluster_seq)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_news_feeds_enabled ON news_feeds(enabled)"
+            )
+            if not NEWS_RSS_URLS_FILE and not NEWS_RSS_URLS_ENV:
+                row = conn.execute("SELECT COUNT(*) FROM news_feeds").fetchone()
+                existing_count = int(row[0]) if row else 0
+                if existing_count == 0:
+                    now_iso = datetime.now(tz=NEWS_TZ).isoformat()
+                    q = quote(NEWS_GNEWS_QUERY)
+                    gnews_url = (
+                        f"https://news.google.com/rss/search?q={q}"
+                        f"&hl={NEWS_GNEWS_HL}&gl={NEWS_GNEWS_GL}&ceid={NEWS_GNEWS_CEID}"
+                    )
+                    default_feeds = [
+                        ("Reuters Technology", "https://www.reuters.com/technology/rss"),
+                        ("Reuters(GNews)", gnews_url),
+                        ("Bloomberg Technology", "https://feeds.bloomberg.com/technology/news.rss"),
+                        ("Bloomberg AI", "https://feeds.bloomberg.com/technology/ai/news.rss"),
+                        ("SemiAnalysis", "https://semianalysis.com/feed/"),
+                        ("Nikkei Asia", "https://asia.nikkei.com/rss/feed/nar"),
+                        ("Nikkei Asia Technology", "https://asia.nikkei.com/rss/feed/technology"),
+                    ]
+                    for name, url in default_feeds:
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO news_feeds(url, name, enabled, created_by, created_at, updated_at)
+                            VALUES (?, ?, 1, ?, ?, ?)
+                            """,
+                            (url, name, "system", now_iso, now_iso),
+                        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sync_state (
@@ -1540,7 +1583,7 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
     if text_lower.startswith("/news"):
         if not FEATURE_NEWS_ENABLED:
             return "新聞功能已關閉。"
-        return "用法：/news latest | /news search <keywords> | /news sources | /news help"
+        return "用法：/news latest | /news search <keywords> | /news sources | /news add <url> | /news remove <id> | /news enable <id> | /news disable <id> | /news help"
 
     if text_lower.startswith("open "):
         if not _is_allowed_control_user(user_id, user_name):
@@ -1575,7 +1618,7 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
         if APP_PROFILE == "chitchat":
             cmds.append("/notion_test")
         if FEATURE_NEWS_ENABLED:
-            cmds.extend(["/news latest", "/summary_news_daily", "/summary_news_weekly"])
+            cmds.extend(["/news latest", "/news sources", "/summary_news_daily", "/summary_news_weekly"])
         if FEATURE_TRANSCRIBE_ENABLED:
             cmds.append("/transcribe <url>")
             cmds.append("/cancel")
@@ -1596,7 +1639,7 @@ def route_user_text_command(
     lower = cmd_text.lower()
 
     if FEATURE_NEWS_ENABLED and lower.startswith("/news"):
-        replies = handle_news_command(cmd_text, chat_id)
+        replies = handle_news_command(cmd_text, chat_id, user_id=user_id, user_name=user_name)
         tokens = cmd_text.split()
         sub = tokens[1].lower() if len(tokens) > 1 else "latest"
         parse_mode = "Markdown" if sub == "latest" else None
@@ -5609,6 +5652,35 @@ def build_gnews_url(query: str, hl: str, gl: str, ceid: str) -> str:
     return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
 
 
+def get_default_news_feeds() -> list[tuple[str, str]]:
+    gnews_url = build_gnews_url(NEWS_GNEWS_QUERY, NEWS_GNEWS_HL, NEWS_GNEWS_GL, NEWS_GNEWS_CEID)
+    return [
+        ("Reuters Technology", "https://www.reuters.com/technology/rss"),
+        ("Reuters(GNews)", gnews_url),
+        ("Bloomberg Technology", "https://feeds.bloomberg.com/technology/news.rss"),
+        ("Bloomberg AI", "https://feeds.bloomberg.com/technology/ai/news.rss"),
+        ("SemiAnalysis", "https://semianalysis.com/feed/"),
+        ("Nikkei Asia", "https://asia.nikkei.com/rss/feed/nar"),
+        ("Nikkei Asia Technology", "https://asia.nikkei.com/rss/feed/technology"),
+    ]
+
+
+def list_news_feeds() -> list[tuple[int, str, str, int]]:
+    with _connect_db() as conn:
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, COALESCE(name, ''), url, enabled
+                FROM news_feeds
+                ORDER BY enabled DESC, id ASC
+                """
+            ).fetchall()
+            conn.commit()
+            return [(int(feed_id), str(name), str(url), int(enabled)) for feed_id, name, url, enabled in rows]
+        except sqlite3.OperationalError:
+            return []
+
+
 def get_news_rss_urls() -> list[str]:
     if NEWS_RSS_URLS_FILE:
         path = Path(NEWS_RSS_URLS_FILE)
@@ -5620,16 +5692,76 @@ def get_news_rss_urls() -> list[str]:
         raw = NEWS_RSS_URLS_ENV.splitlines()
         return [u.strip() for u in raw if u.strip()]
 
-    gnews_url = build_gnews_url(NEWS_GNEWS_QUERY, NEWS_GNEWS_HL, NEWS_GNEWS_GL, NEWS_GNEWS_CEID)
-    return [
-        "https://www.reuters.com/technology/rss",
-        gnews_url,
-        "https://feeds.bloomberg.com/technology/news.rss",
-        "https://feeds.bloomberg.com/technology/ai/news.rss",
-        "https://semianalysis.com/feed/",
-        "https://asia.nikkei.com/rss/feed/nar",
-        "https://asia.nikkei.com/rss/feed/technology",
-    ]
+    db_feeds = list_news_feeds()
+    if db_feeds or FEATURE_NEWS_ENABLED:
+        return [url for _feed_id, _name, url, enabled in db_feeds if enabled]
+
+    return [url for _name, url in get_default_news_feeds()]
+
+
+def _validate_news_feed_url(url: str) -> str:
+    normalized = (url or "").strip()
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("URL must start with http:// or https://")
+    return normalized
+
+
+def add_news_feed(url: str, created_by: str, name: str | None = None) -> tuple[int, str]:
+    normalized_url = _validate_news_feed_url(url)
+    probe = feedparser.parse(normalized_url)
+    feed_title = ((getattr(probe, "feed", {}) or {}).get("title") or "").strip()
+    entry_count = len(getattr(probe, "entries", []) or [])
+    if not feed_title and entry_count == 0:
+        raise ValueError("Feed parse failed or no entries found")
+
+    display_name = (name or feed_title or normalized_url).strip()
+    now_iso = datetime.now(tz=get_local_tz()).isoformat()
+    with _connect_db() as conn:
+        existing = conn.execute(
+            "SELECT id, COALESCE(name, '') FROM news_feeds WHERE url = ?",
+            (normalized_url,),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"Feed already exists: #{existing[0]} {existing[1] or normalized_url}")
+        cur = conn.execute(
+            """
+            INSERT INTO news_feeds(url, name, enabled, created_by, created_at, updated_at)
+            VALUES (?, ?, 1, ?, ?, ?)
+            """,
+            (normalized_url, display_name, created_by, now_iso, now_iso),
+        )
+        conn.commit()
+        return int(cur.lastrowid), display_name
+
+
+def remove_news_feed(feed_id: int) -> tuple[str, str]:
+    with _connect_db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(name, ''), url FROM news_feeds WHERE id = ?",
+            (feed_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("Feed id not found")
+        conn.execute("DELETE FROM news_feeds WHERE id = ?", (feed_id,))
+        conn.commit()
+        return str(row[0]), str(row[1])
+
+
+def set_news_feed_enabled(feed_id: int, enabled: bool) -> tuple[str, str, bool]:
+    with _connect_db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(name, ''), url FROM news_feeds WHERE id = ?",
+            (feed_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("Feed id not found")
+        conn.execute(
+            "UPDATE news_feeds SET enabled = ?, updated_at = ? WHERE id = ?",
+            (1 if enabled else 0, datetime.now(tz=get_local_tz()).isoformat(), feed_id),
+        )
+        conn.commit()
+        return str(row[0]), str(row[1]), bool(enabled)
 
 
 def normalize_title(title: str) -> str:
@@ -6032,15 +6164,72 @@ def format_cluster_list(rows: list[tuple]) -> str:
     return "\n".join(lines) if lines else "No news items found."
 
 
-def handle_news_command(text: str, chat_id: str) -> list[str]:
+def handle_news_command(
+    text: str,
+    chat_id: str,
+    user_id: str | None = None,
+    user_name: str | None = None,
+) -> list[str]:
     if not FEATURE_NEWS_ENABLED:
         return ["新聞功能已關閉。"]
 
     tokens = text.strip().split()
     sub = tokens[1].lower() if len(tokens) > 1 else "latest"
     if sub == "sources":
+        rows = list_news_feeds()
+        if rows:
+            lines = ["News sources:"]
+            for feed_id, name, url, enabled in rows:
+                label = name or url
+                status = "enabled" if enabled else "disabled"
+                lines.append(f"- #{feed_id} [{status}] {label}")
+                lines.append(f"  {url}")
+            return ["\n".join(lines)]
         srcs = get_news_rss_urls()
         return ["News sources:\n" + "\n".join(srcs)]
+    if sub == "add":
+        if not _is_allowed_control_user(user_id, user_name):
+            return ["未授權使用新聞來源管理指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"]
+        raw_args = text.strip()[len(tokens[0]) + len(tokens[1]) + 2 :].strip() if len(tokens) >= 2 else ""
+        if not raw_args:
+            return ["Usage: /news add <url> | <name(optional)>"]
+        url_part, sep, name_part = raw_args.partition("|")
+        try:
+            actor = user_name or user_id or "telegram"
+            feed_id, display_name = add_news_feed(url_part.strip(), str(actor), name=name_part.strip() if sep else None)
+            return [f"已新增新聞來源 #{feed_id}: {display_name}"]
+        except ValueError as e:
+            return [f"新增失敗：{e}"]
+    if sub == "remove":
+        if not _is_allowed_control_user(user_id, user_name):
+            return ["未授權使用新聞來源管理指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"]
+        if len(tokens) < 3 or not tokens[2].isdigit():
+            return ["Usage: /news remove <feed_id>"]
+        try:
+            name, url = remove_news_feed(int(tokens[2]))
+            return [f"已刪除新聞來源 #{tokens[2]}: {name or url}"]
+        except ValueError as e:
+            return [f"刪除失敗：{e}"]
+    if sub == "enable":
+        if not _is_allowed_control_user(user_id, user_name):
+            return ["未授權使用新聞來源管理指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"]
+        if len(tokens) < 3 or not tokens[2].isdigit():
+            return ["Usage: /news enable <feed_id>"]
+        try:
+            name, url, _enabled = set_news_feed_enabled(int(tokens[2]), True)
+            return [f"已啟用新聞來源 #{tokens[2]}: {name or url}"]
+        except ValueError as e:
+            return [f"啟用失敗：{e}"]
+    if sub == "disable":
+        if not _is_allowed_control_user(user_id, user_name):
+            return ["未授權使用新聞來源管理指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"]
+        if len(tokens) < 3 or not tokens[2].isdigit():
+            return ["Usage: /news disable <feed_id>"]
+        try:
+            name, url, _enabled = set_news_feed_enabled(int(tokens[2]), False)
+            return [f"已停用新聞來源 #{tokens[2]}: {name or url}"]
+        except ValueError as e:
+            return [f"停用失敗：{e}"]
     if sub == "search":
         if len(tokens) < 3:
             return ["Usage: /news search <keywords>"]
@@ -6076,7 +6265,7 @@ def handle_news_command(text: str, chat_id: str) -> list[str]:
         return ["\n".join(build_scoped_summary(end_day, "news", recent_days=3))]
     if sub == "help":
         return [
-            "News commands: /news latest [YYYY-MM-DD], /news search <keywords>, /news sources, /news debug"
+            "News commands: /news latest [YYYY-MM-DD], /news search <keywords>, /news sources, /news add <url> | <name>, /news remove <id>, /news enable <id>, /news disable <id>, /news debug"
         ]
     return ["Unknown /news subcommand. Use /news help."]
 
@@ -6091,6 +6280,7 @@ def set_telegram_commands() -> None:
     if FEATURE_NEWS_ENABLED:
         commands.extend(
             [
+                {"command": "news", "description": "News commands and feed management"},
                 {"command": "news_latest", "description": "Latest digest (3 days)"},
                 {"command": "news_sources", "description": "List news sources"},
                 {"command": "news_debug", "description": "Debug ingestion"},
