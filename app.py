@@ -19,8 +19,11 @@ import calendar
 from contextlib import contextmanager
 
 from typing import Iterator
+from urllib.parse import parse_qsl
 from urllib.parse import quote
+from urllib.parse import urlencode
 from urllib.parse import urlparse
+from urllib.parse import urlunparse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import threading
@@ -44,22 +47,42 @@ except Exception:
 
 from slack_bolt import App as SlackApp
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from kol_digest import (
-    DEFAULT_WATCHLIST_PATH,
-    add_watchlist_entry,
-    build_facebook_source_adapter,
-    build_x_source_adapter,
-    fetch_posts_for_watchlist,
-    init_kol_digest_storage,
-    list_watchlist_entries,
-    list_posts_for_digest,
-    load_watchlist,
-    remove_watchlist_entry,
-    render_digest_markdown,
-    set_watchlist_entry_enabled,
-    sync_watchlist_to_db,
-    write_digest_file,
-)
+KOL_DIGEST_IMPORT_ERROR: Exception | None = None
+try:
+    from kol_digest import (
+        DEFAULT_WATCHLIST_PATH,
+        add_watchlist_entry,
+        build_facebook_source_adapter,
+        build_x_source_adapter,
+        fetch_posts_for_watchlist,
+        init_kol_digest_storage,
+        list_watchlist_entries,
+        list_posts_for_digest,
+        load_watchlist,
+        remove_watchlist_entry,
+        render_digest_markdown,
+        set_watchlist_entry_enabled,
+        sync_watchlist_to_db,
+        write_digest_file,
+    )
+    KOL_DIGEST_MODULE_AVAILABLE = True
+except Exception as e:
+    KOL_DIGEST_IMPORT_ERROR = e
+    KOL_DIGEST_MODULE_AVAILABLE = False
+    DEFAULT_WATCHLIST_PATH = None
+    add_watchlist_entry = None
+    build_facebook_source_adapter = None
+    build_x_source_adapter = None
+    fetch_posts_for_watchlist = None
+    init_kol_digest_storage = None
+    list_watchlist_entries = None
+    list_posts_for_digest = None
+    load_watchlist = None
+    remove_watchlist_entry = None
+    render_digest_markdown = None
+    set_watchlist_entry_enabled = None
+    sync_watchlist_to_db = None
+    write_digest_file = None
 
 try:
     if hasattr(sys.stdout, "reconfigure"):
@@ -72,6 +95,18 @@ except Exception:
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("jat")
+
+
+def _kol_digest_unavailable_reason() -> str:
+    if KOL_DIGEST_IMPORT_ERROR is None:
+        return "kol digest module unavailable"
+    return f"kol digest module unavailable: {type(KOL_DIGEST_IMPORT_ERROR).__name__}: {KOL_DIGEST_IMPORT_ERROR}"
+
+
+def _require_kol_digest_available() -> str | None:
+    if KOL_DIGEST_MODULE_AVAILABLE:
+        return None
+    return f"KOL digest 功能目前不可用。{_kol_digest_unavailable_reason()}"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -156,6 +191,8 @@ ALLOWED_CONTROL_USERS = {
     for user in os.getenv("TELEGRAM_ALLOWED_CONTROL_USERS", "").split(",")
     if user.strip()
 }
+if DEFAULT_WATCHLIST_PATH is None:
+    DEFAULT_WATCHLIST_PATH = DATA_DIR / "kol_watchlist.json"
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN", "")
@@ -223,9 +260,12 @@ WEEKLY_REPORT_PUSH_MAX_CHATS = max(1, int(os.getenv("WEEKLY_REPORT_PUSH_MAX_CHAT
 NEWS_RSS_URLS_ENV = os.getenv("NEWS_RSS_URLS", "")
 NEWS_RSS_URLS_FILE = os.getenv("NEWS_RSS_URLS_FILE", "")
 NEWS_ENABLED = os.getenv("NEWS_ENABLED", "1").lower() in {"1", "true", "yes"}
-NEWS_FETCH_INTERVAL_MINUTES = int(os.getenv("NEWS_FETCH_INTERVAL_MINUTES", "180"))
+NEWS_FETCH_INTERVAL_MINUTES = int(os.getenv("NEWS_FETCH_INTERVAL_MINUTES", "360"))
+NEWS_LOOKBACK_HOURS = max(1, int(os.getenv("NEWS_LOOKBACK_HOURS", "24")))
 NEWS_PUSH_MAX_ITEMS = int(os.getenv("NEWS_PUSH_MAX_ITEMS", "10"))
 NEWS_PUSH_ENABLED = os.getenv("NEWS_PUSH_ENABLED", "0").lower() in {"1", "true", "yes"}
+NEWS_STARTUP_FETCH_ENABLED = _env_flag("NEWS_STARTUP_FETCH_ENABLED", True)
+NEWS_STARTUP_NOTIFY_ENABLED = _env_flag("NEWS_STARTUP_NOTIFY_ENABLED", True)
 NEWS_GNEWS_QUERY = os.getenv("NEWS_GNEWS_QUERY", "site:reuters.com semiconductors technology")
 NEWS_GNEWS_HL = os.getenv("NEWS_GNEWS_HL", "en-US")
 NEWS_GNEWS_GL = os.getenv("NEWS_GNEWS_GL", "US")
@@ -1618,9 +1658,15 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
         or text_lower.startswith("/kol_yesterday")
         or text_lower.startswith("/kol_now")
     ):
+        unavailable = _require_kol_digest_available()
+        if unavailable:
+            return unavailable
         return _handle_kol_digest_command(text, user_id=user_id, user_name=user_name)
 
     if text_lower.startswith("/digest_watchlist"):
+        unavailable = _require_kol_digest_available()
+        if unavailable:
+            return unavailable
         return _handle_digest_watchlist_command(text, user_id=user_id, user_name=user_name)
     if (
         text_lower.startswith("/add_kol")
@@ -1629,8 +1675,14 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
         or text_lower.startswith("/off_kol")
         or text_lower.startswith("/del_kol")
     ):
+        unavailable = _require_kol_digest_available()
+        if unavailable:
+            return unavailable
         return _handle_digest_watchlist_slash_command(text, user_id=user_id, user_name=user_name)
     if text_lower.startswith("add kol ") or text_lower.startswith("list kol") or text_lower.startswith("on kol ") or text_lower.startswith("off kol ") or text_lower.startswith("del kol "):
+        unavailable = _require_kol_digest_available()
+        if unavailable:
+            return unavailable
         return _handle_digest_watchlist_short_command(text, user_id=user_id, user_name=user_name)
 
     if text_lower.startswith("/whoami"):
@@ -1681,13 +1733,16 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
             "sort downloads",
             "/whoami",
             "/status",
-            "/kol_today",
-            "/kol_yesterday",
-            "/kol_now",
-            "/digest_watchlist",
             "/summary_notes_daily",
             "/summary_notes_weekly",
         ]
+        if KOL_DIGEST_MODULE_AVAILABLE:
+            cmds.extend([
+                "/kol_today",
+                "/kol_yesterday",
+                "/kol_now",
+                "/digest_watchlist",
+            ])
         if APP_PROFILE == "chitchat":
             cmds.append("/notion_test")
         if FEATURE_NEWS_ENABLED:
@@ -1739,6 +1794,9 @@ def _handle_digest_watchlist_command(
     user_id: str | None = None,
     user_name: str | None = None,
 ) -> str:
+    unavailable = _require_kol_digest_available()
+    if unavailable:
+        return unavailable
     tokens = (text or "").strip().split()
     sub = tokens[1].lower() if len(tokens) > 1 else "help"
     modifying = sub in {"add", "enable", "disable", "remove"}
@@ -6035,19 +6093,71 @@ def normalize_title(title: str) -> str:
     t = (title or "").strip().lower()
     if not t:
         return ""
+    t = unescape(t)
     t = re.sub(
-        r"^\\s*(reuters|bloomberg|nikkei|nikkei asia|asia nikkei|semianalysis)\\s*[-:|]\\s*",
+        r"^\s*(reuters|bloomberg|nikkei|nikkei asia|asia nikkei|semianalysis|techcrunch|techmeme|the verge|financial times|bbc|zdnet|futurism|wccftech|eetimes|semiwiki|the information|technews|techorange)\s*[-:|]\s*",
         "",
         t,
     )
     t = re.sub(
-        r"\\s*[-:|]\\s*(reuters|bloomberg|nikkei|nikkei asia|asia nikkei|semianalysis)\\s*$",
+        r"\s*[-:|]\s*(reuters|bloomberg|nikkei|nikkei asia|asia nikkei|semianalysis|techcrunch|techmeme|the verge|financial times|bbc|zdnet|futurism|wccftech|eetimes|semiwiki|the information|technews|techorange)\s*$",
         "",
         t,
     )
-    t = re.sub(r"[^a-z0-9\\u4e00-\\u9fff\\s]", " ", t)
-    t = re.sub(r"\\s+", " ", t).strip()
+    t = re.sub(r"^[\[(](?:update|live|analysis|exclusive|report|breaking)[^\])]*[\])]\s*", "", t)
+    t = re.sub(r"\s*[\[(](?:update|live|analysis|exclusive|report|breaking)[^\])]*[\])]\s*$", "", t)
+    t = re.sub(r"[^a-z0-9\u4e00-\u9fff\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
     return t
+
+
+def _title_match_key(title: str) -> str:
+    t = normalize_title(title)
+    if not t:
+        return ""
+    t = re.sub(
+        r"\b(update|updates|updated|live|exclusive|analysis|report|reports|breaking|says|say|sources|source|opinion|commentary)\b",
+        " ",
+        t,
+    )
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _norm_compact(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "").strip().lower())
+
+
+def canonicalize_article_url(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return raw
+
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+
+    kept_params = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        k = key.lower()
+        if (
+            k.startswith("utm_")
+            or k in {"fbclid", "gclid", "mc_cid", "mc_eid", "guccounter", "guce_referrer", "guce_referrer_sig"}
+        ):
+            continue
+        kept_params.append((key, value))
+    query = urlencode(sorted(kept_params), doseq=True)
+
+    return urlunparse((scheme, host, path or "/", "", query, ""))
 
 
 def hash_text(text: str) -> str:
@@ -6100,7 +6210,7 @@ def fetch_news_entries() -> list[dict]:
                 {
                     "source": source_name,
                     "title": title,
-                    "url": link,
+                    "url": canonicalize_article_url(link),
                     "summary": summary.strip(),
                     "published_at": published_at,
                 }
@@ -6112,13 +6222,37 @@ def fetch_news_entries() -> list[dict]:
 def find_similar_cluster(recent_rows: list[tuple], title_norm: str) -> int | None:
     if not title_norm:
         return None
+    title_key = _title_match_key(title_norm)
+    title_compact = _norm_compact(title_norm)
+    title_key_compact = _norm_compact(title_key)
     best_cluster = None
     best_score = 0
-    threshold = 95 if len(title_norm) < 40 else 92
+    threshold = 96 if len(title_norm) < 40 else 93
     for cluster_id, existing_norm in recent_rows:
         if not existing_norm:
             continue
-        score = fuzz.token_set_ratio(title_norm, existing_norm)
+        existing_key = _title_match_key(existing_norm)
+        existing_compact = _norm_compact(existing_norm)
+        existing_key_compact = _norm_compact(existing_key)
+        if title_compact and title_compact == existing_compact:
+            return cluster_id
+        if title_key_compact and title_key_compact == existing_key_compact:
+            return cluster_id
+        if (
+            title_key_compact
+            and existing_key_compact
+            and min(len(title_key_compact), len(existing_key_compact)) >= 24
+            and (
+                title_key_compact in existing_key_compact
+                or existing_key_compact in title_key_compact
+            )
+        ):
+            return cluster_id
+        score = max(
+            fuzz.token_set_ratio(title_norm, existing_norm),
+            fuzz.token_sort_ratio(title_norm, existing_norm),
+            fuzz.partial_ratio(title_key or title_norm, existing_key or existing_norm),
+        )
         if score >= threshold and score > best_score:
             best_score = score
             best_cluster = cluster_id
@@ -6213,14 +6347,15 @@ def ensure_cluster(
     return cluster_id
 
 
-def fetch_and_store_news() -> set[str]:
+def fetch_and_store_news(*, lookback_hours: int | None = None) -> set[str]:
     changed_dates: set[str] = set()
     entries = fetch_news_entries()
     if not entries:
         return changed_dates
 
     now = datetime.now(tz=get_local_tz())
-    cutoff_dt = now - timedelta(hours=12)
+    effective_lookback_hours = max(1, int(lookback_hours or NEWS_LOOKBACK_HOURS))
+    cutoff_dt = now - timedelta(hours=effective_lookback_hours)
     cutoff_iso = cutoff_dt.isoformat()
     with _connect_db() as conn:
         recent_rows = conn.execute(
@@ -6376,7 +6511,7 @@ def upsert_news_subscription(chat_id: str, enabled: bool) -> None:
 
 def get_latest_clusters(limit: int) -> list[tuple]:
     now = datetime.now(tz=get_local_tz())
-    cutoff_iso = (now - timedelta(hours=12)).isoformat()
+    cutoff_iso = (now - timedelta(hours=NEWS_LOOKBACK_HOURS)).isoformat()
     with _connect_db() as conn:
         rows = conn.execute(
             """
@@ -6395,7 +6530,7 @@ def get_latest_clusters(limit: int) -> list[tuple]:
 def search_clusters(keyword: str, limit: int) -> list[tuple]:
     kw = f"%{keyword}%"
     now = datetime.now(tz=get_local_tz())
-    cutoff_iso = (now - timedelta(hours=12)).isoformat()
+    cutoff_iso = (now - timedelta(hours=NEWS_LOOKBACK_HOURS)).isoformat()
     with _connect_db() as conn:
         rows = conn.execute(
             """
@@ -6573,6 +6708,7 @@ def set_telegram_commands() -> None:
         commands.append({"command": "transcribe", "description": "Transcribe url/audio to markdown"})
         commands.append({"command": "cancel", "description": "Cancel active transcription"})
     commands.append({"command": "status", "description": "Bot health status"})
+    resp = None
     try:
         resp = requests.post(
             f"{TELEGRAM_API}/setMyCommands",
@@ -6586,7 +6722,8 @@ def set_telegram_commands() -> None:
         print(f"setMyCommands timeout: {e}")
     except requests.RequestException as e:
         print(f"setMyCommands request error: {e}")
-        print(f"setMyCommands status={resp.status_code} body={resp.text}")
+        if resp is not None:
+            print(f"setMyCommands status={resp.status_code} body={resp.text}")
     except Exception as e:
         print(f"setMyCommands error: {e}")
 
@@ -6773,7 +6910,10 @@ def build_status_report() -> str:
         ),
         "kol digest: "
         + (
-            "on "
+            "unavailable "
+            + f"({_kol_digest_unavailable_reason()})"
+            if not KOL_DIGEST_MODULE_AVAILABLE
+            else "on "
             + (
                 f"(x={KOL_X_SOURCE_PROVIDER}, facebook={KOL_FACEBOOK_SOURCE_PROVIDER}, "
                 f"{KOL_DIGEST_FETCH_INTERVAL_HOURS}h fetch, {KOL_DIGEST_TIME} {KOL_DIGEST_TZ_NAME})"
@@ -6815,6 +6955,9 @@ def _kol_digest_run_key(now: datetime, *, digest_hour: int, digest_minute: int) 
 
 
 def run_kol_fetch_cycle() -> dict[str, int]:
+    unavailable = _require_kol_digest_available()
+    if unavailable:
+        raise RuntimeError(unavailable)
     watchlist = load_watchlist(KOL_WATCHLIST_PATH)
     init_kol_digest_storage(KOL_DIGEST_DB_PATH)
     sync_watchlist_to_db(KOL_DIGEST_DB_PATH, watchlist)
@@ -6859,6 +7002,9 @@ def _kol_digest_day_bounds(target_day: str, now: datetime | None = None) -> tupl
 
 
 def generate_kol_digest_for_day(target_day: str, generated_at: datetime | None = None) -> Path:
+    unavailable = _require_kol_digest_available()
+    if unavailable:
+        raise RuntimeError(unavailable)
     now = generated_at.astimezone(_get_kol_digest_tz()) if generated_at else datetime.now(tz=_get_kol_digest_tz())
     since, until = _kol_digest_day_bounds(target_day, now=now)
     watchlist = load_watchlist(KOL_WATCHLIST_PATH)
@@ -6890,6 +7036,9 @@ def _handle_kol_digest_command(
     user_id: str | None = None,
     user_name: str | None = None,
 ) -> str:
+    unavailable = _require_kol_digest_available()
+    if unavailable:
+        return unavailable
     cmd_text = (text or "").strip()
     lower = cmd_text.lower()
     if lower.startswith("/kol_now"):
@@ -6945,7 +7094,7 @@ def push_news_to_subscribers() -> None:
         return
 
     now = datetime.now(tz=get_local_tz())
-    cutoff_iso = (now - timedelta(hours=12)).isoformat()
+    cutoff_iso = (now - timedelta(hours=NEWS_LOOKBACK_HOURS)).isoformat()
     now_iso = now.isoformat()
     for chat_id, _enabled, last_sent_at in subs:
         effective_last = last_sent_at
@@ -7076,20 +7225,66 @@ def start_news_thread() -> None:
         print("[INFO] News worker disabled by FEATURE_NEWS_ENABLED=0")
         return
 
+    def _get_news_subscriber_chat_ids() -> list[str]:
+        with _connect_db() as conn:
+            rows = conn.execute(
+                "SELECT chat_id FROM news_subscriptions WHERE enabled = 1 ORDER BY chat_id"
+            ).fetchall()
+        return [str(chat_id) for (chat_id,) in rows if chat_id]
+
+    def _notify_news_run_started(reason: str) -> None:
+        if not NEWS_STARTUP_NOTIFY_ENABLED:
+            return
+        chat_ids = _get_news_subscriber_chat_ids()
+        if not chat_ids:
+            return
+        now = datetime.now(tz=get_local_tz()).strftime("%Y-%m-%d %H:%M")
+        text = (
+            f"News fetch started ({reason}).\n"
+            f"time: {now}\n"
+            f"lookback: {NEWS_LOOKBACK_HOURS}h\n"
+            f"interval: {NEWS_FETCH_INTERVAL_MINUTES}m"
+        )
+        for chat_id in chat_ids:
+            try:
+                send_message_sync(chat_id, text)
+            except Exception as e:
+                print(f"[WARN] failed to send news startup notice to {chat_id}: {e}")
+
+    def _next_news_run_at(now: datetime) -> datetime:
+        interval_minutes = max(1, NEWS_FETCH_INTERVAL_MINUTES)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elapsed_minutes = int((now - day_start).total_seconds() // 60)
+        next_slot_minutes = ((elapsed_minutes // interval_minutes) + 1) * interval_minutes
+        return day_start + timedelta(minutes=next_slot_minutes)
+
     def loop():
+        if NEWS_STARTUP_FETCH_ENABLED:
+            try:
+                _notify_news_run_started("startup")
+                fetch_and_store_news(lookback_hours=NEWS_LOOKBACK_HOURS)
+                push_news_to_subscribers()
+            except Exception as e:
+                print(f"news startup fetch error: {e}")
         while True:
             try:
-                fetch_and_store_news()
+                now = datetime.now(tz=get_local_tz())
+                next_run_at = _next_news_run_at(now)
+                sleep_seconds = max(1.0, (next_run_at - now).total_seconds())
+                time.sleep(sleep_seconds)
+                fetch_and_store_news(lookback_hours=NEWS_LOOKBACK_HOURS)
                 push_news_to_subscribers()
             except Exception as e:
                 print(f"news worker error: {e}")
-            time.sleep(max(1, NEWS_FETCH_INTERVAL_MINUTES) * 60)
 
     t = threading.Thread(target=loop, daemon=True)
     t.start()
 
 
 def start_kol_digest_thread() -> None:
+    if not KOL_DIGEST_MODULE_AVAILABLE:
+        print(f"[INFO] KOL digest worker unavailable: {_kol_digest_unavailable_reason()}")
+        return
     if not KOL_DIGEST_ENABLED:
         print("[INFO] KOL digest worker disabled by KOL_DIGEST_ENABLED=0")
         return

@@ -59,7 +59,9 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 
 ### Segment F: News / Digest
 - Purpose: collect, filter, and summarize news.
-- Keys: `NEWS_ENABLED`, `NEWS_FETCH_INTERVAL_MINUTES`, `NEWS_PUSH_ENABLED`, `NEWS_PUSH_MAX_ITEMS`, `NEWS_GNEWS_*`, `NEWS_RSS_URLS`, `NEWS_RSS_URLS_FILE`, `NEWS_URL_FETCH_*`, `NEWS_DIGEST_*`, `NOTE_DIGEST_MAX_ITEMS`.
+- Keys: `NEWS_ENABLED`, `NEWS_FETCH_INTERVAL_MINUTES`, `NEWS_LOOKBACK_HOURS`, `NEWS_STARTUP_FETCH_ENABLED`, `NEWS_STARTUP_NOTIFY_ENABLED`, `NEWS_PUSH_ENABLED`, `NEWS_PUSH_MAX_ITEMS`, `NEWS_GNEWS_*`, `NEWS_RSS_URLS`, `NEWS_RSS_URLS_FILE`, `NEWS_URL_FETCH_*`, `NEWS_DIGEST_*`, `NOTE_DIGEST_MAX_ITEMS`.
+- Current main profile defaults: `NEWS_FETCH_INTERVAL_MINUTES=360`, `NEWS_LOOKBACK_HOURS=24`, `NEWS_STARTUP_FETCH_ENABLED=1`, `NEWS_STARTUP_NOTIFY_ENABLED=1`.
+- Current behavior: on bot startup, news ingestion runs once immediately, sends a Telegram notice to enabled `news_subscriptions`, then continues on aligned 6-hour slots. The fetch window is 24 hours so the next startup can backfill after the PC was off.
 - Note/transcript AI input budget: `NOTE_AI_INPUT_MAX_CHARS` (current default `28000`).
 
 ### Segment G: AI Summary Providers
@@ -125,6 +127,17 @@ Run with specific env file and port:
 .\start.ps1 -EnvFile .env.digest -Port 8002
 ```
 
+Register the main bot to auto-start on Windows logon:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\register-startup-task.ps1 -TaskName "JAT Telegram Assistant Bot Main" -EnvFile ".env.main" -Port 8000 -Trigger Logon
+```
+
+Notes:
+- This creates a local Windows Task Scheduler entry, so it must be registered again on another PC.
+- The helper script lives at [tools/register-startup-task.ps1](/C:/Users/tsaiy/jat_telegram_assistant_bot/tools/register-startup-task.ps1).
+- The current task runs `start.ps1` with `.env.main` after user logon, which is more reliable than a pre-logon startup trigger for this bot.
+
 Start both bots:
 
 ```powershell
@@ -173,6 +186,24 @@ Troubleshoot startup/command routing (keep logs streaming in current terminal):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start-both.ps1 -EnableLogs -Monitor
+```
+
+Startup troubleshooting notes:
+
+- If `start-both.ps1` reports `Health check did not become ready ... /healthz within 30s`, check the uvicorn startup log first. The failure may be an app startup exception, not an HTTP health route problem.
+- The main profile now tolerates a missing `kol_digest.py`. KOL commands/features are marked unavailable instead of crashing the whole bot during import.
+- `set_telegram_commands()` failures to `api.telegram.org` should no longer kill startup. If Telegram is blocked by local firewall / endpoint policy, the bot can still start and serve `/healthz`, but Telegram polling or command sync may log connection errors.
+- If you need to isolate the issue quickly, test the app import directly:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import app_main; print('app_main import ok')"
+```
+
+- Then test the local server without `start-both.ps1`:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app_main:app --host 127.0.0.1 --port 8011
+Invoke-WebRequest http://127.0.0.1:8011/healthz
 ```
 
 Stop both bots:
