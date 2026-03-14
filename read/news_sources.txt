@@ -1,7 +1,11 @@
 https://www.reuters.com/technology/rss
 https://feeds.content.dowjones.io/public/rss/RSSWSJD
 https://news.google.com/rss/search?q=site:reuters.com%20semiconductors%20ai&hl=en-US&gl=US&ceid=US:en
+https://news.google.com/rss/search?q=site:reuters.com+technology&hl=en-US&gl=US&ceid=US:en
 https://feeds.bloomberg.com/technology/ai/news.rss
+https://feeds.bloomberg.com/technology/news.rss
+https://feeds.bloomberg.com/industries/news.rss
+https://www.ft.com/rss/home
 http://feeds.bbci.co.uk/news/technology/rss.xml
 https://news.google.com/rss/search?q=when:24h+source:The_Information&hl=en-US&gl=US&ceid=US:en
 https://semianalysis.com/feed/
