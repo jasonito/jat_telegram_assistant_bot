@@ -67,6 +67,82 @@ For each entry, capture:
 - Validation:
   - `python -m py_compile app.py`
   - `pytest` unavailable in current environment (`pytest` command missing and `.venv` lacks the module), so no automated test suite was run here.
+### 2026-03-09 - KOL digest phase 1 scaffold
+
+- Summary: added the first KOL digest module with watchlist loading, SQLite schema bootstrap, normalized post persistence, and markdown digest rendering, plus a starter watchlist file and tests.
+- Files: `.env.digest`, `data/kol_watchlist.json`, `kol_digest.py`, `tests/test_kol_digest.py`, `README.md`
+- Technologies: JSON watchlist config, SQLite WAL storage, normalized social post model, markdown digest rendering, Python `unittest`
+- Pitfalls:
+  - Keep source-specific scraping or API logic out of `kol_digest.py`; adapters should hand over normalized posts only.
+  - Do not mix digest runtime data into existing main/chitchat `DATA_DIR` values; digest profile should keep its own storage root.
+  - Preserve both source post IDs and content-hash fallback logic so reposts or unstable identifiers do not explode duplicates later.
+- Validation:
+  - `python -m py_compile kol_digest.py tests\\test_kol_digest.py`
+  - `python -m unittest tests.test_kol_digest`
+
+### 2026-03-09 - X adapter via optional snscrape CLI
+
+- Summary: added an X-source adapter that shells out to the `snscrape` CLI, parses JSONL output into normalized posts, and persists enabled X watchlist items through the existing KOL digest storage path.
+- Files: `kol_digest.py`, `tests/test_kol_digest.py`, `README.md`
+- Technologies: subprocess-based CLI integration, JSONL parsing, adapter pattern, SQLite fetch-state tracking, Python `unittest.mock`
+- Pitfalls:
+  - Keep `snscrape` optional at the repo level for now; adapter failures should record fetch errors instead of crashing the digest pipeline.
+  - Do not leak `snscrape` JSON shapes past the adapter boundary; normalize into `NormalizedPost` immediately.
+  - Expect X scraping to break over time, so the adapter must stay replaceable with an official API implementation later.
+- Validation:
+  - `python -m py_compile kol_digest.py tests\\test_kol_digest.py`
+  - `python -m unittest tests.test_kol_digest`
+
+### 2026-03-09 - Telegram watchlist management for digest profile
+
+- Summary: added `/digest_watchlist` command support so the digest bot can list, add, enable, disable, and remove tracked KOL entries directly from Telegram.
+- Files: `app.py`, `kol_digest.py`, `tests/test_kol_digest.py`, `tests/test_smoke.py`, `README.md`
+- Technologies: Telegram command routing, JSON watchlist mutation, file replacement writes, allowlist-based admin control, Python `unittest.mock`
+- Pitfalls:
+  - Treat watchlist mutation as an admin capability; keep add/enable/disable/remove behind `TELEGRAM_ALLOWED_CONTROL_USERS`.
+  - Keep file mutation logic in `kol_digest.py` so future CLI or UI tools reuse the same validation rules.
+  - Do not depend on display names for identity; use `kol_id` for enable/disable/remove operations.
+- Validation:
+  - `python -m py_compile app.py kol_digest.py tests\\test_kol_digest.py tests\\test_smoke.py`
+  - `python -m unittest tests.test_kol_digest tests.test_smoke`
+
+### 2026-03-10 - Replaceable X source provider with Apify adapter skeleton
+
+- Summary: decoupled the KOL digest X source selection from `snscrape`, added a provider factory plus an `ApifyXAdapter` skeleton, and documented the Apify env, field mapping, and cost model needed for a managed-scraper MVP.
+- Files: `kol_digest.py`, `app.py`, `.env.digest`, `.env.digest.example`, `tests/test_kol_digest.py`, `README.md`, `docs/APIFY_X_ADAPTER.md`
+- Technologies: adapter factory pattern, env-driven provider selection, Apify HTTP API integration skeleton, placeholder-based JSON input templating, tolerant payload normalization
+- Pitfalls:
+  - Do not assume one universal Apify input schema; keep actor-specific input in `APIFY_X_INPUT_TEMPLATE_JSON` or an Apify task.
+  - Keep X adapter failures isolated to fetch-state errors so digest rendering still works.
+  - Treat Apify as a short-term managed scraping bridge; the long-term stable route for X is still likely the official API.
+- Validation:
+  - `python -m py_compile kol_digest.py app.py tests\\test_kol_digest.py`
+  - `python -m unittest tests.test_kol_digest`
+
+### 2026-03-09 - Digest bot profile scaffold
+
+- Summary: added a third Telegram bot profile scaffold for digest-only use with its own wrapper module and env template, while keeping startup separate from the existing main + chitchat pair.
+- Files: `app_digest.py`, `.env.digest.example`, `README.md`
+- Technologies: profile-based app bootstrap, Telegram bot env isolation, shared FastAPI app entrypoints
+- Pitfalls:
+  - Keep digest profile rollout independent until feature/capability flags replace more `APP_PROFILE == ...` branches in `app.py`.
+  - Do not enable transcribe, OCR, Slack, or other chat-heavy features in digest profile by default.
+  - Use a separate `DATA_DIR` for digest profile so future KOL artifacts and checkpoints do not mix with main or chitchat runtime data.
+- Validation:
+  - `python -m py_compile app_digest.py app_main.py app_chitchat.py`
+
+### 2026-03-09 - KOL Daily Digest source strategy
+
+- Summary: for KOL Daily Digest, adopt a staged source strategy: short term use option C to validate the pipeline quickly with scraper-based inputs, then move toward option B as the long-term architecture with source adapters and a dedicated Facebook crawler.
+- Files: `docs/PROJECT_MEMORY.md`
+- Technologies: social source ingestion, X API evaluation, scraper-based collection, crawler architecture, adapter pattern, scheduled digest generation
+- Pitfalls:
+  - Do not couple digest logic directly to a single source implementation such as `snscrape`; keep source adapters replaceable.
+  - Treat `snscrape` as a bootstrap tool for MVP and internal validation, not as a long-term reliability layer.
+  - Expect Facebook external public-page tracking to require a crawler path rather than relying on official API coverage.
+  - Keep X integration swappable so a scraper-based MVP can later migrate to the official API without rewriting digest generation.
+- Validation:
+  - Decision recorded after evaluating `snscrape`, official APIs, and custom crawler tradeoffs for recurring KOL tracking.
 
 ### 2026-03-09 - Weekly digest pipeline and transcription chunking
 
@@ -96,6 +172,26 @@ For each entry, capture:
 - Validation:
   - `python -m unittest discover -s tests -p "test_*.py"`
   - `python -m py_compile app.py app_main.py app_chitchat.py transcription.py tests\\test_smoke.py`
+
+### 2026-03-09 - KOL digest scheduler defaults
+
+- Summary: wired the digest profile to run a background KOL scheduler with 6-hour fetch slots aligned to `08:00 Asia/Taipei`, and to generate one daily digest at `08:00`.
+- Files: `app.py`, `.env.digest`, `.env.digest.example`, `README.md`, `tests/test_smoke.py`
+- Technologies: background worker threads, wall-clock slot scheduling, SQLite-backed KOL digest storage, markdown digest output
+- Pitfalls:
+  - Keep the scheduler profile-scoped behind `KOL_DIGEST_ENABLED` so main/chitchat bots do not start digest jobs accidentally.
+  - Align fetch slots to the digest hour; with the current defaults that means `02:00 / 08:00 / 14:00 / 20:00 Asia/Taipei`.
+  - Daily digest generation should remain independent from Telegram push so transport changes do not affect collection.
+
+### 2026-03-09 - Manual KOL digest commands
+
+- Summary: added `/kol_today` to read or generate today's digest on demand, `/kol_yesterday` for the previous calendar day, and `/kol_now` to force a fetch cycle and rebuild the current-day digest immediately.
+- Files: `app.py`, `tests/test_smoke.py`, `README.md`
+- Technologies: Telegram command routing, digest preview truncation, admin-gated manual execution
+- Pitfalls:
+  - Keep `/kol_now` behind `TELEGRAM_ALLOWED_CONTROL_USERS`; it triggers live fetch work and should stay admin-only.
+  - `/kol_today` should remain safe for normal use; if today's file is missing it may generate from existing stored posts without forcing a network fetch.
+  - Scheduled `08:00` digest generation should write the previous calendar day so the file name and digest window stay aligned.
 
 ## Recommended Workflow
 

@@ -44,6 +44,22 @@ except Exception:
 
 from slack_bolt import App as SlackApp
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from kol_digest import (
+    DEFAULT_WATCHLIST_PATH,
+    add_watchlist_entry,
+    build_facebook_source_adapter,
+    build_x_source_adapter,
+    fetch_posts_for_watchlist,
+    init_kol_digest_storage,
+    list_watchlist_entries,
+    list_posts_for_digest,
+    load_watchlist,
+    remove_watchlist_entry,
+    render_digest_markdown,
+    set_watchlist_entry_enabled,
+    sync_watchlist_to_db,
+    write_digest_file,
+)
 
 try:
     if hasattr(sys.stdout, "reconfigure"):
@@ -108,6 +124,14 @@ TELEGRAM_POLL_ERROR_BACKOFF_BASE_SECONDS = max(
 TELEGRAM_POLL_ERROR_BACKOFF_MAX_SECONDS = max(
     TELEGRAM_POLL_ERROR_BACKOFF_BASE_SECONDS,
     float(os.getenv("TELEGRAM_POLL_ERROR_BACKOFF_MAX_SECONDS", "20")),
+)
+TELEGRAM_POLL_WATCHDOG_ENABLED = _env_flag("TELEGRAM_POLL_WATCHDOG_ENABLED", True)
+TELEGRAM_POLL_WATCHDOG_INTERVAL_SECONDS = max(
+    5.0, _env_float("TELEGRAM_POLL_WATCHDOG_INTERVAL_SECONDS", 15.0)
+)
+TELEGRAM_POLL_STALE_SECONDS = max(
+    float(TELEGRAM_POLL_READ_TIMEOUT_SECONDS + 30),
+    _env_float("TELEGRAM_POLL_STALE_SECONDS", float(TELEGRAM_POLL_READ_TIMEOUT_SECONDS + 45)),
 )
 
 TELEGRAM_UPDATE_MAX_WORKERS = max(1, int(os.getenv("TELEGRAM_UPDATE_MAX_WORKERS", "8")))
@@ -220,6 +244,16 @@ OCR_CHOICE_TIMEOUT_SECONDS = int(os.getenv("OCR_CHOICE_TIMEOUT_SECONDS", "60"))
 OCR_CHOICE_TIMEOUT_DEFAULT = (os.getenv("OCR_CHOICE_TIMEOUT_DEFAULT", "skip") or "skip").strip().lower()
 FEATURE_SLACK_ENABLED = _env_flag("FEATURE_SLACK_ENABLED", True)
 APP_PROFILE = (os.getenv("APP_PROFILE", "main") or "main").strip().lower()
+KOL_WATCHLIST_PATH = Path(os.getenv("KOL_WATCHLIST_PATH", str(DEFAULT_WATCHLIST_PATH))).resolve()
+KOL_DIGEST_ENABLED = _env_flag("KOL_DIGEST_ENABLED", APP_PROFILE == "digest")
+KOL_DIGEST_DB_PATH = Path(os.getenv("KOL_DIGEST_DB_PATH", str(DATA_DIR / "kol_digest.sqlite"))).resolve()
+KOL_DIGEST_OUTPUT_DIR = Path(os.getenv("KOL_DIGEST_OUTPUT_DIR", str(DATA_DIR / "digests"))).resolve()
+KOL_DIGEST_FETCH_INTERVAL_HOURS = max(1, int(os.getenv("KOL_DIGEST_FETCH_INTERVAL_HOURS", "6")))
+KOL_DIGEST_FETCH_LIMIT_PER_SOURCE = max(1, int(os.getenv("KOL_DIGEST_FETCH_LIMIT_PER_SOURCE", "20")))
+KOL_X_SOURCE_PROVIDER = (os.getenv("KOL_X_SOURCE_PROVIDER", "snscrape") or "snscrape").strip().lower()
+KOL_FACEBOOK_SOURCE_PROVIDER = (os.getenv("KOL_FACEBOOK_SOURCE_PROVIDER", "stub") or "stub").strip().lower()
+KOL_DIGEST_TIME = os.getenv("KOL_DIGEST_TIME", "08:00").strip() or "08:00"
+KOL_DIGEST_TZ_NAME = os.getenv("KOL_DIGEST_TZ", "Asia/Taipei").strip() or "Asia/Taipei"
 
 NOTION_ENABLED = _env_flag("NOTION_ENABLED", False)
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
@@ -254,6 +288,11 @@ _telegram_poll_last_ok_at = 0.0
 _telegram_poll_last_update_at = 0.0
 _telegram_poll_last_update_id: int | None = None
 _telegram_poll_last_error = ""
+_telegram_poll_loop_last_seen_at = 0.0
+_telegram_poll_thread_started_at = 0.0
+_telegram_poll_thread_restart_count = 0
+_telegram_poll_thread: threading.Thread | None = None
+_telegram_poll_thread_lock = threading.Lock()
 _telegram_send_last_ok_at = 0.0
 _telegram_send_last_status = ""
 _telegram_send_last_error = ""
@@ -690,6 +729,16 @@ async def send_ack_message(chat_id: int, text: str = "已成功紀錄") -> bool:
         if attempt < 2:
             await asyncio.sleep(0.8 * (attempt + 1))
     return False
+
+
+def _spawn_background_to_thread(func, /, *args, label: str = "background") -> None:
+    async def _runner() -> None:
+        try:
+            await asyncio.to_thread(func, *args)
+        except Exception as e:
+            print(f"[WARN] {label} failed: {type(e).__name__}: {e}")
+
+    asyncio.create_task(_runner())
 
 
 async def edit_message(chat_id: int, message_id: int, text: str) -> bool:
@@ -1564,6 +1613,26 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
     if text_lower.startswith("/status"):
         return build_status_report()
 
+    if (
+        text_lower.startswith("/kol_today")
+        or text_lower.startswith("/kol_yesterday")
+        or text_lower.startswith("/kol_now")
+    ):
+        return _handle_kol_digest_command(text, user_id=user_id, user_name=user_name)
+
+    if text_lower.startswith("/digest_watchlist"):
+        return _handle_digest_watchlist_command(text, user_id=user_id, user_name=user_name)
+    if (
+        text_lower.startswith("/add_kol")
+        or text_lower.startswith("/list_kol")
+        or text_lower.startswith("/on_kol")
+        or text_lower.startswith("/off_kol")
+        or text_lower.startswith("/del_kol")
+    ):
+        return _handle_digest_watchlist_slash_command(text, user_id=user_id, user_name=user_name)
+    if text_lower.startswith("add kol ") or text_lower.startswith("list kol") or text_lower.startswith("on kol ") or text_lower.startswith("off kol ") or text_lower.startswith("del kol "):
+        return _handle_digest_watchlist_short_command(text, user_id=user_id, user_name=user_name)
+
     if text_lower.startswith("/whoami"):
         return "請在 Telegram 對話中使用 /whoami。"
 
@@ -1612,6 +1681,10 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
             "sort downloads",
             "/whoami",
             "/status",
+            "/kol_today",
+            "/kol_yesterday",
+            "/kol_now",
+            "/digest_watchlist",
             "/summary_notes_daily",
             "/summary_notes_weekly",
         ]
@@ -1659,6 +1732,200 @@ def route_user_text_command(
         parse_mode = "Markdown"
         disable_preview = True
     return [reply], parse_mode, disable_preview
+
+
+def _handle_digest_watchlist_command(
+    text: str,
+    user_id: str | None = None,
+    user_name: str | None = None,
+) -> str:
+    tokens = (text or "").strip().split()
+    sub = tokens[1].lower() if len(tokens) > 1 else "help"
+    modifying = sub in {"add", "enable", "disable", "remove"}
+    if modifying and not _is_allowed_control_user(user_id, user_name):
+        return "未授權管理 digest watchlist。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"
+
+    if sub == "help":
+        return "\n".join(
+            [
+                "Digest watchlist:",
+                "- /list_kol",
+                "- /add_kol <handle_or_url> [display_name]",
+                "- /on_kol <kol_id>",
+                "- /off_kol <kol_id>",
+                "- /del_kol <kol_id>",
+            ]
+        )
+
+    if sub == "list":
+        entries = list_watchlist_entries(KOL_WATCHLIST_PATH)
+        if not entries:
+            return f"Watchlist is empty. File: {KOL_WATCHLIST_PATH}"
+        lines = [f"Watchlist ({len(entries)})", f"file: {KOL_WATCHLIST_PATH}"]
+        for item in entries:
+            status = "on" if item.enabled else "off"
+            lines.append(
+                f"- {item.kol_id} [{status}] {item.platform} {item.display_name} -> {item.handle_or_url}"
+            )
+        return "\n".join(lines)
+
+    if sub == "add":
+        if len(tokens) < 4:
+            return "Usage: /digest_watchlist add <x|facebook> <handle_or_url> [display_name]"
+        platform = tokens[2].strip().lower()
+        handle_or_url = tokens[3].strip()
+        display_name = " ".join(tokens[4:]).strip() if len(tokens) > 4 else None
+        try:
+            item, created = add_watchlist_entry(
+                KOL_WATCHLIST_PATH,
+                platform=platform,
+                handle_or_url=handle_or_url,
+                display_name=display_name,
+            )
+        except Exception as e:
+            return f"Failed to add watchlist entry: {type(e).__name__}: {e}"
+        action = "added" if created else "already exists"
+        return f"{action}: {item.kol_id} ({item.platform}) {item.display_name} -> {item.handle_or_url}"
+
+    if sub in {"enable", "disable"}:
+        if len(tokens) < 3:
+            return f"Usage: /digest_watchlist {sub} <kol_id>"
+        try:
+            item = set_watchlist_entry_enabled(KOL_WATCHLIST_PATH, tokens[2].strip(), enabled=(sub == "enable"))
+        except KeyError:
+            return f"Unknown kol_id: {tokens[2].strip()}"
+        except Exception as e:
+            return f"Failed to update watchlist entry: {type(e).__name__}: {e}"
+        status = "enabled" if item.enabled else "disabled"
+        return f"{status}: {item.kol_id} ({item.platform}) {item.display_name}"
+
+    if sub == "remove":
+        if len(tokens) < 3:
+            return "Usage: /digest_watchlist remove <kol_id>"
+        try:
+            item = remove_watchlist_entry(KOL_WATCHLIST_PATH, tokens[2].strip())
+        except KeyError:
+            return f"Unknown kol_id: {tokens[2].strip()}"
+        except Exception as e:
+            return f"Failed to remove watchlist entry: {type(e).__name__}: {e}"
+        return f"removed: {item.kol_id} ({item.platform}) {item.display_name}"
+
+    return "Unknown /digest_watchlist subcommand. Use /digest_watchlist help."
+
+
+def _infer_kol_platform(handle_or_url: str) -> str:
+    raw = (handle_or_url or "").strip().lower()
+    if not raw:
+        raise ValueError("handle_or_url is required")
+    if "facebook.com/" in raw:
+        return "facebook"
+    if "x.com/" in raw or "twitter.com/" in raw or raw.startswith("@"):
+        return "x"
+    if "://" in raw:
+        raise ValueError("unsupported platform; use an X or Facebook URL")
+    return "x"
+
+
+def _handle_digest_watchlist_slash_command(
+    text: str,
+    user_id: str | None = None,
+    user_name: str | None = None,
+) -> str:
+    cmd_text = (text or "").strip()
+    lower = cmd_text.lower()
+    if lower == "/list_kol":
+        return _handle_digest_watchlist_command("/digest_watchlist list", user_id=user_id, user_name=user_name)
+    if lower.startswith("/add_kol"):
+        parts = cmd_text.split(maxsplit=2)
+        if len(parts) < 2:
+            return "Usage:\n- /add_kol <handle_or_url> [display_name]"
+        handle_or_url = parts[1].strip()
+        display_name = parts[2].strip() if len(parts) > 2 else None
+        try:
+            platform = _infer_kol_platform(handle_or_url)
+        except Exception as e:
+            return f"Failed to infer platform: {type(e).__name__}: {e}"
+        return _handle_digest_watchlist_command(
+            " ".join(
+                [
+                    "/digest_watchlist",
+                    "add",
+                    platform,
+                    handle_or_url,
+                    display_name or "",
+                ]
+            ).strip(),
+            user_id=user_id,
+            user_name=user_name,
+        )
+    if lower.startswith("/on_kol"):
+        parts = cmd_text.split(maxsplit=1)
+        if len(parts) < 2:
+            return "Usage:\n- /on_kol <kol_id>"
+        return _handle_digest_watchlist_command(
+            f"/digest_watchlist enable {parts[1].strip()}",
+            user_id=user_id,
+            user_name=user_name,
+        )
+    if lower.startswith("/off_kol"):
+        parts = cmd_text.split(maxsplit=1)
+        if len(parts) < 2:
+            return "Usage:\n- /off_kol <kol_id>"
+        return _handle_digest_watchlist_command(
+            f"/digest_watchlist disable {parts[1].strip()}",
+            user_id=user_id,
+            user_name=user_name,
+        )
+    if lower.startswith("/del_kol"):
+        parts = cmd_text.split(maxsplit=1)
+        if len(parts) < 2:
+            return "Usage:\n- /del_kol <kol_id>"
+        return _handle_digest_watchlist_command(
+            f"/digest_watchlist remove {parts[1].strip()}",
+            user_id=user_id,
+            user_name=user_name,
+        )
+    return "Unknown kol command. Use:\n- /list_kol\n- /add_kol <handle_or_url> [display_name]"
+
+
+def _handle_digest_watchlist_short_command(
+    text: str,
+    user_id: str | None = None,
+    user_name: str | None = None,
+) -> str:
+    cmd_text = (text or "").strip()
+    lower = cmd_text.lower()
+    if lower == "list kol":
+        return _handle_digest_watchlist_command("/digest_watchlist list", user_id=user_id, user_name=user_name)
+    if lower.startswith("add kol "):
+        payload = cmd_text[len("add kol ") :].strip()
+        return _handle_digest_watchlist_slash_command(
+            f"/add_kol {payload}",
+            user_id=user_id,
+            user_name=user_name,
+        )
+    if lower.startswith("on kol "):
+        kol_id = cmd_text[7:].strip()
+        return _handle_digest_watchlist_command(
+            f"/digest_watchlist enable {kol_id}",
+            user_id=user_id,
+            user_name=user_name,
+        )
+    if lower.startswith("off kol "):
+        kol_id = cmd_text[8:].strip()
+        return _handle_digest_watchlist_command(
+            f"/digest_watchlist disable {kol_id}",
+            user_id=user_id,
+            user_name=user_name,
+        )
+    if lower.startswith("del kol "):
+        kol_id = cmd_text[8:].strip()
+        return _handle_digest_watchlist_command(
+            f"/digest_watchlist remove {kol_id}",
+            user_id=user_id,
+            user_name=user_name,
+        )
+    return "Unknown kol command. Use:\n- /list_kol\n- /add_kol <handle_or_url> [display_name]"
 
 
 def store_message(
@@ -6275,6 +6542,19 @@ def set_telegram_commands() -> None:
         {"command": "summary_notes_daily", "description": "Daily notes digest"},
         {"command": "summary_notes_weekly", "description": "Weekly notes digest"},
     ]
+    if APP_PROFILE == "digest":
+        commands.extend(
+            [
+                {"command": "list_kol", "description": "List tracked KOLs"},
+                {"command": "add_kol", "description": "Add a KOL"},
+                {"command": "on_kol", "description": "Enable a KOL"},
+                {"command": "off_kol", "description": "Disable a KOL"},
+                {"command": "del_kol", "description": "Remove a KOL"},
+                {"command": "kol_today", "description": "Show today's KOL digest"},
+                {"command": "kol_yesterday", "description": "Show yesterday's KOL digest"},
+                {"command": "kol_now", "description": "Fetch now and rebuild digest"},
+            ]
+        )
     if APP_PROFILE == "chitchat":
         commands.append({"command": "notion_test", "description": "Run Notion text/image diagnostics"})
     if FEATURE_NEWS_ENABLED:
@@ -6372,6 +6652,49 @@ def _fmt_diag_time(ts: float) -> str:
         return "error"
 
 
+def _telegram_poll_health_snapshot(now_ts: float | None = None) -> dict[str, object]:
+    now_ts = now_ts or time.time()
+    with _telegram_poll_thread_lock:
+        poll_thread = _telegram_poll_thread
+        started_at = _telegram_poll_thread_started_at
+        restart_count = _telegram_poll_thread_restart_count
+    thread_alive = bool(poll_thread and poll_thread.is_alive())
+    stale = False
+    if TELEGRAM_LONG_POLLING and _telegram_poll_loop_last_seen_at:
+        stale = (now_ts - _telegram_poll_loop_last_seen_at) > TELEGRAM_POLL_STALE_SECONDS
+    return {
+        "enabled": TELEGRAM_LONG_POLLING,
+        "thread_alive": thread_alive,
+        "thread_name": poll_thread.name if poll_thread else "",
+        "thread_started_at": started_at,
+        "restart_count": restart_count,
+        "last_ok_at": _telegram_poll_last_ok_at,
+        "last_update_at": _telegram_poll_last_update_at,
+        "last_update_id": _telegram_poll_last_update_id,
+        "last_error": _telegram_poll_last_error,
+        "loop_last_seen_at": _telegram_poll_loop_last_seen_at,
+        "stale": stale,
+    }
+
+
+def _app_health_snapshot() -> dict[str, object]:
+    poll = _telegram_poll_health_snapshot()
+    overall_ok = True
+    if TELEGRAM_LONG_POLLING and (not poll["thread_alive"] or bool(poll["stale"])):
+        overall_ok = False
+    return {
+        "ok": overall_ok,
+        "profile": APP_PROFILE,
+        "telegram_mode": "long_polling" if TELEGRAM_LONG_POLLING else "webhook",
+        "telegram_poll": poll,
+        "telegram_send": {
+            "last_ok_at": _telegram_send_last_ok_at,
+            "last_status": _telegram_send_last_status,
+            "last_error": _telegram_send_last_error,
+        },
+    }
+
+
 def build_status_report() -> str:
     now = datetime.now(tz=get_local_tz())
     day = now.strftime("%Y-%m-%d")
@@ -6420,6 +6743,15 @@ def build_status_report() -> str:
         lines.append(f"news clusters (24h): {news_24h}")
     lines.append(f"telegram mode: {'long_polling' if TELEGRAM_LONG_POLLING else 'webhook'}")
     if TELEGRAM_LONG_POLLING:
+        poll = _telegram_poll_health_snapshot()
+        lines.append(
+            "telegram poll thread: "
+            + (f"alive ({poll['thread_name'] or 'unnamed'})" if poll["thread_alive"] else "down")
+        )
+        lines.append(f"telegram poll thread started: {_fmt_diag_time(float(poll['thread_started_at'] or 0.0))}")
+        lines.append(f"telegram poll watchdog restarts: {int(poll['restart_count'])}")
+        lines.append(f"telegram poll last loop seen: {_fmt_diag_time(float(poll['loop_last_seen_at'] or 0.0))}")
+        lines.append(f"telegram poll stale: {'yes' if poll['stale'] else 'no'}")
         lines.append(f"telegram poll last ok: {_fmt_diag_time(_telegram_poll_last_ok_at)}")
         lines.append(f"telegram poll last update: {_fmt_diag_time(_telegram_poll_last_update_at)}")
         lines.append(
@@ -6439,9 +6771,166 @@ def build_status_report() -> str:
             if WEEKLY_REPORT_PUSH_ENABLED
             else "off"
         ),
+        "kol digest: "
+        + (
+            "on "
+            + (
+                f"(x={KOL_X_SOURCE_PROVIDER}, facebook={KOL_FACEBOOK_SOURCE_PROVIDER}, "
+                f"{KOL_DIGEST_FETCH_INTERVAL_HOURS}h fetch, {KOL_DIGEST_TIME} {KOL_DIGEST_TZ_NAME})"
+            )
+            if KOL_DIGEST_ENABLED
+            else "off"
+        ),
         f"today: {day}",
     ])
     return "\n".join(lines)
+
+
+def _get_kol_digest_tz():
+    try:
+        return ZoneInfo(KOL_DIGEST_TZ_NAME)
+    except ZoneInfoNotFoundError:
+        return get_local_tz()
+
+
+def _kol_fetch_run_key(
+    now: datetime,
+    *,
+    digest_hour: int,
+    digest_minute: int,
+    interval_hours: int,
+) -> str | None:
+    if now.minute != digest_minute:
+        return None
+    step = max(1, int(interval_hours))
+    if ((now.hour - digest_hour) % step) != 0:
+        return None
+    return f"{now.strftime('%Y-%m-%d')}:{now.hour:02d}:{now.minute:02d}"
+
+
+def _kol_digest_run_key(now: datetime, *, digest_hour: int, digest_minute: int) -> str | None:
+    if now.hour != digest_hour or now.minute != digest_minute:
+        return None
+    return f"{now.strftime('%Y-%m-%d')}:{now.hour:02d}:{now.minute:02d}"
+
+
+def run_kol_fetch_cycle() -> dict[str, int]:
+    watchlist = load_watchlist(KOL_WATCHLIST_PATH)
+    init_kol_digest_storage(KOL_DIGEST_DB_PATH)
+    sync_watchlist_to_db(KOL_DIGEST_DB_PATH, watchlist)
+    adapters = {
+        "x": build_x_source_adapter(KOL_X_SOURCE_PROVIDER),
+        "facebook": build_facebook_source_adapter(KOL_FACEBOOK_SOURCE_PROVIDER),
+    }
+    results = fetch_posts_for_watchlist(
+        KOL_DIGEST_DB_PATH,
+        watchlist,
+        adapters_by_platform=adapters,
+        limit_per_source=KOL_DIGEST_FETCH_LIMIT_PER_SOURCE,
+    )
+    return results
+
+
+def _build_kol_source_health_lines(fetch_results: dict[str, int]) -> list[str]:
+    if not fetch_results:
+        return ["No enabled KOL sources in watchlist."]
+    lines: list[str] = []
+    for kol_id, count in sorted(fetch_results.items()):
+        if count == -1:
+            lines.append(f"{kol_id}: fetch failed")
+        elif count == -2:
+            lines.append(f"{kol_id}: provider unavailable")
+        else:
+            lines.append(f"{kol_id}: {count} new posts fetched")
+    return lines
+
+
+def _kol_digest_day_string(offset_days: int = 0, now: datetime | None = None) -> str:
+    effective_now = now.astimezone(_get_kol_digest_tz()) if now else datetime.now(tz=_get_kol_digest_tz())
+    return (effective_now + timedelta(days=offset_days)).strftime("%Y-%m-%d")
+
+
+def _kol_digest_day_bounds(target_day: str, now: datetime | None = None) -> tuple[datetime, datetime]:
+    tz = _get_kol_digest_tz()
+    effective_now = now.astimezone(tz) if now else datetime.now(tz=tz)
+    day_start = datetime.fromisoformat(f"{target_day}T00:00:00").replace(tzinfo=tz)
+    day_end = day_start + timedelta(days=1)
+    return day_start, min(day_end, effective_now)
+
+
+def generate_kol_digest_for_day(target_day: str, generated_at: datetime | None = None) -> Path:
+    now = generated_at.astimezone(_get_kol_digest_tz()) if generated_at else datetime.now(tz=_get_kol_digest_tz())
+    since, until = _kol_digest_day_bounds(target_day, now=now)
+    watchlist = load_watchlist(KOL_WATCHLIST_PATH)
+    init_kol_digest_storage(KOL_DIGEST_DB_PATH)
+    sync_watchlist_to_db(KOL_DIGEST_DB_PATH, watchlist)
+    posts = list_posts_for_digest(KOL_DIGEST_DB_PATH, since=since, until=until, limit=500)
+    markdown = render_digest_markdown(
+        target_day,
+        posts,
+        generated_at=now,
+    )
+    return write_digest_file(KOL_DIGEST_OUTPUT_DIR, target_day, markdown)
+
+
+def generate_kol_daily_digest(force_now: datetime | None = None) -> Path:
+    now = force_now.astimezone(_get_kol_digest_tz()) if force_now else datetime.now(tz=_get_kol_digest_tz())
+    return generate_kol_digest_for_day(_kol_digest_day_string(0, now=now), generated_at=now)
+
+
+def _read_kol_digest_preview(path: Path, max_chars: int = 3500) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n\n...[truncated]"
+
+
+def _handle_kol_digest_command(
+    text: str,
+    user_id: str | None = None,
+    user_name: str | None = None,
+) -> str:
+    cmd_text = (text or "").strip()
+    lower = cmd_text.lower()
+    if lower.startswith("/kol_now"):
+        if not _is_allowed_control_user(user_id, user_name):
+            return "未授權執行 KOL 即時抓取。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"
+        try:
+            results = run_kol_fetch_cycle()
+            path = generate_kol_digest_for_day(_kol_digest_day_string(0))
+        except Exception as e:
+            return f"KOL digest run failed: {type(e).__name__}: {e}"
+        lines = [
+            f"KOL fetch done: {len(results)} sources",
+            *[f"- {line}" for line in _build_kol_source_health_lines(results)],
+            "",
+            f"Digest file: {path}",
+            "",
+            _read_kol_digest_preview(path),
+        ]
+        return "\n".join(lines).strip()
+
+    if lower.startswith("/kol_today"):
+        try:
+            today = _kol_digest_day_string(0)
+            path = KOL_DIGEST_OUTPUT_DIR / f"{today.replace('-', '')}_kol_digest.md"
+            if not path.exists():
+                path = generate_kol_digest_for_day(today)
+        except Exception as e:
+            return f"Failed to load KOL digest: {type(e).__name__}: {e}"
+        return _read_kol_digest_preview(path)
+
+    if lower.startswith("/kol_yesterday"):
+        try:
+            day = _kol_digest_day_string(-1)
+            path = KOL_DIGEST_OUTPUT_DIR / f"{day.replace('-', '')}_kol_digest.md"
+            if not path.exists():
+                path = generate_kol_digest_for_day(day)
+        except Exception as e:
+            return f"Failed to load KOL digest: {type(e).__name__}: {e}"
+        return _read_kol_digest_preview(path)
+
+    return "Unknown KOL digest command. Use:\n- /kol_today\n- /kol_yesterday\n- /kol_now"
 
 
 def push_news_to_subscribers() -> None:
@@ -6597,6 +7086,46 @@ def start_news_thread() -> None:
             time.sleep(max(1, NEWS_FETCH_INTERVAL_MINUTES) * 60)
 
     t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+
+def start_kol_digest_thread() -> None:
+    if not KOL_DIGEST_ENABLED:
+        print("[INFO] KOL digest worker disabled by KOL_DIGEST_ENABLED=0")
+        return
+
+    digest_hour, digest_minute = parse_hhmm(KOL_DIGEST_TIME, default_hour=8, default_minute=0)
+
+    def loop():
+        last_fetch_key = ""
+        last_digest_key = ""
+        while True:
+            now = datetime.now(tz=_get_kol_digest_tz())
+            fetch_key = _kol_fetch_run_key(
+                now,
+                digest_hour=digest_hour,
+                digest_minute=digest_minute,
+                interval_hours=KOL_DIGEST_FETCH_INTERVAL_HOURS,
+            )
+            if fetch_key and fetch_key != last_fetch_key:
+                try:
+                    results = run_kol_fetch_cycle()
+                    logger.info("KOL fetch cycle done key=%s results=%s", fetch_key, results)
+                except Exception as e:
+                    logger.warning("KOL fetch cycle failed key=%s error=%s: %s", fetch_key, type(e).__name__, e)
+                last_fetch_key = fetch_key
+
+            digest_key = _kol_digest_run_key(now, digest_hour=digest_hour, digest_minute=digest_minute)
+            if digest_key and digest_key != last_digest_key:
+                try:
+                    path = generate_kol_digest_for_day(_kol_digest_day_string(-1, now=now), generated_at=now)
+                    logger.info("KOL daily digest generated key=%s path=%s", digest_key, path)
+                except Exception as e:
+                    logger.warning("KOL daily digest failed key=%s error=%s: %s", digest_key, type(e).__name__, e)
+                last_digest_key = digest_key
+            time.sleep(60)
+
+    t = threading.Thread(target=loop, daemon=True, name="kol-digest-worker")
     t.start()
 
 
@@ -6889,13 +7418,15 @@ def telegram_get_file_info(file_id: str) -> tuple[str, str]:
 
 
 def telegram_polling_loop() -> None:
-    global _telegram_poll_last_ok_at, _telegram_poll_last_update_at, _telegram_poll_last_update_id, _telegram_poll_last_error
+    global _telegram_poll_last_ok_at, _telegram_poll_last_update_at, _telegram_poll_last_update_id
+    global _telegram_poll_last_error, _telegram_poll_loop_last_seen_at
     print("[INFO] Telegram long polling enabled.")
     delete_telegram_webhook(drop_pending=False)
     offset = None
     consecutive_errors = 0
     while True:
         try:
+            _telegram_poll_loop_last_seen_at = time.time()
             params = {"timeout": TELEGRAM_POLL_TIMEOUT_SECONDS}
             if offset is not None:
                 params["offset"] = offset
@@ -6940,12 +7471,14 @@ def telegram_polling_loop() -> None:
                         continue
                 # Mark update as seen immediately so /status reflects the latest received update.
                 _telegram_poll_last_update_at = time.time()
+                _telegram_poll_loop_last_seen_at = _telegram_poll_last_update_at
                 try:
                     _submit_telegram_update(update)
                 except Exception as e:
                     print(f"[WARN] telegram update process error: {e}")
                     print(traceback.format_exc())
         except Exception as e:
+            _telegram_poll_loop_last_seen_at = time.time()
             consecutive_errors += 1
             _telegram_poll_last_error = f"{type(e).__name__}: {e}"
             print(f"[ERROR] Telegram polling error: {e}")
@@ -6956,10 +7489,55 @@ def telegram_polling_loop() -> None:
             time.sleep(sleep_s)
 
 
-def start_telegram_polling_thread() -> None:
+def _start_telegram_polling_worker(*, reason: str) -> None:
+    global _telegram_poll_thread, _telegram_poll_thread_started_at, _telegram_poll_thread_restart_count
     if not TELEGRAM_LONG_POLLING:
         return
-    t = threading.Thread(target=telegram_polling_loop, daemon=True)
+    with _telegram_poll_thread_lock:
+        if _telegram_poll_thread and _telegram_poll_thread.is_alive():
+            return
+        _telegram_poll_thread_restart_count += 1
+        _telegram_poll_thread_started_at = time.time()
+        _telegram_poll_thread = threading.Thread(
+            target=telegram_polling_loop,
+            daemon=True,
+            name=f"telegram-poll-{_telegram_poll_thread_restart_count}",
+        )
+        print(
+            f"[INFO] Starting Telegram polling thread "
+            f"(reason={reason}, count={_telegram_poll_thread_restart_count})"
+        )
+        _telegram_poll_thread.start()
+
+
+def start_telegram_polling_thread() -> None:
+    _start_telegram_polling_worker(reason="startup")
+
+
+def telegram_polling_watchdog_loop() -> None:
+    if not TELEGRAM_LONG_POLLING or not TELEGRAM_POLL_WATCHDOG_ENABLED:
+        return
+    while True:
+        try:
+            snap = _telegram_poll_health_snapshot()
+            if not snap["thread_alive"]:
+                print("[WARN] Telegram polling watchdog detected dead thread; restarting.")
+                _start_telegram_polling_worker(reason="watchdog_dead_thread")
+            elif snap["stale"]:
+                print(
+                    "[WARN] Telegram polling watchdog detected stale loop "
+                    f"(last_seen={_fmt_diag_time(float(snap['loop_last_seen_at'] or 0.0))}, "
+                    f"threshold={int(TELEGRAM_POLL_STALE_SECONDS)}s)"
+                )
+        except Exception as e:
+            print(f"[WARN] Telegram polling watchdog error: {type(e).__name__}: {e}")
+        time.sleep(TELEGRAM_POLL_WATCHDOG_INTERVAL_SECONDS)
+
+
+def start_telegram_polling_watchdog_thread() -> None:
+    if not TELEGRAM_LONG_POLLING or not TELEGRAM_POLL_WATCHDOG_ENABLED:
+        return
+    t = threading.Thread(target=telegram_polling_watchdog_loop, daemon=True, name="telegram-poll-watchdog")
     t.start()
 
 
@@ -7018,7 +7596,12 @@ async def process_telegram_update(update: dict) -> None:
         # Caption text for image messages is synced through notion_append_chitchat_image;
         # skip plain text append here to avoid duplicated caption entries in Notion.
         if not has_image:
-            await asyncio.to_thread(notion_append_chitchat_text, text, msg_ts)
+            _spawn_background_to_thread(
+                notion_append_chitchat_text,
+                text,
+                msg_ts,
+                label="notion text append",
+            )
 
     if is_private and chat_id and has_audio_attachment and not has_image:
         handled = await handle_transcribe_audio_message(chat_id, message, message_ts=msg_ts)
@@ -7387,14 +7970,21 @@ def start_background_workers_once() -> None:
             return
         set_telegram_commands()
         start_news_thread()
+        start_kol_digest_thread()
         start_weekly_report_thread()
         start_slack_thread()
         start_dropbox_sync_thread()
         start_ocr_choice_expire_thread()
         start_telegram_polling_thread()
+        start_telegram_polling_watchdog_thread()
         _startup_done = True
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     start_background_workers_once()
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    return _app_health_snapshot()

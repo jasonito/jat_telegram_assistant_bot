@@ -3,6 +3,8 @@ import os
 import sys
 import types
 import unittest
+import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -221,6 +223,129 @@ class SmokeTests(unittest.TestCase):
             self.assertTrue(app._is_allowed_control_user(None, "@alice"))
             self.assertFalse(app._is_allowed_control_user("999", "bob"))
 
+    def test_digest_watchlist_command_requires_authorization_for_mutation(self):
+        with mock.patch.object(app, "ALLOWED_CONTROL_USERS", set()):
+            msg = app.handle_command(
+                "/add_kol https://x.com/kol1 KOL One",
+                user_id="123",
+                user_name="alice",
+            )
+        self.assertIn("未授權", msg)
+
+    def test_digest_watchlist_list_and_add_route_through_helpers(self):
+        fake_item = types.SimpleNamespace(
+            kol_id="x-kol1",
+            enabled=True,
+            platform="x",
+            display_name="KOL One",
+            handle_or_url="https://x.com/kol1",
+        )
+        with mock.patch.object(app, "KOL_WATCHLIST_PATH", Path("data/kol_watchlist.json")):
+            with mock.patch.object(app, "list_watchlist_entries", return_value=[fake_item]):
+                listed = app.handle_command("/list_kol")
+                self.assertIn("x-kol1", listed)
+            with mock.patch.object(app, "ALLOWED_CONTROL_USERS", {"123"}):
+                with mock.patch.object(app, "add_watchlist_entry", return_value=(fake_item, True)):
+                    added = app.handle_command(
+                        "/add_kol https://x.com/kol1 KOL One",
+                        user_id="123",
+                        user_name="alice",
+                    )
+        self.assertIn("added: x-kol1", added)
+
+    def test_short_kol_commands_route_to_watchlist_handler(self):
+        with mock.patch.object(app, "_handle_digest_watchlist_slash_command", return_value="ok") as mocked:
+            result = app.handle_command("add kol https://x.com/kol1 KOL One", user_id="123", user_name="alice")
+        self.assertEqual("ok", result)
+        mocked.assert_called_once()
+
+    def test_add_kol_infers_x_from_handle(self):
+        fake_item = types.SimpleNamespace(
+            kol_id="x-elonmusk",
+            enabled=True,
+            platform="x",
+            display_name="Elon Musk",
+            handle_or_url="@elonmusk",
+        )
+        with mock.patch.object(app, "ALLOWED_CONTROL_USERS", {"123"}):
+            with mock.patch.object(app, "add_watchlist_entry", return_value=(fake_item, True)) as mocked_add:
+                msg = app.handle_command("/add_kol @elonmusk Elon Musk", user_id="123", user_name="alice")
+        self.assertIn("added: x-elonmusk", msg)
+        self.assertEqual("x", mocked_add.call_args.kwargs["platform"])
+
+    def test_kol_fetch_schedule_aligns_with_8am_digest(self):
+        tz = timezone(timedelta(hours=8))
+        aligned = datetime(2026, 3, 10, 8, 0, tzinfo=tz)
+        self.assertEqual(
+            app._kol_fetch_run_key(aligned, digest_hour=8, digest_minute=0, interval_hours=6),
+            "2026-03-10:08:00",
+        )
+        self.assertEqual(
+            app._kol_fetch_run_key(aligned.replace(hour=2), digest_hour=8, digest_minute=0, interval_hours=6),
+            "2026-03-10:02:00",
+        )
+        self.assertEqual(
+            app._kol_fetch_run_key(aligned.replace(hour=14), digest_hour=8, digest_minute=0, interval_hours=6),
+            "2026-03-10:14:00",
+        )
+        self.assertIsNone(
+            app._kol_fetch_run_key(aligned.replace(hour=6), digest_hour=8, digest_minute=0, interval_hours=6)
+        )
+
+    def test_kol_digest_run_key_matches_only_exact_time(self):
+        tz = timezone(timedelta(hours=8))
+        exact = datetime(2026, 3, 10, 8, 0, tzinfo=tz)
+        self.assertEqual(
+            app._kol_digest_run_key(exact, digest_hour=8, digest_minute=0),
+            "2026-03-10:08:00",
+        )
+        self.assertIsNone(app._kol_digest_run_key(exact.replace(minute=1), digest_hour=8, digest_minute=0))
+        self.assertIsNone(app._kol_digest_run_key(exact.replace(hour=7), digest_hour=8, digest_minute=0))
+
+    def test_kol_digest_day_string_supports_yesterday(self):
+        tz = timezone(timedelta(hours=8))
+        now = datetime(2026, 3, 10, 0, 5, tzinfo=tz)
+        self.assertEqual(app._kol_digest_day_string(0, now=now), "2026-03-10")
+        self.assertEqual(app._kol_digest_day_string(-1, now=now), "2026-03-09")
+
+    def test_kol_today_generates_digest_if_missing(self):
+        fake_path = Path("digest/20260310_kol_digest.md")
+        with mock.patch.object(app, "KOL_DIGEST_OUTPUT_DIR", Path("digest")):
+            with mock.patch.object(Path, "exists", return_value=False):
+                with mock.patch.object(app, "generate_kol_digest_for_day", return_value=fake_path) as mocked_generate:
+                    with mock.patch.object(app, "_read_kol_digest_preview", return_value="# KOL Daily Digest"):
+                        result = app.handle_command("/kol_today")
+        self.assertIn("KOL Daily Digest", result)
+        mocked_generate.assert_called_once()
+
+    def test_kol_yesterday_generates_previous_day_digest_if_missing(self):
+        fake_path = Path("digest/20260309_kol_digest.md")
+        with mock.patch.object(app, "KOL_DIGEST_OUTPUT_DIR", Path("digest")):
+            with mock.patch.object(app, "_kol_digest_day_string", return_value="2026-03-09"):
+                with mock.patch.object(Path, "exists", return_value=False):
+                    with mock.patch.object(app, "generate_kol_digest_for_day", return_value=fake_path) as mocked_generate:
+                        with mock.patch.object(app, "_read_kol_digest_preview", return_value="# KOL Daily Digest - 2026-03-09"):
+                            result = app.handle_command("/kol_yesterday")
+        self.assertIn("2026-03-09", result)
+        mocked_generate.assert_called_once_with("2026-03-09")
+
+    def test_kol_now_requires_authorization(self):
+        with mock.patch.object(app, "ALLOWED_CONTROL_USERS", set()):
+            result = app.handle_command("/kol_now", user_id="123", user_name="alice")
+        self.assertIn("未授權", result)
+
+    def test_kol_now_runs_fetch_and_generate_digest(self):
+        fake_path = Path("digest/20260310_kol_digest.md")
+        with mock.patch.object(app, "ALLOWED_CONTROL_USERS", {"123"}):
+            with mock.patch.object(app, "run_kol_fetch_cycle", return_value={"x-kol1": 2}) as mocked_fetch:
+                with mock.patch.object(app, "generate_kol_digest_for_day", return_value=fake_path) as mocked_generate:
+                    with mock.patch.object(app, "_read_kol_digest_preview", return_value="# KOL Daily Digest"):
+                        result = app.handle_command("/kol_now", user_id="123", user_name="alice")
+        self.assertIn("KOL fetch done: 1 sources", result)
+        self.assertIn("x-kol1: 2 new posts fetched", result)
+        mocked_fetch.assert_called_once()
+        mocked_generate.assert_called_once()
+
     def test_handle_command_blocks_unauthorized_local_control(self):
         with mock.patch.object(app, "ALLOWED_CONTROL_USERS", set()):
             msg = app.handle_command("open https://example.com", user_id="123", user_name="alice")
@@ -255,6 +380,73 @@ class SmokeTests(unittest.TestCase):
                 out.unlink()
             if tmpdir.exists():
                 tmpdir.rmdir()
+
+    def test_private_youtube_url_does_not_block_on_notion_sync(self):
+        update = {
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": 1710391864,
+                "chat": {"id": 123, "type": "private", "username": "alice"},
+                "from": {"id": 456, "username": "alice"},
+                "text": "https://youtu.be/hXC7vtZCV_4?si=Lr6qGsGFs9v0ctoq",
+            },
+        }
+
+        with mock.patch.object(app, "store_message"):
+            with mock.patch.object(app, "append_markdown"):
+                with mock.patch.object(app, "_spawn_background_to_thread") as mocked_bg:
+                    with mock.patch.object(app, "handle_transcribe_audio_message", new=mock.AsyncMock(return_value=False)):
+                        with mock.patch.object(app, "handle_transcribe_cancel_command", new=mock.AsyncMock(return_value=False)):
+                            with mock.patch.object(app, "handle_transcribe_text_command", new=mock.AsyncMock(return_value=False)):
+                                with mock.patch.object(
+                                    app,
+                                    "handle_transcribe_auto_url_message",
+                                    new=mock.AsyncMock(return_value=True),
+                                ) as mocked_auto:
+                                    asyncio.run(app.process_telegram_update(update))
+
+        mocked_bg.assert_called_once_with(
+            app.notion_append_chitchat_text,
+            "https://youtu.be/hXC7vtZCV_4?si=Lr6qGsGFs9v0ctoq",
+            mock.ANY,
+            label="notion text append",
+        )
+        mocked_auto.assert_awaited_once()
+
+    def test_status_report_includes_telegram_poll_thread_health(self):
+        class _Thread:
+            name = "telegram-poll-1"
+
+            def is_alive(self):
+                return True
+
+        with mock.patch.object(app, "TELEGRAM_LONG_POLLING", True):
+            with mock.patch.object(app, "_telegram_poll_thread", _Thread()):
+                with mock.patch.object(app, "_telegram_poll_thread_started_at", 100.0):
+                    with mock.patch.object(app, "_telegram_poll_thread_restart_count", 2):
+                        with mock.patch.object(app, "_telegram_poll_loop_last_seen_at", 195.0):
+                            with mock.patch.object(app, "_telegram_poll_last_ok_at", 190.0):
+                                with mock.patch.object(app, "_telegram_poll_last_update_at", 191.0):
+                                    with mock.patch.object(app, "_telegram_poll_last_update_id", 123):
+                                        with mock.patch.object(app, "_telegram_poll_last_error", ""):
+                                            with mock.patch.object(app, "TELEGRAM_POLL_STALE_SECONDS", 30.0):
+                                                with mock.patch.object(app.time, "time", return_value=200.0):
+                                                    report = app.build_status_report()
+
+        self.assertIn("telegram poll thread: alive (telegram-poll-1)", report)
+        self.assertIn("telegram poll watchdog restarts: 2", report)
+        self.assertIn("telegram poll stale: no", report)
+
+    def test_healthz_reports_not_ok_when_long_polling_thread_is_down(self):
+        with mock.patch.object(app, "TELEGRAM_LONG_POLLING", True):
+            with mock.patch.object(app, "_telegram_poll_thread", None):
+                with mock.patch.object(app, "_telegram_poll_loop_last_seen_at", 0.0):
+                    payload = app.healthz()
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual("long_polling", payload["telegram_mode"])
+        self.assertFalse(payload["telegram_poll"]["thread_alive"])
 
     def test_build_scoped_summary_syncs_dropbox_before_note_summary(self):
         with mock.patch.object(app, "_sync_dropbox_before_weekly_report") as mocked_presync:

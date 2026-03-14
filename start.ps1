@@ -126,6 +126,35 @@ param(
     return @($pids | Select-Object -Unique)
   }
 
+  function Wait-HttpHealth([int]$targetPort, [bool]$expectLongPolling) {
+    $healthUrl = "http://127.0.0.1:$targetPort/healthz"
+    $deadline = (Get-Date).AddSeconds(30)
+    $lastDetail = ""
+    while ((Get-Date) -lt $deadline) {
+      try {
+        $resp = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 3
+        if ($null -eq $resp) {
+          $lastDetail = "empty health response"
+        } elseif (-not $resp.ok) {
+          $lastDetail = "health ok=false"
+        } elseif ($resp.telegram_mode -eq 'long_polling' -and $expectLongPolling) {
+          if ($resp.telegram_poll -and $resp.telegram_poll.thread_alive -and (-not $resp.telegram_poll.stale)) {
+            return $resp
+          }
+          $threadAlive = if ($resp.telegram_poll) { [bool]$resp.telegram_poll.thread_alive } else { $false }
+          $stale = if ($resp.telegram_poll) { [bool]$resp.telegram_poll.stale } else { $true }
+          $lastDetail = "poll thread not ready (alive=$threadAlive stale=$stale)"
+        } else {
+          return $resp
+        }
+      } catch {
+        $lastDetail = $_.Exception.Message
+      }
+      Start-Sleep -Milliseconds 800
+    }
+    throw "Health check did not become ready at $healthUrl within 30s. Last detail: $lastDetail"
+  }
+
   try {
     Ensure-Command 'python'
 
@@ -423,6 +452,7 @@ param(
       FilePath = $pythonExe
       WorkingDirectory = $PSScriptRoot
       ArgumentList = $uvicornArgs
+      PassThru = $true
     }
     if (-not $ShowWindow) {
       $startParams["WindowStyle"] = "Hidden"
@@ -441,7 +471,17 @@ param(
       $startParams["RedirectStandardOutput"] = $stdoutLog
       $startParams["RedirectStandardError"] = $stderrLog
     }
-    Start-Process @startParams
+    $proc = Start-Process @startParams
+    if ($null -eq $proc) {
+      throw "Failed to start uvicorn process."
+    }
+    Write-Info "uvicorn pid: $($proc.Id)"
+    $health = Wait-HttpHealth -targetPort $Port -expectLongPolling $isLongPollingMode
+    if ($health -and $health.telegram_mode) {
+      Write-Info "Health ready: mode=$($health.telegram_mode) ok=$($health.ok)"
+    } else {
+      Write-Info 'Health ready.'
+    }
   } catch {
     Write-Err $_.Exception.Message
     exit 1

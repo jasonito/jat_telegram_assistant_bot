@@ -19,6 +19,8 @@ Notes:
 - systemd template: `deploy/jat-bot.service.example`
 - Server operation runbook: `docs/SERVER_RUNBOOK.md`
 - Project memory / recurring pitfalls: `docs/PROJECT_MEMORY.md`
+- KOL Daily Digest plan: `docs/KOL_DAILY_DIGEST_PLAN.md`
+- KOL watchlist seed: `data/kol_watchlist.json`
 
 ## Env
 
@@ -26,6 +28,7 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 
 - main bot: `.env.main`
 - chitchat bot: `.env.chitchat`
+- digest bot: `.env.digest`
 
 `start.ps1` loads env values from `-EnvFile`, and `start-both.ps1` already uses `.env.main` + `.env.chitchat`.
 
@@ -84,6 +87,7 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 
 - Main profile template: `.env.main.example`
 - Chitchat profile template: `.env.chitchat.example`
+- Digest profile template: `.env.digest.example`
 - Legacy generic template: `.env.example`
 
 ## Run
@@ -92,6 +96,12 @@ Direct uvicorn run:
 
 ```powershell
 uvicorn app_chitchat:app --host 0.0.0.0 --port 8000
+```
+
+Digest profile direct run:
+
+```powershell
+uvicorn app_digest:app --host 0.0.0.0 --port 8002
 ```
 
 Recommended startup script:
@@ -112,6 +122,7 @@ Run with specific env file and port:
 ```powershell
 .\start.ps1 -EnvFile .env.main -Port 8000
 .\start.ps1 -EnvFile .env.chitchat -Port 8001
+.\start.ps1 -EnvFile .env.digest -Port 8002
 ```
 
 Start both bots:
@@ -119,6 +130,44 @@ Start both bots:
 ```powershell
 .\start-both.ps1
 ```
+
+The digest bot is currently started separately so its rollout stays independent from the existing main + chitchat startup flow.
+
+Phase 1 KOL digest scaffold now lives in `kol_digest.py`. It currently provides:
+
+- watchlist loading from `data/kol_watchlist.json`
+- SQLite schema bootstrap for KOL sources, posts, and digest runs
+- normalized post persistence with dedupe
+- markdown digest rendering to `read/digests/`-style output paths
+- replaceable X adapters via `build_x_source_adapter()`
+- optional `snscrape`-backed X adapter via `SnscrapeXAdapter`
+- optional Apify-backed X adapter skeleton via `ApifyXAdapter`
+- Telegram watchlist management via `/digest_watchlist`
+- digest profile background scheduler aligned to `08:00 Asia/Taipei`
+- default fetch slots at `02:00 / 08:00 / 14:00 / 20:00 Asia/Taipei`, with the `08:00` slot generating the previous calendar day's digest
+
+Current X adapter notes:
+
+- select the provider with `KOL_X_SOURCE_PROVIDER=snscrape|apify`
+- `snscrape` remains the default bootstrap path
+- `ApifyXAdapter` is wired as a generic task/actor client and usually needs `APIFY_X_INPUT_TEMPLATE_JSON` to match the chosen actor schema
+- provider-specific notes live in `docs/APIFY_X_ADAPTER.md`
+
+Digest watchlist command notes:
+
+- list: `/list_kol`
+- add: `/add_kol https://x.com/example Display Name`
+- add with handle: `/add_kol @example Display Name`
+- today digest: `/kol_today`
+- yesterday digest: `/kol_yesterday`
+- fetch now + rebuild digest: `/kol_now`
+- enable: `/on_kol <kol_id>`
+- disable: `/off_kol <kol_id>`
+- remove: `/del_kol <kol_id>`
+- platform is inferred automatically: `facebook.com` => `facebook`, `x.com`/`twitter.com`/`@handle`/plain handle => `x`
+- legacy forms still work: `/digest_watchlist ...` and `add kol ...`
+- mutation commands require the Telegram user to be allowlisted in `TELEGRAM_ALLOWED_CONTROL_USERS`
+- optional env override: `KOL_WATCHLIST_PATH`
 
 Troubleshoot startup/command routing (keep logs streaming in current terminal):
 
