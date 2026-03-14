@@ -32,16 +32,16 @@ Use this before production launch.
 - [ ] Log stream is clean during smoke test: `journalctl -u jat-bot -f`.
 - [ ] Dropbox transcript sync behaves as expected:
   - [ ] `DROPBOX_TRANSCRIPTS_PATH` points to correct folder
-  - [ ] downloaded files appear in `data/transcripts`
+  - [ ] downloaded files appear in `read/_runtime/transcribe`
 
 ## C. Backup & Recovery
 
 - [ ] Backup target is defined (another disk/bucket/NAS).
 - [ ] Daily backup is configured for:
-  - [ ] `data/messages.sqlite`
-  - [ ] `data/news`
-  - [ ] `data/notes`
-  - [ ] `data/transcripts` (if enabled)
+  - [ ] `read/messages.sqlite`
+  - [ ] `read/news`
+  - [ ] `read/notes`
+  - [ ] `read/_runtime/transcribe` (if enabled)
   - [ ] `.env` (encrypted or secret-managed backup)
 - [ ] Restore test completed at least once.
 - [ ] Disk usage alert threshold set (for example 80%).

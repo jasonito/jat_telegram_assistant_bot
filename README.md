@@ -20,7 +20,7 @@ Notes:
 - Server operation runbook: `docs/SERVER_RUNBOOK.md`
 - Project memory / recurring pitfalls: `docs/PROJECT_MEMORY.md`
 - KOL Daily Digest plan: `docs/KOL_DAILY_DIGEST_PLAN.md`
-- KOL watchlist seed: `data/kol_watchlist.json`
+- KOL watchlist seed: `read/kol_watchlist.json`
 
 ## Env
 
@@ -43,7 +43,7 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 
 ### Segment C: Feature Flags
 - Purpose: toggle major functions without code changes.
-- Keys: `FEATURE_NEWS_ENABLED`, `FEATURE_TRANSCRIBE_ENABLED`, `FEATURE_TRANSCRIBE_AUTO_URL`, `FEATURE_OCR_ENABLED`, `FEATURE_OCR_CHOICE_ENABLED`, `FEATURE_SLACK_ENABLED`.
+- Keys: `FEATURE_NEWS_ENABLED`, `FEATURE_WEEKLY_REPORT_ENABLED`, `FEATURE_TRANSCRIBE_ENABLED`, `FEATURE_TRANSCRIBE_AUTO_URL`, `FEATURE_OCR_ENABLED`, `FEATURE_OCR_CHOICE_ENABLED`, `FEATURE_SLACK_ENABLED`.
 - OCR choice behavior: `OCR_CHOICE_SCOPE`, `OCR_CHOICE_TIMEOUT_SECONDS`, `OCR_CHOICE_TIMEOUT_DEFAULT`.
 
 ### Segment D: Transcription Engine
@@ -62,15 +62,19 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 - Keys: `NEWS_ENABLED`, `NEWS_FETCH_INTERVAL_MINUTES`, `NEWS_LOOKBACK_HOURS`, `NEWS_STARTUP_FETCH_ENABLED`, `NEWS_STARTUP_NOTIFY_ENABLED`, `NEWS_PUSH_ENABLED`, `NEWS_PUSH_MAX_ITEMS`, `NEWS_GNEWS_*`, `NEWS_RSS_URLS`, `NEWS_RSS_URLS_FILE`, `NEWS_URL_FETCH_*`, `NEWS_DIGEST_*`, `NOTE_DIGEST_MAX_ITEMS`.
 - Current main profile defaults: `NEWS_FETCH_INTERVAL_MINUTES=360`, `NEWS_LOOKBACK_HOURS=24`, `NEWS_STARTUP_FETCH_ENABLED=1`, `NEWS_STARTUP_NOTIFY_ENABLED=1`.
 - Current behavior: on bot startup, news ingestion runs once immediately, sends a Telegram notice to enabled `news_subscriptions`, then continues on aligned 6-hour slots. The fetch window is 24 hours so the next startup can backfill after the PC was off.
+- `/news` now reads local markdown under `DATA_DIR\news`, filters items by `published_at` within the last 24 hours in `Asia/Taipei`, and renders clickable HTML links instead of AI bullet summaries.
+- If local `news` markdown for the recent window is missing, the bot first tries Dropbox remote-to-local news sync and then retries the local read.
 - Note/transcript AI input budget: `NOTE_AI_INPUT_MAX_CHARS` (current default `28000`).
 
 ### Segment G: AI Summary Providers
 - Purpose: shared AI config for digest/weekly report and transcript summary blocks.
 - Keys: `AI_SUMMARY_ENABLED`, `AI_SUMMARY_PROVIDER`, `AI_SUMMARY_TIMEOUT_SECONDS`, `AI_SUMMARY_MAX_CHARS`, `AI_SUMMARY_TEMPERATURE`.
 - Provider keys: `OPENAI_*`, `GEMINI_*`, `ANTHROPIC_*`, `HUGGINGFACE_*`, `OLLAMA_*`.
+- News title translation can use a separate provider via `NEWS_TITLE_TRANSLATION_PROVIDER` (for example `ollama` or `deeplx`).
+- Optional DeepLX keys: `DEEPLX_API_URL`, `DEEPLX_AUTH_KEY`.
 
 ### Segment H: Dropbox Sync
-- Purpose: sync notes/images/weekly report and import transcript files.
+- Purpose: sync notes/images/news/weekly report and import transcript files.
 - Keys: `DROPBOX_ACCESS_TOKEN`, `DROPBOX_REFRESH_TOKEN`, `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS`, `DROPBOX_ROOT_PATH`, `DROPBOX_SYNC_ENABLED`, `DROPBOX_SYNC_TIME`, `DROPBOX_SYNC_TZ`, `DROPBOX_SYNC_ON_STARTUP`, `DROPBOX_TRANSCRIPTS_PATH`, `DROPBOX_TRANSCRIPTS_SYNC_ENABLED`.
 
 ### Segment H-2: Weekly Report Push
@@ -267,17 +271,19 @@ notepad
 sort downloads
 /summary_notes_daily
 /summary_notes_weekly
-/summary_news_daily
 /summary_news_weekly
-/news latest
+/news
 /transcribe https://www.youtube.com/watch?v=VIDEO_ID
 ```
 
 `/news` and `/transcribe` availability depends on `FEATURE_NEWS_ENABLED` and `FEATURE_TRANSCRIBE_ENABLED`.
 
+`/summary_news_daily` and `/news_latest` are kept as compatibility aliases, but the main entry point is `/news`.
+
 ## Weekly Note Digest And Weekly Report
 
 - `/summary_notes_weekly` uses AI summarization when `AI_SUMMARY_ENABLED=1`.
+- Weekly commands and weekly push can be disabled entirely with `FEATURE_WEEKLY_REPORT_ENABLED=0`.
 - Before note daily/weekly summary runs, the bot syncs Dropbox note markdown for the requested date range into local `DATA_DIR\notes\...`.
 - Weekly note AI input now prefers larger raw transcript sections over aggressively compressed extracted lines, to preserve more source material.
 - Raw URL-only lines and note metadata lines are removed before the AI call.
@@ -371,6 +377,12 @@ Image OCR and cloud sync:
 - `/read & chat/read/notes`
 - `/read & chat/read/images`
 - Weekly report markdown is saved under `DATA_DIR\\weekly report\\` and also synced to Dropbox.
+
+Current sync notes:
+- The active local data root is `read/`, not the old `data/` path.
+- Dropbox sync covers `notes`, `news`, and `images` under `/read & chat/read/...`.
+- `news` supports Dropbox remote-to-local sync before `/news` reads the local markdown cache.
+- Weekly report storage and sync only matter when `FEATURE_WEEKLY_REPORT_ENABLED=1`.
 
 
 ## Markdown Cleanup Maintenance
