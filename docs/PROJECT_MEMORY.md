@@ -193,6 +193,23 @@ For each entry, capture:
   - `/kol_today` should remain safe for normal use; if today's file is missing it may generate from existing stored posts without forcing a network fetch.
   - Scheduled `08:00` digest generation should write the previous calendar day so the file name and digest window stay aligned.
 
+### 2026-03-11 - Facebook provider wiring and Meta review status
+
+- Summary: generalized KOL social-source fetching beyond X, added a Facebook provider interface with both `StubFacebookAdapter` and `MetaPagePublicContentAdapter`, updated digest config/docs/tests, and validated that the current blocker for tracking third-party public Facebook Pages is Meta review/access rather than app code wiring.
+- Files: `kol_digest.py`, `app.py`, `tests/test_kol_digest.py`, `README.md`, `.env.digest`, `.env.digest.example`, `privacy-policy.html`, `docs/KOL_FACEBOOK_PAGE_CANDIDATES.md`
+- Technologies: provider factory pattern, Meta Graph API skeleton integration, Facebook Page URL normalization, public-page candidate triage, GitHub Pages-hosted privacy policy, Meta App Review workflow
+- Pitfalls:
+  - `KOL_FACEBOOK_SOURCE_PROVIDER=meta` only proves the Graph API integration path; it does not bypass Meta review requirements for third-party public Pages.
+  - Current live tests with the updated token reached Graph API but returned `(#210) A page access token is required` for several likely Pages and `Unsupported get request` for others, so do not assume current permissions cover third-party Page reading.
+  - Seeing `pages_read_engagement` / `pages_show_list` as `可供測試` is not evidence that `Page Public Content Access` has been approved.
+  - The app dashboard currently showed no visible `Page Public Content Access` feature entry; App Review flow also prompted for business/access verification before higher review.
+  - Privacy policy must use the public GitHub Pages URL, not the GitHub `blob` URL.
+  - For this project's current scope, skip Threads review fields unless Threads ingestion is actually implemented.
+- Validation:
+  - `python -m unittest tests.test_kol_digest`
+  - `python -m py_compile app.py kol_digest.py tests\\test_kol_digest.py`
+  - Live Meta Graph API checks against the candidate Facebook URLs using `.env.digest`
+
 ## Recommended Workflow
 
 Before making non-trivial changes:

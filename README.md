@@ -152,9 +152,10 @@ Phase 1 KOL digest scaffold now lives in `kol_digest.py`. It currently provides:
 - SQLite schema bootstrap for KOL sources, posts, and digest runs
 - normalized post persistence with dedupe
 - markdown digest rendering to `read/digests/`-style output paths
-- replaceable X adapters via `build_x_source_adapter()`
+- replaceable social-source adapters via `build_x_source_adapter()`, `build_facebook_source_adapter()`, and `build_social_source_adapter()`
 - optional `snscrape`-backed X adapter via `SnscrapeXAdapter`
 - optional Apify-backed X adapter skeleton via `ApifyXAdapter`
+- Facebook provider interface wired via `StubFacebookAdapter` placeholder, so Meta Pages API or scraper-backed implementations can plug in without changing the digest flow
 - Telegram watchlist management via `/digest_watchlist`
 - digest profile background scheduler aligned to `08:00 Asia/Taipei`
 - default fetch slots at `02:00 / 08:00 / 14:00 / 20:00 Asia/Taipei`, with the `08:00` slot generating the previous calendar day's digest
@@ -165,6 +166,16 @@ Current X adapter notes:
 - `snscrape` remains the default bootstrap path
 - `ApifyXAdapter` is wired as a generic task/actor client and usually needs `APIFY_X_INPUT_TEMPLATE_JSON` to match the chosen actor schema
 - provider-specific notes live in `docs/APIFY_X_ADAPTER.md`
+
+Current Facebook adapter notes:
+
+- select the provider with `KOL_FACEBOOK_SOURCE_PROVIDER=stub`
+- `stub` is the current default and intentionally fails with a clear error until a real Facebook adapter is plugged in
+- planned real implementations can target Meta `Page Public Content Access` or a scraper-backed fetcher behind the same `SocialSourceAdapter` contract
+- the Meta skeleton is now wired as `KOL_FACEBOOK_SOURCE_PROVIDER=meta`
+- required env for the Meta skeleton: `META_GRAPH_API_ACCESS_TOKEN` or `META_PAGE_PUBLIC_CONTENT_ACCESS_TOKEN`
+- optional env for the Meta skeleton: `META_GRAPH_API_VERSION`, `META_FACEBOOK_POSTS_EDGE`, `META_FACEBOOK_FIELDS`
+- this adapter only proves the Graph API integration path; actual success still depends on Meta app review / `Page Public Content Access` approval and the exact Page permissions granted to the token
 
 Digest watchlist command notes:
 

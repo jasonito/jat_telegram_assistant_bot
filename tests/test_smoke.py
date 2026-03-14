@@ -448,6 +448,12 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual("long_polling", payload["telegram_mode"])
         self.assertFalse(payload["telegram_poll"]["thread_alive"])
 
+    def test_set_telegram_commands_request_error_does_not_crash_when_response_missing(self):
+        with mock.patch.object(app.requests, "Timeout", Exception, create=True):
+            with mock.patch.object(app.requests, "RequestException", Exception, create=True):
+                with mock.patch.object(app.requests, "post", side_effect=Exception("boom")):
+                    app.set_telegram_commands()
+
     def test_build_scoped_summary_syncs_dropbox_before_note_summary(self):
         with mock.patch.object(app, "_sync_dropbox_before_weekly_report") as mocked_presync:
             with mock.patch.object(app, "build_note_digest_recent", return_value=["weekly"]) as mocked_digest:
@@ -465,6 +471,11 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(result, ["daily"])
         mocked_presync.assert_called_once_with("2026-03-09", 1)
         mocked_digest.assert_called_once_with("2026-03-09")
+
+    def test_weekly_commands_return_disabled_message_when_feature_flag_off(self):
+        with mock.patch.object(app, "FEATURE_WEEKLY_REPORT_ENABLED", False):
+            self.assertEqual(app.handle_command("/summary_notes_weekly"), "週報功能目前已關閉。")
+            self.assertEqual(app.handle_command("/summary_news_weekly"), "週報功能目前已關閉。")
 
     def test_estimate_weekly_topic_count_scales_to_ten(self):
         self.assertEqual(app._estimate_weekly_topic_count("短摘要", 3), 2)
@@ -689,6 +700,108 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("AI 熱潮", result[title])
         self.assertIn("手機", result[title])
 
+    def test_translate_news_titles_to_zh_retries_when_ai_keeps_english_title(self):
+        title = "Why the AI Boom Will Make Phones More Expensive"
+        ai_outputs = [
+            f"1. {title}",
+            "1) 為何 AI 熱潮將使手機更昂貴",
+        ]
+        with mock.patch.object(app, "AI_SUMMARY_ENABLED", True):
+            with mock.patch.object(app, "_run_ai_chat", side_effect=ai_outputs):
+                result = app._translate_news_titles_to_zh([title])
+
+        self.assertEqual(result[title], "為何 AI 熱潮將使手機更昂貴")
+
+    def test_translate_news_titles_to_zh_uses_deeplx_translation(self):
+        title = "Why the AI Boom Will Make Phones More Expensive"
+
+        class FakeResp:
+            status_code = 200
+            content = b"1"
+
+            def json(self):
+                return {"data": "為何 AI 熱潮將使手機更昂貴"}
+
+        with mock.patch.object(app, "AI_SUMMARY_ENABLED", True):
+            with mock.patch.object(app, "NEWS_TITLE_TRANSLATION_PROVIDER", "deeplx"):
+                with mock.patch.object(app.requests, "post", return_value=FakeResp()):
+                    result = app._translate_news_titles_to_zh([title])
+
+        self.assertEqual(result[title], "為何 AI 熱潮將使手機更昂貴")
+
+    def test_parse_news_markdown_entries_extracts_title_url_and_time(self):
+        raw = (
+            "---\n"
+            'published_at: "2026-03-14T09:00:00+08:00"\n'
+            "canonical:\n"
+            '  source: "Reuters"\n'
+            '  url: "https://example.com/a"\n'
+            'title: "Example title"\n'
+            "---\n"
+            "Summary text\n"
+        )
+
+        entries = app._parse_news_markdown_entries(raw)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["title"], "Example title")
+        self.assertEqual(entries[0]["url"], "https://example.com/a")
+
+    def test_build_recent_news_links_html_reads_local_md_and_renders_html_links(self):
+        tmp_news = Path("tests_runtime_news_links")
+        now = datetime.now(tz=app.get_local_tz())
+        current_iso = (now - timedelta(hours=1)).isoformat()
+        old_iso = (now - timedelta(hours=30)).isoformat()
+        current_name = now.strftime("%Y%m%d_news.md")
+        previous_name = (now - timedelta(days=1)).strftime("%Y%m%d_news.md")
+        try:
+            if tmp_news.exists():
+                for fp in tmp_news.rglob("*"):
+                    if fp.is_file():
+                        fp.unlink()
+                for fp in sorted(tmp_news.rglob("*"), reverse=True):
+                    if fp.is_dir():
+                        fp.rmdir()
+            tmp_news.mkdir(exist_ok=True)
+            (tmp_news / current_name).write_text(
+                "---\n"
+                f'published_at: "{current_iso}"\n'
+                "canonical:\n"
+                '  source: "Reuters"\n'
+                '  url: "https://example.com/a"\n'
+                'title: "English title"\n'
+                "---\n"
+                "Summary\n",
+                encoding="utf-8",
+            )
+            (tmp_news / previous_name).write_text(
+                "---\n"
+                f'published_at: "{old_iso}"\n'
+                "canonical:\n"
+                '  source: "Reuters"\n'
+                '  url: "https://example.com/old"\n'
+                'title: "Old title"\n'
+                "---\n"
+                "Summary\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(app, "NEWS_MD_DIR", tmp_news):
+                with mock.patch.object(app, "_translate_news_titles_to_zh", return_value={"English title": "中文標題"}):
+                    html = app.build_recent_news_links_html(now=now)
+
+            self.assertIn("最近 24 小時新聞", html)
+            self.assertIn('href="https://example.com/a"', html)
+            self.assertIn("中文標題", html)
+            self.assertNotIn("https://example.com/old", html)
+        finally:
+            if tmp_news.exists():
+                for fp in tmp_news.rglob("*"):
+                    if fp.is_file():
+                        fp.unlink()
+                for fp in sorted(tmp_news.rglob("*"), reverse=True):
+                    if fp.is_dir():
+                        fp.rmdir()
+
     def test_sync_dropbox_notes_range_to_local_downloads_missing_remote_md(self):
         class FakeEntry:
             def __init__(self, path_lower, name, rev="r1", content_hash="h1"):
@@ -731,6 +844,105 @@ class SmokeTests(unittest.TestCase):
                     if fp.is_file():
                         fp.unlink()
                 for fp in sorted(tmp_notes.rglob("*"), reverse=True):
+                    if fp.is_dir():
+                        fp.rmdir()
+
+    def test_sync_dropbox_news_to_local_downloads_missing_remote_md(self):
+        class FakeEntry:
+            def __init__(self, path_lower, name, rev="r1", content_hash="h1"):
+                self.path_lower = path_lower
+                self.path_display = path_lower
+                self.name = name
+                self.rev = rev
+                self.content_hash = content_hash
+                self.server_modified = None
+                self.size = 12
+
+        remote_root = "/root/news"
+        entry = FakeEntry(f"{remote_root}/2026-03-09_news.md", "2026-03-09_news.md")
+        tmp_news = Path("tests_runtime_news")
+        try:
+            if tmp_news.exists():
+                for fp in tmp_news.rglob("*"):
+                    if fp.is_file():
+                        fp.unlink()
+                for fp in sorted(tmp_news.rglob("*"), reverse=True):
+                    if fp.is_dir():
+                        fp.rmdir()
+            tmp_news.mkdir(exist_ok=True)
+            with mock.patch.object(app, "FEATURE_NEWS_ENABLED", True):
+                with mock.patch.object(app, "DROPBOX_SYNC_ENABLED", True):
+                    with mock.patch.object(app, "DROPBOX_ROOT_PATH", "/root"):
+                        with mock.patch.object(app, "NEWS_MD_DIR", tmp_news):
+                            with mock.patch.object(app, "_dropbox_list_folder_entries_recursive", return_value=[entry]):
+                                with mock.patch.object(app, "_dropbox_download_file_bytes", return_value=b"# News\n\nRemote line\n"):
+                                    with mock.patch.object(app, "get_sync_state", return_value=None):
+                                        with mock.patch.object(app, "upsert_sync_state") as mocked_upsert:
+                                            stats = app.sync_dropbox_news_to_local(full_scan=True)
+
+            local_file = tmp_news / "2026-03-09_news.md"
+            self.assertTrue(local_file.exists())
+            self.assertIn("Remote line", local_file.read_text(encoding="utf-8"))
+            self.assertEqual(stats["news_remote_downloaded"], 1)
+            mocked_upsert.assert_called_once()
+        finally:
+            if tmp_news.exists():
+                for fp in tmp_news.rglob("*"):
+                    if fp.is_file():
+                        fp.unlink()
+                for fp in sorted(tmp_news.rglob("*"), reverse=True):
+                    if fp.is_dir():
+                        fp.rmdir()
+
+    def test_sync_dropbox_news_to_local_merges_remote_and_local_without_duplicate_blocks(self):
+        class FakeEntry:
+            def __init__(self, path_lower, name, rev="r1", content_hash="h1"):
+                self.path_lower = path_lower
+                self.path_display = path_lower
+                self.name = name
+                self.rev = rev
+                self.content_hash = content_hash
+                self.server_modified = None
+                self.size = 12
+
+        remote_root = "/root/news"
+        entry = FakeEntry(f"{remote_root}/2026-03-09_news.md", "2026-03-09_news.md")
+        tmp_news = Path("tests_runtime_news_merge")
+        local_file = tmp_news / "2026-03-09_news.md"
+        remote_text = "# 2026-03-09 News\n\n## Item A\n\nRemote only\n\n## Item Shared\n\nSame block\n"
+        local_text = "# 2026-03-09 News\n\n## Item Shared\n\nSame block\n\n## Item B\n\nLocal only\n"
+        try:
+            if tmp_news.exists():
+                for fp in tmp_news.rglob("*"):
+                    if fp.is_file():
+                        fp.unlink()
+                for fp in sorted(tmp_news.rglob("*"), reverse=True):
+                    if fp.is_dir():
+                        fp.rmdir()
+            tmp_news.mkdir(exist_ok=True)
+            local_file.write_text(local_text, encoding="utf-8")
+
+            with mock.patch.object(app, "FEATURE_NEWS_ENABLED", True):
+                with mock.patch.object(app, "DROPBOX_SYNC_ENABLED", True):
+                    with mock.patch.object(app, "DROPBOX_ROOT_PATH", "/root"):
+                        with mock.patch.object(app, "NEWS_MD_DIR", tmp_news):
+                            with mock.patch.object(app, "_dropbox_list_folder_entries_recursive", return_value=[entry]):
+                                with mock.patch.object(app, "_dropbox_download_file_bytes", return_value=remote_text.encode("utf-8")):
+                                    with mock.patch.object(app, "get_sync_state", return_value=None):
+                                        with mock.patch.object(app, "upsert_sync_state"):
+                                            stats = app.sync_dropbox_news_to_local(full_scan=True)
+
+            merged = local_file.read_text(encoding="utf-8")
+            self.assertIn("## Item A", merged)
+            self.assertIn("## Item B", merged)
+            self.assertEqual(merged.count("## Item Shared"), 1)
+            self.assertEqual(stats["news_remote_downloaded"], 1)
+        finally:
+            if tmp_news.exists():
+                for fp in tmp_news.rglob("*"):
+                    if fp.is_file():
+                        fp.unlink()
+                for fp in sorted(tmp_news.rglob("*"), reverse=True):
                     if fp.is_dir():
                         fp.rmdir()
 

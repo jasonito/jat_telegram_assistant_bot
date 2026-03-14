@@ -3,7 +3,7 @@ import asyncio
 import re
 import webbrowser
 import sys
-from html import unescape
+from html import escape, unescape
 from pathlib import Path, PurePosixPath
 import subprocess
 import shutil
@@ -207,6 +207,9 @@ AI_SUMMARY_TIMEOUT_SECONDS = int(
 AI_SUMMARY_MAX_CHARS = int(os.getenv("AI_SUMMARY_MAX_CHARS", "6000"))
 NOTE_AI_INPUT_MAX_CHARS = int(os.getenv("NOTE_AI_INPUT_MAX_CHARS", "28000"))
 AI_SUMMARY_TEMPERATURE = _env_float("AI_SUMMARY_TEMPERATURE", 0.2)
+NEWS_TITLE_TRANSLATION_PROVIDER = (
+    os.getenv("NEWS_TITLE_TRANSLATION_PROVIDER", AI_SUMMARY_PROVIDER).strip().lower()
+)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -221,6 +224,8 @@ HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "openai/gpt-oss-120b")
 HUGGINGFACE_BASE_URL = os.getenv("HUGGINGFACE_BASE_URL", "https://router.huggingface.co/v1")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+DEEPLX_API_URL = os.getenv("DEEPLX_API_URL", "http://127.0.0.1:1188/translate").strip()
+DEEPLX_AUTH_KEY = os.getenv("DEEPLX_AUTH_KEY", "").strip()
 NEWS_URL_FETCH_MAX_ARTICLES = int(os.getenv("NEWS_URL_FETCH_MAX_ARTICLES", "3"))
 NEWS_URL_FETCH_MAX_CHARS = int(os.getenv("NEWS_URL_FETCH_MAX_CHARS", "3000"))
 NEWS_URL_FETCH_TIMEOUT_SECONDS = int(os.getenv("NEWS_URL_FETCH_TIMEOUT_SECONDS", "6"))
@@ -271,6 +276,7 @@ NEWS_GNEWS_HL = os.getenv("NEWS_GNEWS_HL", "en-US")
 NEWS_GNEWS_GL = os.getenv("NEWS_GNEWS_GL", "US")
 NEWS_GNEWS_CEID = os.getenv("NEWS_GNEWS_CEID", "US:en")
 FEATURE_NEWS_ENABLED = _env_flag("FEATURE_NEWS_ENABLED", NEWS_ENABLED)
+FEATURE_WEEKLY_REPORT_ENABLED = _env_flag("FEATURE_WEEKLY_REPORT_ENABLED", True)
 FEATURE_TRANSCRIBE_ENABLED = _env_flag("FEATURE_TRANSCRIBE_ENABLED", True)
 FEATURE_TRANSCRIBE_AUTO_URL = _env_flag("FEATURE_TRANSCRIBE_AUTO_URL", False)
 TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS = max(10, int(os.getenv("TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS", "30")))
@@ -1632,6 +1638,8 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
         return "\n".join(parts)
 
     if text_lower.startswith("/summary_notes_weekly"):
+        if not FEATURE_WEEKLY_REPORT_ENABLED:
+            return "週報功能目前已關閉。"
         day = _parse_day_arg(text)
         parts = build_scoped_summary(day, "note", recent_days=7)
         return "\n".join(parts)
@@ -1639,11 +1647,11 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
     if text_lower.startswith("/summary_news_daily"):
         if not FEATURE_NEWS_ENABLED:
             return "新聞功能已關閉。"
-        day = _parse_day_arg(text)
-        parts = build_scoped_summary(day, "news")
-        return "\n".join(parts)
+        return handle_command("/news", user_id=user_id, user_name=user_name)
 
     if text_lower.startswith("/summary_news_weekly"):
+        if not FEATURE_WEEKLY_REPORT_ENABLED:
+            return "週報功能目前已關閉。"
         if not FEATURE_NEWS_ENABLED:
             return "新聞功能已關閉。"
         day = _parse_day_arg(text)
@@ -1693,7 +1701,9 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
 
     if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_latest"):
         suffix = text.strip()[len("/news_latest") :].strip()
-        return "\n".join(handle_news_command(f"/news latest {suffix}".strip(), ""))
+        if suffix:
+            return "\n".join(handle_news_command(f"/news {suffix}".strip(), ""))
+        return "\n".join(handle_news_command("/news", ""))
     if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_sources"):
         return "\n".join(handle_news_command("/news sources", ""))
     if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_debug"):
@@ -1704,7 +1714,7 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
     if text_lower.startswith("/news"):
         if not FEATURE_NEWS_ENABLED:
             return "新聞功能已關閉。"
-        return "用法：/news latest | /news search <keywords> | /news sources | /news add <url> | /news remove <id> | /news enable <id> | /news disable <id> | /news help"
+        return "用法：/news | /news search <keywords> | /news sources | /news add <url> | /news remove <id> | /news enable <id> | /news disable <id> | /news help"
 
     if text_lower.startswith("open "):
         if not _is_allowed_control_user(user_id, user_name):
@@ -1734,8 +1744,9 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
             "/whoami",
             "/status",
             "/summary_notes_daily",
-            "/summary_notes_weekly",
         ]
+        if FEATURE_WEEKLY_REPORT_ENABLED:
+            cmds.append("/summary_notes_weekly")
         if KOL_DIGEST_MODULE_AVAILABLE:
             cmds.extend([
                 "/kol_today",
@@ -1746,7 +1757,9 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
         if APP_PROFILE == "chitchat":
             cmds.append("/notion_test")
         if FEATURE_NEWS_ENABLED:
-            cmds.extend(["/news latest", "/news sources", "/summary_news_daily", "/summary_news_weekly"])
+            cmds.extend(["/news", "/news sources"])
+            if FEATURE_WEEKLY_REPORT_ENABLED:
+                cmds.append("/summary_news_weekly")
         if FEATURE_TRANSCRIBE_ENABLED:
             cmds.append("/transcribe <url>")
             cmds.append("/cancel")
@@ -1769,22 +1782,24 @@ def route_user_text_command(
     if FEATURE_NEWS_ENABLED and lower.startswith("/news"):
         replies = handle_news_command(cmd_text, chat_id, user_id=user_id, user_name=user_name)
         tokens = cmd_text.split()
-        sub = tokens[1].lower() if len(tokens) > 1 else "latest"
-        parse_mode = "Markdown" if sub == "latest" else None
-        disable_preview = True if sub == "latest" else None
+        sub = tokens[1].lower() if len(tokens) > 1 else ""
+        parse_mode = "HTML" if sub in {"", "latest"} else None
+        disable_preview = True if parse_mode == "HTML" else None
         return replies, parse_mode, disable_preview
 
     reply = handle_command(cmd_text, user_id=user_id, user_name=user_name)
     parse_mode = None
     disable_preview = None
-    if lower.startswith("/summary_notes_daily") or lower.startswith("/summary_notes_weekly"):
+    if lower.startswith("/summary_notes_daily") or (
+        FEATURE_WEEKLY_REPORT_ENABLED and lower.startswith("/summary_notes_weekly")
+    ):
         parse_mode = "Markdown"
         disable_preview = True
     if FEATURE_NEWS_ENABLED and (
         lower.startswith("/summary_news_daily")
-        or lower.startswith("/summary_news_weekly")
+        or (FEATURE_WEEKLY_REPORT_ENABLED and lower.startswith("/summary_news_weekly"))
     ):
-        parse_mode = "Markdown"
+        parse_mode = "HTML" if lower.startswith("/summary_news_daily") else "Markdown"
         disable_preview = True
     return [reply], parse_mode, disable_preview
 
@@ -2297,6 +2312,73 @@ def sync_dropbox_notes_range_to_local(start_day: str, end_day: str) -> dict[str,
         except Exception as e:
             stats["notes_remote_failed"] += 1
             print(f"[WARN] Dropbox ranged notes sync failed for {remote_path}: {e}")
+    return stats
+
+
+def sync_dropbox_news_to_local(full_scan: bool = False) -> dict[str, int]:
+    stats = {
+        "news_remote_scanned": 0,
+        "news_remote_downloaded": 0,
+        "news_remote_skipped": 0,
+        "news_remote_failed": 0,
+    }
+    if not FEATURE_NEWS_ENABLED or not DROPBOX_SYNC_ENABLED:
+        return stats
+
+    root = normalize_dropbox_path(DROPBOX_ROOT_PATH)
+    remote_root = f"{root}/news".replace("//", "/")
+
+    try:
+        entries = _dropbox_list_folder_entries_recursive(remote_root)
+    except Exception as e:
+        print(f"[WARN] Dropbox news sync failed to list news: {e}")
+        stats["news_remote_failed"] += 1
+        return stats
+
+    for entry in entries:
+        remote_path = str(getattr(entry, "path_display", "") or getattr(entry, "path_lower", "") or "").strip()
+        name = str(getattr(entry, "name", "") or "").strip()
+        if not remote_path or not name:
+            continue
+        if Path(name).suffix.lower() not in {".md", ".markdown"}:
+            continue
+
+        stats["news_remote_scanned"] += 1
+        rel = _safe_dropbox_relpath(remote_root, remote_path)
+        if not rel:
+            stats["news_remote_skipped"] += 1
+            continue
+
+        local_path = NEWS_MD_DIR / Path(rel)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        state_key = rel.replace("\\", "/")
+        fingerprint = _dropbox_entry_fingerprint(entry)
+        last_fp = get_sync_state("dropbox_news_remote", state_key)
+        if not full_scan and last_fp == fingerprint and local_path.exists():
+            stats["news_remote_skipped"] += 1
+            continue
+
+        try:
+            remote_bytes = _dropbox_download_file_bytes(remote_path)
+            if remote_bytes is None:
+                stats["news_remote_failed"] += 1
+                continue
+
+            remote_text = remote_bytes.decode("utf-8", errors="replace")
+            if local_path.exists():
+                local_text = local_path.read_text(encoding="utf-8")
+                merged_text = merge_markdown_content(remote_text, local_text)
+            else:
+                merged_text = remote_text.replace("\r\n", "\n")
+                if merged_text and not merged_text.endswith("\n"):
+                    merged_text += "\n"
+            local_path.write_text(merged_text, encoding="utf-8")
+            upsert_sync_state("dropbox_news_remote", state_key, fingerprint)
+            stats["news_remote_downloaded"] += 1
+        except Exception as e:
+            stats["news_remote_failed"] += 1
+            print(f"[WARN] Dropbox news sync failed for {remote_path}: {e}")
+
     return stats
 
 
@@ -3254,6 +3336,10 @@ def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
         "uploaded": 0,
         "skipped": 0,
         "failed": 0,
+        "news_remote_scanned": 0,
+        "news_remote_downloaded": 0,
+        "news_remote_skipped": 0,
+        "news_remote_failed": 0,
         "transcripts_scanned": 0,
         "transcripts_downloaded": 0,
         "transcripts_skipped": 0,
@@ -3272,6 +3358,8 @@ def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
     except Exception as e:
         print(f"[WARN] Dropbox folder bootstrap failed: {e}")
         return stats
+    news_stats = sync_dropbox_news_to_local(full_scan=full_scan)
+    stats.update({k: stats.get(k, 0) + news_stats.get(k, 0) for k in news_stats})
     transcript_stats = sync_dropbox_transcripts_to_local(full_scan=full_scan)
     stats.update({k: stats.get(k, 0) + transcript_stats.get(k, 0) for k in transcript_stats})
     for category, local_path, rel in iter_sync_files():
@@ -3306,6 +3394,10 @@ def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
         "[INFO] Dropbox sync finished "
         f"scanned={stats['scanned']} uploaded={stats['uploaded']} "
         f"skipped={stats['skipped']} failed={stats['failed']} "
+        f"news_remote_scanned={stats['news_remote_scanned']} "
+        f"news_remote_downloaded={stats['news_remote_downloaded']} "
+        f"news_remote_skipped={stats['news_remote_skipped']} "
+        f"news_remote_failed={stats['news_remote_failed']} "
         f"transcripts_scanned={stats['transcripts_scanned']} "
         f"transcripts_downloaded={stats['transcripts_downloaded']} "
         f"transcripts_skipped={stats['transcripts_skipped']} "
@@ -5012,6 +5104,93 @@ def _extract_news_title_url_from_line(line: str) -> tuple[str, str]:
     return plain, ""
 
 
+def _yaml_unescape(text: str) -> str:
+    t = str(text or "")
+    return t.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _parse_news_markdown_entries(text: str) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for match in re.finditer(r"(?ms)^---\n(.*?)\n---\n", text or ""):
+        front_matter = match.group(1)
+        title_match = re.search(r'^title:\s+"((?:\\.|[^"])*)"$', front_matter, flags=re.M)
+        url_match = re.search(r'^\s+url:\s+"((?:\\.|[^"])*)"$', front_matter, flags=re.M)
+        published_match = re.search(r'^published_at:\s+"((?:\\.|[^"])*)"$', front_matter, flags=re.M)
+        source_match = re.search(r'^\s+source:\s+"((?:\\.|[^"])*)"$', front_matter, flags=re.M)
+        title = _yaml_unescape(title_match.group(1)) if title_match else ""
+        url = _yaml_unescape(url_match.group(1)) if url_match else ""
+        published_at = _yaml_unescape(published_match.group(1)) if published_match else ""
+        source = _yaml_unescape(source_match.group(1)) if source_match else ""
+        if title and url and published_at:
+            entries.append(
+                {
+                    "title": title.strip(),
+                    "url": url.strip(),
+                    "published_at": published_at.strip(),
+                    "source": source.strip(),
+                }
+            )
+    return entries
+
+
+def _load_recent_news_entries_from_local(now: datetime | None = None) -> list[dict[str, str]]:
+    current = now or datetime.now(tz=get_local_tz())
+    cutoff = current - timedelta(hours=24)
+    day_keys = {
+        current.strftime("%Y-%m-%d"),
+        current.strftime("%Y%m%d"),
+        cutoff.strftime("%Y-%m-%d"),
+        cutoff.strftime("%Y%m%d"),
+    }
+    candidates = sorted(
+        [
+            fp
+            for fp in NEWS_MD_DIR.glob("*.md")
+            if any(key in fp.name for key in day_keys)
+        ]
+    )
+    items: list[dict[str, str]] = []
+    for fp in candidates:
+        try:
+            raw = fp.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for item in _parse_news_markdown_entries(raw):
+            ts = _safe_parse_iso(item.get("published_at", ""))
+            if not ts:
+                continue
+            ts_local = ts.astimezone(get_local_tz())
+            if ts_local < cutoff or ts_local > current:
+                continue
+            item["published_at"] = ts_local.isoformat()
+            items.append(item)
+    items.sort(key=lambda row: row.get("published_at", ""), reverse=True)
+    return items
+
+
+def _render_news_entries_html(items: list[dict[str, str]], *, header: str) -> str:
+    if not items:
+        return f"<b>{escape(header)}</b>\n\n指定期間無可用新聞資料。"
+
+    translations = _translate_news_titles_to_zh([item.get("title", "") for item in items])
+    lines = [f"<b>{escape(header)}</b>", ""]
+    for idx, item in enumerate(items, start=1):
+        title = item.get("title", "").strip()
+        display_title = translations.get(title, "").strip() or title or "Untitled"
+        url = item.get("url", "").strip()
+        lines.append(f'{idx}. <a href="{escape(url, quote=True)}">{escape(display_title)}</a>')
+    return "\n".join(lines)
+
+
+def build_recent_news_links_html(now: datetime | None = None) -> str:
+    current = now or datetime.now(tz=get_local_tz())
+    items = _load_recent_news_entries_from_local(now=current)
+    if not items and DROPBOX_SYNC_ENABLED:
+        sync_dropbox_news_to_local(full_scan=True)
+        items = _load_recent_news_entries_from_local(now=current)
+    return _render_news_entries_html(items, header="最近 24 小時新聞")
+
+
 def _extract_weekly_topic_keywords(text: str) -> set[str]:
     clean = _clean_plain_text(text or "").lower()
     clean = re.sub(r"https?://\S+", " ", clean)
@@ -5207,32 +5386,136 @@ def _translate_news_titles_to_zh(titles: list[str]) -> dict[str, str]:
         t = re.sub(r"\s+", " ", t).strip(" -|:")
         return t
 
+    def _norm_text(text: str) -> str:
+        t = _clean_plain_text(text or "").strip().lower()
+        t = re.sub(r"\s+", " ", t)
+        return t
+
+    def _contains_cjk(text: str) -> bool:
+        return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+    def _looks_mostly_english(text: str) -> bool:
+        t = _clean_plain_text(text or "")
+        letters = len(re.findall(r"[A-Za-z]", t))
+        cjk = len(re.findall(r"[\u4e00-\u9fff]", t))
+        return letters >= 8 and letters > cjk * 2
+
+    def _is_translation_usable(original: str, translated: str) -> bool:
+        candidate = _clean_plain_text(translated or "").strip()
+        if not candidate:
+            return False
+        if _norm_text(candidate) == _norm_text(original):
+            return not _looks_mostly_english(original)
+        if _looks_mostly_english(original) and not _contains_cjk(candidate):
+            return False
+        return True
+
+    def _build_prompt(batch: list[str], *, retry: bool) -> tuple[str, str]:
+        numbered = "\n".join(f"{idx}. {title}" for idx, title in enumerate(batch, start=1))
+        system_prompt = (
+            "You translate news headlines into Traditional Chinese."
+            " Keep facts unchanged and return only numbered lines."
+        )
+        user_prompt = (
+            "請將以下新聞標題翻譯成繁體中文。\n"
+            "要求：\n"
+            "1) 只能輸出對應的翻譯結果，不要加前言、結語或說明。\n"
+            "2) 每行格式固定為「編號. 翻譯後標題」。可接受「編號) 翻譯後標題」。\n"
+            "3) 公司、人名、產品名可保留英文，但句子其餘部分必須翻成繁體中文。\n"
+            "4) 不可整句照抄英文原標題；若無標準譯名，至少將動作、描述與語氣翻成繁中。\n"
+            "5) 不補充評論，不省略任何編號。\n"
+        )
+        if retry:
+            user_prompt += "6) 上一次有些標題保留過多英文，這次請務必把可翻的部分都翻成繁體中文。\n"
+        user_prompt += f"\n{numbered}"
+        return system_prompt, user_prompt
+
+    def _parse_ai_output(batch: list[str], output: str) -> dict[str, str]:
+        parsed: dict[str, str] = {}
+        for line in (output or "").splitlines():
+            m = re.match(r"^\s*(\d+)[.)]\s*(.+?)\s*$", line)
+            if not m:
+                continue
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(batch):
+                parsed[batch[idx]] = _clean_plain_text(m.group(2)).strip()
+        return parsed
+
+    def _translate_with_deeplx(title: str) -> str:
+        payload = {
+            "text": title,
+            "source_lang": "EN",
+            "target_lang": "ZH",
+        }
+        headers = {"Content-Type": "application/json"}
+        if DEEPLX_AUTH_KEY:
+            headers["Authorization"] = f"Bearer {DEEPLX_AUTH_KEY}"
+        try:
+            resp = requests.post(
+                DEEPLX_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=min(10, AI_SUMMARY_TIMEOUT_SECONDS),
+            )
+            if resp.status_code >= 300:
+                return ""
+            data = resp.json() if resp.content else {}
+        except Exception:
+            return ""
+
+        candidates = [
+            data.get("data"),
+            data.get("translation"),
+            data.get("translatedText"),
+            (data.get("alternatives") or [None])[0],
+        ]
+        for value in candidates:
+            text = _clean_plain_text(value or "").strip()
+            if text:
+                return text
+        return ""
+
     clean_titles = [(_clean_plain_text(t or "").strip()) for t in titles]
     clean_titles = [t for t in clean_titles if t]
     if not clean_titles:
         return {}
     if not AI_SUMMARY_ENABLED:
         return {title: _rule_based_title_translation(title) or title for title in clean_titles}
-    numbered = "\n".join(f"{idx}. {title}" for idx, title in enumerate(clean_titles, start=1))
-    system_prompt = "Translate news headlines into Traditional Chinese. Keep facts unchanged."
-    user_prompt = (
-        "請將以下新聞標題翻譯成繁體中文。\n"
-        "要求：\n"
-        "1) 僅翻譯，不補充評論。\n"
-        "2) 保留公司、人名、產品名的常見譯名；若無常見譯名可保留英文。\n"
-        "3) 每行格式固定為「編號. 翻譯後標題」。\n\n"
-        f"{numbered}"
-    )
-    out = _run_ai_chat(system_prompt, user_prompt) or ""
-    translated: dict[str, str] = {}
-    for line in out.splitlines():
-        m = re.match(r"^\s*(\d+)\.\s*(.+?)\s*$", line)
-        if not m:
-            continue
-        idx = int(m.group(1)) - 1
-        if 0 <= idx < len(clean_titles):
-            translated[clean_titles[idx]] = _clean_plain_text(m.group(2)).strip() or clean_titles[idx]
-    return {title: translated.get(title, _rule_based_title_translation(title) or title) for title in clean_titles}
+    if NEWS_TITLE_TRANSLATION_PROVIDER == "deeplx":
+        translated: dict[str, str] = {}
+        unresolved: list[str] = []
+        for title in clean_titles:
+            candidate = _translate_with_deeplx(title)
+            if _is_translation_usable(title, candidate):
+                translated[title] = candidate
+            else:
+                unresolved.append(title)
+        if not unresolved:
+            return translated
+        clean_titles = unresolved
+    else:
+        translated = {}
+    batch_size = 20
+    for start in range(0, len(clean_titles), batch_size):
+        batch = clean_titles[start:start + batch_size]
+        unresolved = list(batch)
+        for retry in (False, True):
+            if not unresolved:
+                break
+            system_prompt, user_prompt = _build_prompt(unresolved, retry=retry)
+            out = _run_ai_chat(system_prompt, user_prompt) or ""
+            parsed = _parse_ai_output(unresolved, out)
+            next_unresolved: list[str] = []
+            for title in unresolved:
+                candidate = parsed.get(title, "")
+                if _is_translation_usable(title, candidate):
+                    translated[title] = candidate
+                else:
+                    next_unresolved.append(title)
+            unresolved = next_unresolved
+        for title in unresolved:
+            translated[title] = _rule_based_title_translation(title) or title
+    return {title: translated.get(title, _rule_based_title_translation(title) or title) for title in titles if _clean_plain_text(title or "").strip()}
 
 
 def _classify_news_title(title: str) -> str:
@@ -5952,6 +6235,8 @@ def generate_weekly_report(day: str, *, include_actions: bool, save_report: bool
 
 
 def summary_weekly(day: str) -> list[str]:
+    if not FEATURE_WEEKLY_REPORT_ENABLED:
+        return ["週報功能目前已關閉。"]
     return generate_weekly_report(day, include_actions=(APP_PROFILE == "main"), save_report=False)
 
 
@@ -6576,7 +6861,9 @@ def handle_news_command(
         return ["新聞功能已關閉。"]
 
     tokens = text.strip().split()
-    sub = tokens[1].lower() if len(tokens) > 1 else "latest"
+    sub = tokens[1].lower() if len(tokens) > 1 else ""
+    if sub in {"", "latest"}:
+        return [build_recent_news_links_html()]
     if sub == "sources":
         rows = list_news_feeds()
         if rows:
@@ -6659,15 +6946,9 @@ def handle_news_command(
         for source, cnt in rows:
             lines.append(f"- {source}: {cnt}")
         return ["\n".join(lines)]
-    if sub == "latest":
-        fetch_and_store_news()
-        end_day = datetime.now(tz=get_local_tz()).strftime("%Y-%m-%d")
-        if len(tokens) >= 3 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[2]):
-            end_day = tokens[2]
-        return ["\n".join(build_scoped_summary(end_day, "news", recent_days=3))]
     if sub == "help":
         return [
-            "News commands: /news latest [YYYY-MM-DD], /news search <keywords>, /news sources, /news add <url> | <name>, /news remove <id>, /news enable <id>, /news disable <id>, /news debug"
+            "News commands: /news, /news search <keywords>, /news sources, /news add <url> | <name>, /news remove <id>, /news enable <id>, /news disable <id>, /news debug"
         ]
     return ["Unknown /news subcommand. Use /news help."]
 
@@ -6675,8 +6956,9 @@ def handle_news_command(
 def set_telegram_commands() -> None:
     commands = [
         {"command": "summary_notes_daily", "description": "Daily notes digest"},
-        {"command": "summary_notes_weekly", "description": "Weekly notes digest"},
     ]
+    if FEATURE_WEEKLY_REPORT_ENABLED:
+        commands.append({"command": "summary_notes_weekly", "description": "Weekly notes digest"})
     if APP_PROFILE == "digest":
         commands.extend(
             [
@@ -6696,14 +6978,13 @@ def set_telegram_commands() -> None:
         commands.extend(
             [
                 {"command": "news", "description": "News commands and feed management"},
-                {"command": "news_latest", "description": "Latest digest (3 days)"},
                 {"command": "news_sources", "description": "List news sources"},
                 {"command": "news_debug", "description": "Debug ingestion"},
                 {"command": "news_help", "description": "News command help"},
-                {"command": "summary_news_daily", "description": "Daily news digest"},
-                {"command": "summary_news_weekly", "description": "Weekly news digest"},
             ]
         )
+        if FEATURE_WEEKLY_REPORT_ENABLED:
+            commands.append({"command": "summary_news_weekly", "description": "Weekly news digest"})
     if FEATURE_TRANSCRIBE_ENABLED:
         commands.append({"command": "transcribe", "description": "Transcribe url/audio to markdown"})
         commands.append({"command": "cancel", "description": "Cancel active transcription"})
@@ -7325,7 +7606,7 @@ def start_kol_digest_thread() -> None:
 
 
 def start_weekly_report_thread() -> None:
-    if not WEEKLY_REPORT_PUSH_ENABLED:
+    if not FEATURE_WEEKLY_REPORT_ENABLED or not WEEKLY_REPORT_PUSH_ENABLED:
         return
 
     run_hour, run_minute = parse_hhmm(WEEKLY_REPORT_PUSH_TIME, default_hour=9, default_minute=0)
