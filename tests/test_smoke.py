@@ -1,5 +1,6 @@
 import importlib
 import os
+import shutil
 import sys
 import types
 import unittest
@@ -205,6 +206,125 @@ transcription = importlib.import_module("transcription")
 
 
 class SmokeTests(unittest.TestCase):
+    def test_dropbox_remote_path_for_local_transcript_uses_transcript_root(self):
+        tmpdir = Path("tests_runtime_transcribe") / "unit_transcript_path"
+        if tmpdir.exists():
+            shutil.rmtree(tmpdir)
+        try:
+            transcript_root = tmpdir / "_runtime" / "transcribe"
+            transcript_root.mkdir(parents=True, exist_ok=True)
+            transcript_path = transcript_root / "2026-03-17_sample.md"
+            transcript_path.write_text("sample", encoding="utf-8")
+
+            with mock.patch.object(app, "TRANSCRIPTS_DIR", transcript_root), mock.patch.object(
+                app, "DROPBOX_TRANSCRIPTS_PATH", "/Transcripts"
+            ):
+                remote_path = app._dropbox_remote_path_for_local_transcript(transcript_path)
+
+            self.assertEqual(remote_path, "/Transcripts/2026-03-17_sample.md")
+        finally:
+            if tmpdir.exists():
+                shutil.rmtree(tmpdir)
+
+    def test_run_dropbox_sync_uploads_local_transcripts(self):
+        tmpdir = Path("tests_runtime_transcribe") / "unit_dropbox_sync"
+        if tmpdir.exists():
+            shutil.rmtree(tmpdir)
+        try:
+            transcript_root = tmpdir / "_runtime" / "transcribe"
+            transcript_root.mkdir(parents=True, exist_ok=True)
+            transcript_path = transcript_root / "2026-03-17_sample.md"
+            transcript_path.write_text("sample transcript", encoding="utf-8")
+
+            zero_stats = {
+                "transcripts_scanned": 0,
+                "transcripts_downloaded": 0,
+                "transcripts_skipped": 0,
+                "transcripts_failed": 0,
+            }
+            uploaded_paths: list[tuple[Path, str]] = []
+
+            def _record_upload(local_path: Path, remote_path: str) -> None:
+                uploaded_paths.append((local_path, remote_path))
+
+            with mock.patch.object(app, "TRANSCRIPTS_DIR", transcript_root), mock.patch.object(
+                app, "DROPBOX_SYNC_ENABLED", True
+            ), mock.patch.object(
+                app, "DROPBOX_TRANSCRIPTS_SYNC_ENABLED", True
+            ), mock.patch.object(
+                app, "DROPBOX_TRANSCRIPTS_PATH", "/Transcripts"
+            ), mock.patch.object(
+                app, "_get_dropbox_client", return_value=object()
+            ), mock.patch.object(
+                app, "_dropbox_call_with_retry", side_effect=lambda func: func(object())
+            ), mock.patch.object(
+                app, "_dropbox_create_folder_if_missing"
+            ), mock.patch.object(
+                app, "sync_dropbox_news_to_local", return_value={}
+            ), mock.patch.object(
+                app, "sync_dropbox_transcripts_to_local", return_value=zero_stats
+            ), mock.patch.object(
+                app, "iter_sync_files", return_value=iter(())
+            ), mock.patch.object(
+                app, "sync_file_to_dropbox", side_effect=_record_upload
+            ), mock.patch.object(
+                app, "get_sync_state", return_value=None
+            ), mock.patch.object(
+                app, "upsert_sync_state"
+            ):
+                stats = app.run_dropbox_sync(full_scan=False)
+
+            self.assertEqual(uploaded_paths, [(transcript_path, "/Transcripts/2026-03-17_sample.md")])
+            self.assertEqual(stats["uploaded"], 1)
+        finally:
+            if tmpdir.exists():
+                shutil.rmtree(tmpdir)
+
+    def test_postprocess_transcript_output_appends_daily_note_after_summary(self):
+        calls: list[str] = []
+
+        def _record_notion(**kwargs):
+            calls.append("notion")
+
+        def _record_build_summary(path):
+            calls.append("build_summary")
+            return "summary text"
+
+        def _record_prepend(path, summary):
+            calls.append("prepend_summary")
+
+        def _record_append(chat_id, title, source, transcript_path, message_ts):
+            calls.append("append_daily_note")
+
+        def _record_sync(path):
+            calls.append("sync_transcript")
+
+        async def _run():
+            with mock.patch.object(app, "notion_append_chitchat_transcript", side_effect=_record_notion), mock.patch.object(
+                app, "_build_transcript_ai_summary", side_effect=_record_build_summary
+            ), mock.patch.object(
+                app, "_prepend_summary_to_transcript", side_effect=_record_prepend
+            ), mock.patch.object(
+                app, "_append_transcript_to_telegram_markdown", side_effect=_record_append
+            ), mock.patch.object(
+                app, "_sync_single_transcript_file_to_dropbox", side_effect=_record_sync
+            ), mock.patch.object(
+                app, "send_message", new=mock.AsyncMock()
+            ):
+                await app._postprocess_transcript_output(
+                    123,
+                    title="title",
+                    source="source",
+                    transcript_path=Path("sample.md"),
+                    message_ts=None,
+                )
+
+        asyncio.run(_run())
+        self.assertEqual(
+            calls,
+            ["notion", "build_summary", "prepend_summary", "append_daily_note", "sync_transcript"],
+        )
+
     def test_local_datetime_from_unix_uses_local_tz(self):
         dt = app._local_datetime_from_unix(0)
         self.assertIsNotNone(dt)

@@ -1193,6 +1193,36 @@ def _sync_single_note_file_to_dropbox(local_path: Path) -> None:
         print(f"[WARN] Immediate Dropbox note sync failed for {local_path}: {e}")
 
 
+def _dropbox_remote_path_for_local_transcript(local_path: Path) -> str | None:
+    try:
+        rel = local_path.resolve().relative_to(TRANSCRIPTS_DIR.resolve()).as_posix()
+    except Exception:
+        return None
+    root = normalize_dropbox_path(DROPBOX_TRANSCRIPTS_PATH)
+    return f"{root}/{rel}".replace("//", "/")
+
+
+def _sync_single_transcript_file_to_dropbox(local_path: Path) -> None:
+    if not (DROPBOX_SYNC_ENABLED and DROPBOX_TRANSCRIPTS_SYNC_ENABLED):
+        return
+    try:
+        path = local_path.resolve()
+        remote_path = _dropbox_remote_path_for_local_transcript(path)
+        if not remote_path:
+            return
+        _get_dropbox_client()
+        root = normalize_dropbox_path(DROPBOX_TRANSCRIPTS_PATH)
+        _dropbox_call_with_retry(lambda dbx: _dropbox_create_folder_if_missing(dbx, root))
+        parent = normalize_dropbox_path(str(PurePosixPath(remote_path).parent))
+        if parent != root:
+            _dropbox_call_with_retry(lambda dbx, p=parent: _dropbox_create_folder_if_missing(dbx, p))
+        sync_file_to_dropbox(path, remote_path)
+        fingerprint = compute_file_fingerprint(path)
+        upsert_sync_state("dropbox_transcripts_local", remote_path.lower(), fingerprint)
+    except Exception as e:
+        print(f"[WARN] Immediate Dropbox transcript sync failed for {local_path}: {e}")
+
+
 def _localize_transcribe_status(status: str) -> str:
     s = (status or "").strip()
     if not s:
@@ -1350,6 +1380,38 @@ async def _run_transcribe_job_with_progress(
     return result, progress_message_id
 
 
+async def _postprocess_transcript_output(
+    chat_id: int,
+    *,
+    title: str,
+    source: str,
+    transcript_path: Path,
+    message_ts: datetime | None,
+) -> None:
+    await asyncio.to_thread(
+        notion_append_chitchat_transcript,
+        title=title,
+        source=source,
+        transcript_path=transcript_path,
+        msg_ts=message_ts,
+    )
+    summary = await asyncio.to_thread(_build_transcript_ai_summary, transcript_path)
+    if summary:
+        await asyncio.to_thread(_prepend_summary_to_transcript, transcript_path, summary)
+    await asyncio.to_thread(
+        _append_transcript_to_telegram_markdown,
+        chat_id,
+        title,
+        source,
+        transcript_path,
+        message_ts,
+    )
+    await asyncio.to_thread(_sync_single_transcript_file_to_dropbox, transcript_path)
+    if summary:
+        for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
+            await send_message(chat_id, chunk)
+
+
 async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: datetime | None = None) -> bool:
     try:
         tx = _load_transcription_module()
@@ -1388,26 +1450,13 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
         if progress_msg_id:
             done_text = _build_transcribe_status_message(intro_text, f"轉錄完成：{title}")
             await edit_message(chat_id, progress_msg_id, done_text)
-        await asyncio.to_thread(
-            _append_transcript_to_telegram_markdown,
+        await _postprocess_transcript_output(
             chat_id,
-            title,
-            target,
-            out_path,
-            message_ts,
-        )
-        await asyncio.to_thread(
-            notion_append_chitchat_transcript,
             title=title,
             source=target,
             transcript_path=out_path,
-            msg_ts=message_ts,
+            message_ts=message_ts,
         )
-        summary = await asyncio.to_thread(_build_transcript_ai_summary, out_path)
-        if summary:
-            await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
-            for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
-                await send_message(chat_id, chunk)
     except Exception as e:
         print(f"[TRANSCRIBE][URL_FLOW][ERROR] chat_id={chat_id} error={type(e).__name__}: {e}")
         print(traceback.format_exc())
@@ -1574,26 +1623,13 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
         if progress_msg_id:
             done_text = _build_transcribe_status_message(intro_text, f"轉錄完成：{title}")
             await edit_message(chat_id, progress_msg_id, done_text)
-        await asyncio.to_thread(
-            _append_transcript_to_telegram_markdown,
+        await _postprocess_transcript_output(
             chat_id,
-            title,
-            original_filename,
-            out_path,
-            message_ts,
-        )
-        await asyncio.to_thread(
-            notion_append_chitchat_transcript,
             title=title,
             source=original_filename,
             transcript_path=out_path,
-            msg_ts=message_ts,
+            message_ts=message_ts,
         )
-        summary = await asyncio.to_thread(_build_transcript_ai_summary, out_path)
-        if summary:
-            await asyncio.to_thread(_prepend_summary_to_transcript, out_path, summary)
-            for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
-                await send_message(chat_id, chunk)
     except Exception as e:
         print(f"[TRANSCRIBE][UPLOAD_FLOW][ERROR] chat_id={chat_id} error={type(e).__name__}: {e}")
         print(traceback.format_exc())
@@ -2172,6 +2208,16 @@ def iter_sync_files() -> Iterator[tuple[str, Path, str]]:
                 continue
             rel = p.relative_to(root).as_posix()
             yield category, p, rel
+
+
+def iter_transcript_sync_files() -> Iterator[tuple[Path, str]]:
+    if not TRANSCRIPTS_DIR.exists():
+        return
+    for p in TRANSCRIPTS_DIR.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(TRANSCRIPTS_DIR).as_posix()
+        yield p, rel
 
 
 TRANSCRIPT_TEXT_EXTENSIONS = {
@@ -3362,6 +3408,34 @@ def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
     stats.update({k: stats.get(k, 0) + news_stats.get(k, 0) for k in news_stats})
     transcript_stats = sync_dropbox_transcripts_to_local(full_scan=full_scan)
     stats.update({k: stats.get(k, 0) + transcript_stats.get(k, 0) for k in transcript_stats})
+    if DROPBOX_TRANSCRIPTS_SYNC_ENABLED:
+        transcript_root = normalize_dropbox_path(DROPBOX_TRANSCRIPTS_PATH)
+        try:
+            _dropbox_call_with_retry(lambda dbx: _dropbox_create_folder_if_missing(dbx, transcript_root))
+        except Exception as e:
+            print(f"[WARN] Dropbox transcript folder bootstrap failed: {e}")
+        else:
+            for local_path, rel in iter_transcript_sync_files():
+                stats["scanned"] += 1
+                remote_path = f"{transcript_root}/{rel}".replace("//", "/")
+                state_key = remote_path.lower()
+                try:
+                    fingerprint = compute_file_fingerprint(local_path)
+                    last_fp = get_sync_state("dropbox_transcripts_local", state_key)
+                    if not full_scan and last_fp == fingerprint:
+                        stats["skipped"] += 1
+                        continue
+                    parent = normalize_dropbox_path(str(PurePosixPath(remote_path).parent))
+                    if parent != transcript_root:
+                        _dropbox_call_with_retry(
+                            lambda dbx, p=parent: _dropbox_create_folder_if_missing(dbx, p)
+                        )
+                    sync_file_to_dropbox(local_path, remote_path)
+                    upsert_sync_state("dropbox_transcripts_local", state_key, fingerprint)
+                    stats["uploaded"] += 1
+                except Exception as e:
+                    stats["failed"] += 1
+                    print(f"[WARN] Dropbox transcript upload failed for {local_path}: {e}")
     for category, local_path, rel in iter_sync_files():
         stats["scanned"] += 1
         local_key = local_path.relative_to(DATA_DIR).as_posix()
