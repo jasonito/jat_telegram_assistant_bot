@@ -357,6 +357,8 @@ DIRECT_AUDIO_URL_RE = re.compile(r"\.(mp3|m4a|wav|ogg|aac|flac|wma|opus)(\?|$)",
 OCR_CHOICE_CALLBACK_RE = re.compile(r"^ocr_choice:([a-f0-9-]{8,64}):(run|save)$", flags=re.I)
 _TRANSCRIBE_JOBS: dict[int, dict] = {}
 _TRANSCRIBE_JOBS_LOCK = threading.Lock()
+_TRANSCRIBE_BUSY_NOTICE_IDS: dict[int, list[int]] = {}
+_TRANSCRIBE_BUSY_NOTICE_IDS_LOCK = threading.Lock()
 
 
 class TranscribeJobCancelled(Exception):
@@ -459,6 +461,20 @@ def _clear_transcribe_job(chat_id: int, job_id: str) -> None:
             return
         existing["finished"] = True
         _TRANSCRIBE_JOBS.pop(chat_id, None)
+
+
+def _track_transcribe_busy_notice(chat_id: int, message_id: int | None) -> None:
+    if not message_id:
+        return
+    with _TRANSCRIBE_BUSY_NOTICE_IDS_LOCK:
+        notice_ids = _TRANSCRIBE_BUSY_NOTICE_IDS.setdefault(chat_id, [])
+        notice_ids.append(int(message_id))
+
+
+def _pop_transcribe_busy_notice_ids(chat_id: int) -> list[int]:
+    with _TRANSCRIBE_BUSY_NOTICE_IDS_LOCK:
+        notice_ids = _TRANSCRIBE_BUSY_NOTICE_IDS.pop(chat_id, [])
+    return [int(x) for x in notice_ids if x]
 
 
 def _load_transcription_module():
@@ -808,6 +824,20 @@ async def edit_message(chat_id: int, message_id: int, text: str) -> bool:
     return await asyncio.to_thread(_edit)
 
 
+async def delete_message(chat_id: int, message_id: int) -> bool:
+    def _delete() -> bool:
+        payload = {"chat_id": chat_id, "message_id": message_id}
+        try:
+            resp = requests.post(f"{TELEGRAM_API}/deleteMessage", json=payload, timeout=10)
+            data = resp.json() if resp.content else {}
+            print(f"deleteMessage status={resp.status_code} ok={bool(data.get('ok'))}")
+            return bool(resp.status_code < 300 and data.get("ok"))
+        except Exception:
+            return False
+
+    return await asyncio.to_thread(_delete)
+
+
 async def clear_message_inline_keyboard(chat_id: int, message_id: int) -> bool:
     def _clear() -> bool:
         payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
@@ -1092,7 +1122,7 @@ def _extract_supported_transcribe_url(text: str) -> str:
     return ""
 
 
-def _build_transcript_ai_summary(transcript_path: Path) -> str | None:
+def _build_transcript_ai_summary(transcript_path: Path, title: str) -> str | None:
     try:
         content = transcript_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
@@ -1109,27 +1139,35 @@ def _build_transcript_ai_summary(transcript_path: Path) -> str | None:
 
     clipped = transcript_text[: min(len(transcript_text), AI_SUMMARY_MAX_CHARS)]
     fallback_points = _fallback_three_points(clipped)
-    fallback = "\n".join(f"- {p}" for p in fallback_points if _normalize_text_value(p))
+    fallback_lines = [f"- {p}" for p in fallback_points if _normalize_text_value(p)]
+    if fallback_points:
+        fallback_lines.append("")
+        fallback_lines.append(f"結論：{fallback_points[0]}")
+    fallback = "\n".join(fallback_lines).strip()
     if not AI_SUMMARY_ENABLED:
-        return fallback
+        return _normalize_transcript_summary(fallback, title)
 
     system_prompt = (
         "Use only provided transcript content. Do not invent facts. "
-        "Output must be in Traditional Chinese."
+        "Output must be in Traditional Chinese used in Taiwan. Never use Simplified Chinese. "
+        "Do not use markdown emphasis such as **, __, or backticks."
     )
     user_prompt = (
-        "請根據以下逐字稿輸出重點摘要：\n"
-        "1. 先用 3-5 點條列重點\n"
-        "2. 補一段 2-3 句的整體結論\n\n"
+        f"請根據以下逐字稿，整理《{_normalize_text_value(title, '此內容')}》的內容。\n"
+        "1. 只輸出主體內容，不要輸出任何開頭、前言、導言或標題句。\n"
+        "2. 先輸出 3-7 點條列重點，每點一行，以 '- ' 開頭。\n"
+        "3. 條列結束後空一行，再輸出一行『結論：』，內容用 2-3 句繁體中文整理整體結論。\n"
+        "4. 全文必須使用繁體中文，禁止出現任何簡體中文。\n"
+        "5. 不要輸出 **、__、` 等 markdown 強調符號。\n\n"
         f"{clipped}"
     )
     ai = _normalize_text_value(_run_ai_chat(system_prompt, user_prompt))
     if not ai:
-        return fallback
+        return _normalize_transcript_summary(fallback, title)
     # Guardrail: if model output is too close to the source transcript, use fallback summary.
     if _looks_like_transcript_dump(ai, clipped):
-        return fallback
-    return ai
+        return _normalize_transcript_summary(fallback, title)
+    return _normalize_transcript_summary(ai, title)
 
 
 def _prepend_summary_to_transcript(transcript_path: Path, summary_text: str | list[str] | tuple[str, ...]) -> None:
@@ -1395,7 +1433,7 @@ async def _postprocess_transcript_output(
         transcript_path=transcript_path,
         msg_ts=message_ts,
     )
-    summary = await asyncio.to_thread(_build_transcript_ai_summary, transcript_path)
+    summary = await asyncio.to_thread(_build_transcript_ai_summary, transcript_path, title)
     if summary:
         await asyncio.to_thread(_prepend_summary_to_transcript, transcript_path, summary)
     await asyncio.to_thread(
@@ -1410,6 +1448,14 @@ async def _postprocess_transcript_output(
     if summary:
         for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
             await send_message(chat_id, chunk)
+
+
+async def _dismiss_transcribe_busy_notices(chat_id: int) -> None:
+    for message_id in _pop_transcribe_busy_notice_ids(chat_id):
+        try:
+            await delete_message(chat_id, int(message_id))
+        except Exception:
+            continue
 
 
 async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: datetime | None = None) -> bool:
@@ -1428,7 +1474,8 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
     job_id = str(uuid.uuid4())
     cancel_event = Event()
     if not _register_transcribe_job(chat_id, job_id, cancel_event):
-        await send_message(chat_id, "已有轉錄任務進行中，請/cancel停止或等待完成")
+        busy_message_id = await send_message(chat_id, "已有一筆youtube或podcast轉錄正在執行，請/cancel或等待完成")
+        _track_transcribe_busy_notice(chat_id, busy_message_id)
         return True
 
     intro_text = ""
@@ -1473,6 +1520,7 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
                 await edit_message(chat_id, progress_msg_id, cancel_text)
             else:
                 await send_message(chat_id, cancel_text)
+            await _dismiss_transcribe_busy_notices(chat_id)
             return True
         err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
         if progress_msg_id:
@@ -1483,6 +1531,7 @@ async def _run_transcribe_url_flow(chat_id: int, target: str, message_ts: dateti
             await send_message(chat_id, err_text)
     finally:
         _clear_transcribe_job(chat_id, job_id)
+        await _dismiss_transcribe_busy_notices(chat_id)
     return True
 
 
@@ -1595,7 +1644,8 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
     job_id = str(uuid.uuid4())
     cancel_event = Event()
     if not _register_transcribe_job(chat_id, job_id, cancel_event):
-        await send_message(chat_id, "已有轉錄任務進行中，請/cancel停止或等待完成")
+        busy_message_id = await send_message(chat_id, "已有一筆youtube或podcast轉錄正在執行，請/cancel或等待完成")
+        _track_transcribe_busy_notice(chat_id, busy_message_id)
         return True
     intro_text = ""
     progress_msg_id: int | None = None
@@ -1646,6 +1696,7 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
                 await edit_message(chat_id, progress_msg_id, cancel_text)
             else:
                 await send_message(chat_id, cancel_text)
+            await _dismiss_transcribe_busy_notices(chat_id)
             return True
         err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
         if progress_msg_id:
@@ -1661,6 +1712,7 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
         except Exception:
             pass
         _clear_transcribe_job(chat_id, job_id)
+        await _dismiss_transcribe_busy_notices(chat_id)
     return True
 
 
@@ -4082,6 +4134,26 @@ def _strip_markdown_noise(text: str) -> str:
     if not text:
         return text
     return text.replace("**", "").replace("__", "").replace("`", "")
+
+
+def _normalize_transcript_summary(summary: str | None, title: str) -> str:
+    normalized = _strip_markdown_noise(_normalize_text_value(summary))
+    if not normalized:
+        return ""
+    title_text = _normalize_text_value(title, "此內容")
+    intro = f"針對《{title_text}》的重點摘要和結論如下："
+    cleaned_lines: list[str] = []
+    for line in normalized.replace("\r\n", "\n").split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("以下是根據逐字稿內容輸出的重點摘要與結論"):
+            continue
+        if stripped == intro:
+            continue
+        cleaned_lines.append(line.rstrip())
+    body = "\n".join(cleaned_lines).strip()
+    if not body:
+        return intro
+    return f"{intro}\n\n{body}"
 
 
 def _looks_like_transcript_dump(summary: str, transcript: str) -> bool:
