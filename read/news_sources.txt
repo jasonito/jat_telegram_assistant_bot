@@ -17,3 +17,4 @@ https://techcrunch.com/feed/
 https://www.semafor.com/rss/technology
 https://wccftech.com/feed/
 https://feeds.arstechnica.com/arstechnica/technology-lab
+https://techorange.com/feed/
