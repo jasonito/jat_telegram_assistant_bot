@@ -59,10 +59,11 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 
 ### Segment F: News / Digest
 - Purpose: collect, filter, and summarize news.
-- Keys: `NEWS_ENABLED`, `NEWS_FETCH_INTERVAL_MINUTES`, `NEWS_LOOKBACK_HOURS`, `NEWS_STARTUP_FETCH_ENABLED`, `NEWS_STARTUP_NOTIFY_ENABLED`, `NEWS_PUSH_ENABLED`, `NEWS_PUSH_MAX_ITEMS`, `NEWS_GNEWS_*`, `NEWS_RSS_URLS`, `NEWS_RSS_URLS_FILE`, `NEWS_URL_FETCH_*`, `NEWS_DIGEST_*`, `NOTE_DIGEST_MAX_ITEMS`.
+- Keys: `NEWS_ENABLED`, `NEWS_FETCH_INTERVAL_MINUTES`, `NEWS_LOOKBACK_HOURS`, `NEWS_STARTUP_FETCH_ENABLED`, `NEWS_STARTUP_NOTIFY_ENABLED`, `NEWS_PUSH_ENABLED`, `NEWS_PUSH_MAX_ITEMS`, `NEWS_GNEWS_*`, `NEWS_RSS_URLS`, `NEWS_RSS_URLS_FILE`, `NEWS_URL_FETCH_*`, `NEWS_DIGEST_*`, `NEWS_CLASSIFY_BATCH_SIZE`, `NOTE_DIGEST_MAX_ITEMS`.
 - Current main profile defaults: `NEWS_FETCH_INTERVAL_MINUTES=360`, `NEWS_LOOKBACK_HOURS=24`, `NEWS_STARTUP_FETCH_ENABLED=1`, `NEWS_STARTUP_NOTIFY_ENABLED=1`.
 - Current behavior: on bot startup, news ingestion runs once immediately, sends a Telegram notice to enabled `news_subscriptions`, then continues on aligned 6-hour slots. The fetch window is 24 hours so the next startup can backfill after the PC was off.
-- `/news` now reads local markdown under `DATA_DIR\news`, filters items by `published_at` within the last 24 hours in `Asia/Taipei`, and renders clickable HTML links instead of AI bullet summaries.
+- `/news` reads local markdown under `DATA_DIR\news`, filters items by `published_at` within the last 24 hours in `Asia/Taipei`, classifies them into 7 categories (AI, 半導體, 台灣產業, 政治及地緣, 金融市場, 消費電子產品, 其他) using LLM batch classification with keyword fallback, and renders grouped clickable HTML links.
+- News classification uses LLM when `AI_SUMMARY_ENABLED=1`; falls back to keyword-based classification otherwise. Batch size is configurable via `NEWS_CLASSIFY_BATCH_SIZE` (default 40).
 - If local `news` markdown for the recent window is missing, the bot first tries Dropbox remote-to-local news sync and then retries the local read.
 - Note/transcript AI input budget: `NOTE_AI_INPUT_MAX_CHARS` (current default `28000`).
 
@@ -293,6 +294,7 @@ sort downloads
   - merged duplicate event chains
   - same-topic bucket limits to reduce over-concentration
   - Traditional Chinese news titles in the weekly report news block
+  - 7-category LLM-based news classification (AI, 半導體, 台灣產業, 政治及地緣, 金融市場, 消費電子產品, 其他) with priority-ordered disambiguation
 - Weekly report generation logs a Dropbox pre-sync step before summarization.
 - For debugging, a pre-AI weekly note input snapshot can be written under `tests\weekly_note_ai_input_YYYY-MM-DD_YYYY-MM-DD.txt`.
 

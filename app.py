@@ -11,12 +11,14 @@ import sqlite3
 import hashlib
 import json
 import mimetypes
+import smtplib
 import time
 import uuid
 import logging
 import traceback
 import calendar
 from contextlib import contextmanager
+from email.message import EmailMessage
 
 from typing import Iterator
 from urllib.parse import parse_qsl
@@ -233,6 +235,16 @@ NEWS_DIGEST_MAX_ITEMS = int(os.getenv("NEWS_DIGEST_MAX_ITEMS", "6"))
 NEWS_DIGEST_AI_ITEMS = int(os.getenv("NEWS_DIGEST_AI_ITEMS", "2"))
 NEWS_DIGEST_FETCH_ARTICLE_ITEMS = int(os.getenv("NEWS_DIGEST_FETCH_ARTICLE_ITEMS", "1"))
 NOTE_DIGEST_MAX_ITEMS = int(os.getenv("NOTE_DIGEST_MAX_ITEMS", "5"))
+NEWS_CLASSIFY_BATCH_SIZE = int(os.getenv("NEWS_CLASSIFY_BATCH_SIZE", "40"))
+NEWS_CATEGORIES: dict[str, str] = {
+    "A": "AI",
+    "B": "半導體",
+    "C": "台灣產業",
+    "D": "政治及地緣",
+    "E": "金融市場",
+    "F": "消費電子產品",
+    "G": "其他",
+}
 
 OCR_PROVIDER = os.getenv("OCR_PROVIDER", "google_vision").strip().lower()
 OCR_LANG_HINTS = [x.strip() for x in os.getenv("OCR_LANG_HINTS", "zh-TW,en").split(",") if x.strip()]
@@ -271,6 +283,15 @@ NEWS_PUSH_MAX_ITEMS = int(os.getenv("NEWS_PUSH_MAX_ITEMS", "10"))
 NEWS_PUSH_ENABLED = os.getenv("NEWS_PUSH_ENABLED", "0").lower() in {"1", "true", "yes"}
 NEWS_STARTUP_FETCH_ENABLED = _env_flag("NEWS_STARTUP_FETCH_ENABLED", True)
 NEWS_STARTUP_NOTIFY_ENABLED = _env_flag("NEWS_STARTUP_NOTIFY_ENABLED", True)
+NEWS_EMAIL_ENABLED = _env_flag("NEWS_EMAIL_ENABLED", False)
+NEWS_EMAIL_SMTP_HOST = os.getenv("NEWS_EMAIL_SMTP_HOST", "smtp.gmail.com").strip()
+NEWS_EMAIL_SMTP_PORT = max(1, int(os.getenv("NEWS_EMAIL_SMTP_PORT", "465")))
+NEWS_EMAIL_USE_SSL = _env_flag("NEWS_EMAIL_USE_SSL", True)
+NEWS_EMAIL_USERNAME = os.getenv("NEWS_EMAIL_USERNAME", "").strip()
+NEWS_EMAIL_PASSWORD = os.getenv("NEWS_EMAIL_PASSWORD", "").strip()
+NEWS_EMAIL_FROM = os.getenv("NEWS_EMAIL_FROM", NEWS_EMAIL_USERNAME).strip()
+NEWS_EMAIL_TO = [addr.strip() for addr in os.getenv("NEWS_EMAIL_TO", "").split(",") if addr.strip()]
+NEWS_EMAIL_SUBJECT_PREFIX = os.getenv("NEWS_EMAIL_SUBJECT_PREFIX", "[JAT News]").strip()
 NEWS_GNEWS_QUERY = os.getenv("NEWS_GNEWS_QUERY", "site:reuters.com semiconductors technology")
 NEWS_GNEWS_HL = os.getenv("NEWS_GNEWS_HL", "en-US")
 NEWS_GNEWS_GL = os.getenv("NEWS_GNEWS_GL", "US")
@@ -5318,14 +5339,30 @@ def _render_news_entries_html(items: list[dict[str, str]], *, header: str) -> st
     if not items:
         return f"<b>{escape(header)}</b>\n\n指定期間無可用新聞資料。"
 
-    translations = _translate_news_titles_to_zh([item.get("title", "") for item in items])
-    lines = [f"<b>{escape(header)}</b>", ""]
-    for idx, item in enumerate(items, start=1):
+    all_titles = [item.get("title", "").strip() for item in items]
+    translations = _translate_news_titles_to_zh(all_titles)
+    title_categories = _classify_news_titles_batch(all_titles)
+
+    # Group items by category
+    grouped: dict[str, list[dict[str, str]]] = {letter: [] for letter in NEWS_CATEGORIES}
+    for item in items:
         title = item.get("title", "").strip()
-        display_title = translations.get(title, "").strip() or title or "Untitled"
-        url = item.get("url", "").strip()
-        lines.append(f'{idx}. <a href="{escape(url, quote=True)}">{escape(display_title)}</a>')
-    return "\n".join(lines)
+        cat = title_categories.get(title, _classify_news_title(title))
+        grouped[cat].append(item)
+
+    lines = [f"<b>{escape(header)}</b>", ""]
+    for letter, display_name in NEWS_CATEGORIES.items():
+        rows = grouped.get(letter, [])
+        if not rows:
+            continue
+        lines.append(f"<b>{escape(display_name)}</b>")
+        for item in rows:
+            title = item.get("title", "").strip()
+            display_title = translations.get(title, "").strip() or title or "Untitled"
+            url = item.get("url", "").strip()
+            lines.append(f'• <a href="{escape(url, quote=True)}">{escape(display_title)}</a>')
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def build_recent_news_links_html(now: datetime | None = None) -> str:
@@ -5335,6 +5372,73 @@ def build_recent_news_links_html(now: datetime | None = None) -> str:
         sync_dropbox_news_to_local(full_scan=True)
         items = _load_recent_news_entries_from_local(now=current)
     return _render_news_entries_html(items, header="最近 24 小時新聞")
+
+
+def _is_recent_news_command(text: str) -> bool:
+    tokens = (text or "").strip().split()
+    if not tokens or tokens[0].lower() != "/news":
+        return False
+    return len(tokens) == 1 or tokens[1].lower() == "latest"
+
+
+def _build_recent_news_email_subject(now: datetime | None = None) -> str:
+    current = now or datetime.now(tz=get_local_tz())
+    ts = current.strftime("%Y-%m-%d %H:%M")
+    prefix = NEWS_EMAIL_SUBJECT_PREFIX or "[JAT News]"
+    return f"{prefix} 最近 24 小時新聞 {ts}"
+
+
+def _news_html_to_plain_text(html: str) -> str:
+    text = html or ""
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(
+        r'(?is)<a\s+href="([^"]+)">(.+?)</a>',
+        lambda m: f"{unescape(re.sub(r'<[^>]+>', '', m.group(2))).strip()}\n{unescape(m.group(1)).strip()}",
+        text,
+    )
+    text = re.sub(r"(?is)</p\s*>", "\n\n", text)
+    text = re.sub(r"(?is)<[^>]+>", "", text)
+    text = unescape(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _send_recent_news_email(html: str, *, now: datetime | None = None) -> bool:
+    if not NEWS_EMAIL_ENABLED:
+        return False
+    if not NEWS_EMAIL_TO or not NEWS_EMAIL_USERNAME or not NEWS_EMAIL_PASSWORD:
+        logger.info("skip news email: missing NEWS_EMAIL_TO/USERNAME/PASSWORD")
+        return False
+    if not NEWS_EMAIL_FROM:
+        logger.info("skip news email: missing NEWS_EMAIL_FROM")
+        return False
+
+    message = EmailMessage()
+    message["Subject"] = _build_recent_news_email_subject(now=now)
+    message["From"] = NEWS_EMAIL_FROM
+    message["To"] = ", ".join(NEWS_EMAIL_TO)
+    plain_text = _news_html_to_plain_text(html)
+    message.set_content(plain_text or "最近 24 小時新聞")
+    html_body = html.replace("\n", "<br>\n")
+    message.add_alternative(f"<html><body>{html_body}</body></html>", subtype="html")
+
+    try:
+        if NEWS_EMAIL_USE_SSL:
+            with smtplib.SMTP_SSL(NEWS_EMAIL_SMTP_HOST, NEWS_EMAIL_SMTP_PORT, timeout=20) as server:
+                server.login(NEWS_EMAIL_USERNAME, NEWS_EMAIL_PASSWORD)
+                server.send_message(message)
+        else:
+            with smtplib.SMTP(NEWS_EMAIL_SMTP_HOST, NEWS_EMAIL_SMTP_PORT, timeout=20) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(NEWS_EMAIL_USERNAME, NEWS_EMAIL_PASSWORD)
+                server.send_message(message)
+        logger.info("news email sent to %s", ",".join(NEWS_EMAIL_TO))
+        return True
+    except Exception as exc:
+        logger.warning("news email send failed: %s: %s", type(exc).__name__, exc)
+        return False
 
 
 def _extract_weekly_topic_keywords(text: str) -> set[str]:
@@ -5665,16 +5769,145 @@ def _translate_news_titles_to_zh(titles: list[str]) -> dict[str, str]:
 
 
 def _classify_news_title(title: str) -> str:
+    """Keyword-based fallback classifier. Returns single letter A-G."""
     t = _clean_plain_text(title or "").lower()
-    if any(k in t for k in ["ai", "agent", "模型", "openai", "gemini", "anthropic", "llm"]):
-        return "AI 與模型"
-    if any(k in t for k in ["晶片", "半導體", "伺服器", "硬體", "nvidia", "amd", "intel", "台積電"]):
-        return "半導體與硬體"
-    if any(k in t for k in ["監管", "法規", "政策", "政府", "國會", "compliance"]):
-        return "政策與監管"
-    if any(k in t for k in ["融資", "財報", "投資", "估值", "ipo", "併購", "市場"]):
-        return "資本市場與公司"
-    return "其他產業動態"
+    # Priority 1: Taiwan company as main subject → C
+    if any(k in t for k in [
+        "台積電", "tsmc", "鴻海", "foxconn", "聯發科", "mediatek", "日月光", "ase",
+        "台達電", "delta", "廣達", "quanta", "仁寶", "compal", "和碩", "pegatron",
+        "緯創", "wistron", "光寶", "liteon", "華碩", "asus", "宏碁", "acer",
+        "聯電", "umc", "南亞科", "nanya", "群創", "innolux", "友達", "auo",
+        "台灣", "taiwan",
+    ]):
+        return "C"
+    # Priority 2: Policy / regulation / geopolitics → D
+    if any(k in t for k in [
+        "監管", "法規", "政策", "政府", "國會", "compliance", "regulation", "tariff",
+        "關稅", "制裁", "sanction", "ban", "禁令", "地緣", "geopolit", "military",
+        "軍事", "戰爭", "war", "能源", "energy", "石油", "oil", "天然氣", "commodity",
+        "大宗商品", "白宮", "white house", "congress", "senate", "歐盟", "eu ",
+    ]):
+        return "D"
+    # Priority 3: Financial markets → E
+    if any(k in t for k in [
+        "股價", "stock price", "財報", "earnings", "融資", "投資", "估值", "valuation",
+        "ipo", "併購", "merger", "acquisition", "m&a", "buyback", "回購",
+        "債券", "bond", "debt", "市值", "market cap", "大漲", "暴跌", "飆漲", "重挫", "rally", "plunge",
+        "華爾街", "wall street", "nasdaq", "s&p", "道瓊", "dow jones",
+    ]):
+        return "E"
+    # Priority 4: Global AI → A
+    if any(k in t for k in [
+        "ai", "agent", "模型", "openai", "gemini", "anthropic", "llm", "chatgpt",
+        "copilot", "claude", "grok", "machine learning", "深度學習", "neural",
+        "transformer", "gpt", "大語言模型",
+    ]):
+        return "A"
+    # Priority 5: Global semiconductor / hardware → B
+    if any(k in t for k in [
+        "晶片", "chip", "半導體", "semiconductor", "伺服器", "server", "硬體",
+        "nvidia", "amd", "intel", "hbm", "foundry", "晶圓", "wafer",
+        "記憶體", "memory", "dram", "nand", "gpu", "cpu", "qualcomm", "broadcom",
+        "arm", "samsung 半導體", "三星晶片",
+    ]):
+        return "B"
+    # Consumer electronics → F
+    if any(k in t for k in [
+        "手機", "smartphone", "iphone", "galaxy", "pixel", "筆電", "laptop",
+        "穿戴", "wearable", "airpods", "耳機", "headphone", "平板", "tablet",
+        "ipad", "macbook", "surface", "產品評測", "review",
+    ]):
+        return "F"
+    return "G"
+
+
+def _classify_news_titles_batch(titles: list[str]) -> dict[str, str]:
+    """Classify titles into categories A-G using LLM batch calls with keyword fallback."""
+    clean_titles = [_clean_plain_text(t or "").strip() for t in titles]
+    clean_titles = [t for t in clean_titles if t]
+    if not clean_titles:
+        return {}
+
+    # If AI disabled, use keyword fallback entirely
+    if not AI_SUMMARY_ENABLED:
+        return {title: _classify_news_title(title) for title in clean_titles}
+
+    cat_desc = (
+        "A = AI — AI models, LLM, agents, AI applications, AI companies\n"
+        "B = 半導體 — Chips, HBM, foundry, semiconductor (global)\n"
+        "C = 台灣產業 — Taiwan company as main subject\n"
+        "D = 政治及地緣 — Policy, regulation, energy, commodities, geopolitics, military\n"
+        "E = 金融市場 — Stock prices, debt, M&A, IPO, buybacks, earnings\n"
+        "F = 消費電子產品 — Smartphones, laptops, wearables, product reviews\n"
+        "G = 其他 — Gaming, science, healthcare, cybersecurity, entertainment"
+    )
+    disambiguation = (
+        "Disambiguation (priority order):\n"
+        "1. 台灣公司為主角 → C\n"
+        "2. 政策/監管驅動 → D\n"
+        "3. 股價/財報/募資/併購 → E\n"
+        "4. 全球 AI → A\n"
+        "5. 全球晶片/硬體 → B"
+    )
+
+    def _build_prompt(batch: list[str], *, retry: bool) -> tuple[str, str]:
+        numbered = "\n".join(f"{idx}. {title}" for idx, title in enumerate(batch, start=1))
+        system_prompt = (
+            "You classify news headlines into exactly one category. "
+            "Output ONLY numbered lines in the format: N. [X] title"
+        )
+        user_prompt = (
+            "請將以下新聞標題分類為 A-G 類別。\n\n"
+            f"類別定義：\n{cat_desc}\n\n"
+            f"{disambiguation}\n\n"
+            "要求：\n"
+            "1) 每行格式固定為「編號. [類別字母] 原始標題」，例如：1. [A] OpenAI releases GPT-5\n"
+            "2) 類別字母必須是大寫 A-G 其中之一。\n"
+            "3) 不可省略任何編號，不可加前言或結語。\n"
+        )
+        if retry:
+            user_prompt += "4) 上一次有些標題未被分類，這次請務必為每一條標題都標上類別。\n"
+        user_prompt += f"\n{numbered}"
+        return system_prompt, user_prompt
+
+    def _parse_ai_output(batch: list[str], output: str) -> dict[str, str]:
+        parsed: dict[str, str] = {}
+        for line in (output or "").splitlines():
+            m = re.match(r"^\s*(\d+)[.)]\s*\[([A-Ga-g])\]", line)
+            if not m:
+                continue
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(batch):
+                parsed[batch[idx]] = m.group(2).upper()
+        return parsed
+
+    classified: dict[str, str] = {}
+    batch_size = NEWS_CLASSIFY_BATCH_SIZE
+
+    for start in range(0, len(clean_titles), batch_size):
+        batch = clean_titles[start:start + batch_size]
+        unresolved = list(batch)
+        for retry in (False, True):
+            if not unresolved:
+                break
+            system_prompt, user_prompt = _build_prompt(unresolved, retry=retry)
+            out = _run_ai_chat(system_prompt, user_prompt) or ""
+            parsed = _parse_ai_output(unresolved, out)
+            next_unresolved: list[str] = []
+            for title in unresolved:
+                cat = parsed.get(title)
+                if cat and cat in NEWS_CATEGORIES:
+                    classified[title] = cat
+                else:
+                    next_unresolved.append(title)
+            unresolved = next_unresolved
+        # Keyword fallback for any remaining
+        for title in unresolved:
+            classified[title] = _classify_news_title(title)
+
+    # Map back to original titles
+    return {title: classified.get(_clean_plain_text(title or "").strip(), _classify_news_title(title))
+            for title in titles if _clean_plain_text(title or "").strip()}
 
 
 def _build_weekly_news_block(end_day: str, days: int) -> list[str]:
@@ -5692,30 +5925,33 @@ def _build_weekly_news_block(end_day: str, days: int) -> list[str]:
     if not items:
         return ["新聞區塊", "- 本週無可用新聞。"]
 
-    grouped: dict[str, list[tuple[str, str]]] = {
-        "AI 與模型": [],
-        "半導體與硬體": [],
-        "政策與監管": [],
-        "資本市場與公司": [],
-        "其他產業動態": [],
-    }
+    # Deduplicate
     seen: set[str] = set()
+    unique_items: list[tuple[str, str]] = []
     for title, url in items:
         key = re.sub(r"\W+", "", title.lower())
         if not key or key in seen:
             continue
         seen.add(key)
-        cat = _classify_news_title(title)
+        unique_items.append((title, url))
+
+    # Batch classify all titles at once
+    all_titles = [title for title, _ in unique_items]
+    title_categories = _classify_news_titles_batch(all_titles)
+
+    grouped: dict[str, list[tuple[str, str]]] = {letter: [] for letter in NEWS_CATEGORIES}
+    for title, url in unique_items:
+        cat = title_categories.get(title, _classify_news_title(title))
         grouped[cat].append((title, url))
 
-    translated_titles = _translate_news_titles_to_zh([title for title, _ in items])
+    translated_titles = _translate_news_titles_to_zh(all_titles)
 
     out: list[str] = ["新聞區塊"]
-    for cat in ["AI 與模型", "半導體與硬體", "政策與監管", "資本市場與公司", "其他產業動態"]:
-        rows = grouped.get(cat, [])
+    for letter, display_name in NEWS_CATEGORIES.items():
+        rows = grouped.get(letter, [])
         if not rows:
             continue
-        out.append(f"- {cat}")
+        out.append(f"- {display_name}")
         for title, url in rows[:4]:
             display_title = translated_titles.get(title, title)
             if url:
@@ -8287,6 +8523,12 @@ async def process_telegram_update(update: dict) -> None:
                     )
                     if sent_id is None:
                         print(f"[WARN] reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
+            if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
+                _spawn_background_to_thread(
+                    _send_recent_news_email,
+                    replies[0],
+                    label="news email",
+                )
         except Exception as e:
             print(f"[WARN] private command handling failed: {type(e).__name__}: {e}")
             await send_message(chat_id, f"指令處理失敗：{type(e).__name__}")
@@ -8312,6 +8554,12 @@ async def process_telegram_update(update: dict) -> None:
                     )
                     if sent_id is None:
                         print(f"[WARN] group reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
+            if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
+                _spawn_background_to_thread(
+                    _send_recent_news_email,
+                    replies[0],
+                    label="news email",
+                )
         except Exception as e:
             print(f"[WARN] group command handling failed: {type(e).__name__}: {e}")
             await send_message(chat_id, f"指令處理失敗：{type(e).__name__}")

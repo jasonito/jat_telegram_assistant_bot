@@ -210,6 +210,21 @@ For each entry, capture:
   - `python -m py_compile app.py kol_digest.py tests\\test_kol_digest.py`
   - Live Meta Graph API checks against the candidate Facebook URLs using `.env.digest`
 
+### 2026-03-18 - LLM batch news classification
+
+- Summary: replaced simple 5-category keyword classification with 7-category LLM batch classification for both `/news` output and weekly report news block. Categories: AI, 半導體, 台灣產業, 政治及地緣, 金融市場, 消費電子產品, 其他. Added priority-ordered disambiguation rules (Taiwan company → policy → financial → AI → semiconductor). Also fixed email HTML formatting (newlines not rendering in Gmail).
+- Files: `app.py`, `.env.example`, `.env.main.example`, `README.md`, `docs/PROJECT_MEMORY.md`
+- Technologies: LLM batch prompting via `_run_ai_chat()`, regex-based output parsing, keyword fallback classifier, priority-ordered disambiguation, configurable batch size
+- Pitfalls:
+  - `_classify_news_titles_batch()` mirrors the `_translate_news_titles_to_zh()` pattern: batch → retry once → keyword fallback. Do not remove the keyword fallback path; it is the safety net when AI is disabled or LLM output is unparseable.
+  - Disambiguation priority order matters: Taiwan company (C) > policy (D) > financial (E) > AI (A) > semiconductor (B). Changing priority will shift classification results.
+  - `NEWS_CLASSIFY_BATCH_SIZE` defaults to 40. Increasing it may exceed LLM context limits for smaller models.
+  - The keyword classifier uses narrowed financial terms (`大漲`/`暴跌`/`飆漲`/`重挫` instead of `漲`/`跌`) to avoid false positives on non-financial price mentions.
+  - Email HTML now converts `\n` to `<br>\n` before embedding in `<html><body>`. Do not double-convert if the source HTML already contains `<br>` tags.
+- Validation:
+  - `python -c "import ast; ast.parse(open('app.py', encoding='utf-8-sig').read())"` — syntax OK
+  - Keyword classifier tested on 403 titles from `tests/24hr_news.txt`: all titles classified (zero missing), distribution A:90 B:26 C:12 D:38 E:26 F:8 G:203
+
 ## Recommended Workflow
 
 Before making non-trivial changes:
