@@ -722,10 +722,14 @@ def transcribe_audio(
         raise
 
 
+def _transcript_output_dir(base_dir: Path, today: datetime.date | None = None) -> Path:
+    folder_day = (today or datetime.date.today()).isoformat()
+    return base_dir / folder_day
+
+
 def _safe_filename(title: str) -> str:
-    date_str = datetime.date.today().isoformat()
     title_slug = slugify(title, max_length=80) or "transcript"
-    return f"{date_str}_{title_slug}.md"
+    return f"{title_slug}.md"
 
 
 def save_transcript_md(
@@ -736,6 +740,7 @@ def save_transcript_md(
     duration_seconds: int | None,
     text: str,
 ) -> Path:
+    transcript_dir = _transcript_output_dir(transcript_dir)
     transcript_dir.mkdir(parents=True, exist_ok=True)
     filename = _safe_filename(title)
     base_stem = Path(filename).stem

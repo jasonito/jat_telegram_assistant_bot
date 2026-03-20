@@ -181,7 +181,7 @@ NOTES_DIR = DATA_DIR / "notes"
 TELEGRAM_MD_DIR = NOTES_DIR / "telegram"
 INBOX_IMAGES_DIR = DATA_DIR / "images"
 WEEKLY_REPORT_DIR = DATA_DIR / "weekly report"
-TRANSCRIPTS_DIR = DATA_DIR / "_runtime" / "transcribe"
+TRANSCRIPTS_DIR = DATA_DIR / "Transcript"
 TRANSCRIPTS_TMP_DIR = DATA_DIR / "_runtime" / "transcribe_tmp"
 ALLOWED_GROUPS = {
     g.strip()
@@ -822,6 +822,19 @@ def _spawn_background_to_thread(func, /, *args, label: str = "background") -> No
             print(f"[WARN] {label} failed: {type(e).__name__}: {e}")
 
     asyncio.create_task(_runner())
+
+
+async def _handle_recent_news_email_delivery(chat_id: int, html: str) -> bool:
+    email_ready, email_status = _get_recent_news_email_status()
+    if not email_ready:
+        await send_message(chat_id, f"Email 未寄出：{email_status}")
+        return True
+    sent = await asyncio.to_thread(_send_recent_news_email, html)
+    if sent:
+        await send_message(chat_id, "已成功送出mail")
+    else:
+        await send_message(chat_id, "Email 未寄出：寄送失敗，請檢查 Gmail SMTP 設定或稍後再試。")
+    return True
 
 
 async def edit_message(chat_id: int, message_id: int, text: str) -> bool:
@@ -5403,14 +5416,24 @@ def _news_html_to_plain_text(html: str) -> str:
     return text.strip()
 
 
-def _send_recent_news_email(html: str, *, now: datetime | None = None) -> bool:
+def _get_recent_news_email_status() -> tuple[bool, str]:
     if not NEWS_EMAIL_ENABLED:
-        return False
-    if not NEWS_EMAIL_TO or not NEWS_EMAIL_USERNAME or not NEWS_EMAIL_PASSWORD:
-        logger.info("skip news email: missing NEWS_EMAIL_TO/USERNAME/PASSWORD")
-        return False
+        return False, "新聞 email 未啟用。請設定 NEWS_EMAIL_ENABLED=1。"
+    if not NEWS_EMAIL_TO:
+        return False, "新聞 email 未設定收件人。請設定 NEWS_EMAIL_TO。"
+    if not NEWS_EMAIL_USERNAME:
+        return False, "新聞 email 未設定寄件帳號。請設定 NEWS_EMAIL_USERNAME。"
+    if not NEWS_EMAIL_PASSWORD:
+        return False, "新聞 email 未設定寄件密碼或 Gmail App Password。請設定 NEWS_EMAIL_PASSWORD。"
     if not NEWS_EMAIL_FROM:
-        logger.info("skip news email: missing NEWS_EMAIL_FROM")
+        return False, "新聞 email 未設定寄件者。請設定 NEWS_EMAIL_FROM。"
+    return True, f"新聞 email 已啟用，將寄送至: {', '.join(NEWS_EMAIL_TO)}"
+
+
+def _send_recent_news_email(html: str, *, now: datetime | None = None) -> bool:
+    email_ready, email_status = _get_recent_news_email_status()
+    if not email_ready:
+        logger.info("skip news email: %s", email_status)
         return False
 
     message = EmailMessage()
@@ -7323,10 +7346,13 @@ def handle_news_command(
                 (cutoff_iso,),
             ).fetchall()
         if not rows:
-            return ["No news items ingested in the last 12 hours."]
+            email_ready, email_status = _get_recent_news_email_status()
+            return [f"No news items ingested in the last 12 hours.\nEmail: {'ready' if email_ready else 'not ready'}\n{email_status}"]
         lines = ["News items by source (last 12 hours):"]
         for source, cnt in rows:
             lines.append(f"- {source}: {cnt}")
+        email_ready, email_status = _get_recent_news_email_status()
+        lines.extend(["", f"Email: {'ready' if email_ready else 'not ready'}", email_status])
         return ["\n".join(lines)]
     if sub == "help":
         return [
@@ -8513,6 +8539,9 @@ async def process_telegram_update(update: dict) -> None:
                 user_id=user_id,
                 user_name=sender.get("username") or user_name,
             )
+            if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
+                await _handle_recent_news_email_delivery(chat_id, replies[0])
+                return
             for reply in replies:
                 for chunk in _chunk_text_for_telegram(reply):
                     sent_id = await send_message(
@@ -8523,12 +8552,6 @@ async def process_telegram_update(update: dict) -> None:
                     )
                     if sent_id is None:
                         print(f"[WARN] reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
-            if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
-                _spawn_background_to_thread(
-                    _send_recent_news_email,
-                    replies[0],
-                    label="news email",
-                )
         except Exception as e:
             print(f"[WARN] private command handling failed: {type(e).__name__}: {e}")
             await send_message(chat_id, f"指令處理失敗：{type(e).__name__}")
@@ -8544,6 +8567,9 @@ async def process_telegram_update(update: dict) -> None:
                 user_id=user_id,
                 user_name=sender.get("username") or user_name,
             )
+            if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
+                await _handle_recent_news_email_delivery(chat_id, replies[0])
+                return
             for reply in replies:
                 for chunk in _chunk_text_for_telegram(reply):
                     sent_id = await send_message(
@@ -8554,12 +8580,6 @@ async def process_telegram_update(update: dict) -> None:
                     )
                     if sent_id is None:
                         print(f"[WARN] group reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
-            if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
-                _spawn_background_to_thread(
-                    _send_recent_news_email,
-                    replies[0],
-                    label="news email",
-                )
         except Exception as e:
             print(f"[WARN] group command handling failed: {type(e).__name__}: {e}")
             await send_message(chat_id, f"指令處理失敗：{type(e).__name__}")
