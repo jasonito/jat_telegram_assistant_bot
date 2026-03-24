@@ -1139,10 +1139,12 @@ def _extract_transcribe_target(text: str) -> str:
     return m.group(1).strip()
 
 
-def _extract_supported_transcribe_url(text: str) -> str:
+def _extract_supported_transcribe_urls(text: str) -> list[str]:
     raw = (text or "").strip()
     if not raw:
-        return ""
+        return []
+    matches: list[str] = []
+    seen: set[str] = set()
     for match in URL_RE.findall(raw):
         candidate = match.rstrip(").,;!?")
         lower = candidate.lower()
@@ -1152,8 +1154,15 @@ def _extract_supported_transcribe_url(text: str) -> str:
             or "podcasts.apple.com/" in lower
             or DIRECT_AUDIO_URL_RE.search(candidate)
         ):
-            return candidate
-    return ""
+            if candidate not in seen:
+                seen.add(candidate)
+                matches.append(candidate)
+    return matches
+
+
+def _extract_supported_transcribe_url(text: str) -> str:
+    matches = _extract_supported_transcribe_urls(text)
+    return matches[0] if matches else ""
 
 
 def _build_transcript_ai_summary(transcript_path: Path, title: str) -> str | None:
@@ -1608,13 +1617,25 @@ def _download_telegram_file(file_id: str, dest_path: Path) -> None:
 async def handle_transcribe_text_command(chat_id: int, text: str, message_ts: datetime | None = None) -> bool:
     if not FEATURE_TRANSCRIBE_ENABLED:
         return False
-    target = _extract_transcribe_target(text)
-    if not target:
+    raw_target = _extract_transcribe_target(text)
+    if not raw_target:
         if (text or "").strip().lower().startswith("/transcribe"):
             await send_message(chat_id, "用法：/transcribe <YouTube URL | Podcast URL | 音訊 URL>")
             return True
         return False
-    return await _run_transcribe_url_flow(chat_id, target, message_ts=message_ts)
+    targets = _extract_supported_transcribe_urls(raw_target)
+    if not targets:
+        if URL_RE.search(raw_target):
+            await send_message(chat_id, "偵測到網址，但不是可轉錄來源。支援：YouTube / Apple Podcasts / 直接音訊連結。")
+            return True
+        await send_message(chat_id, "用法：/transcribe <YouTube URL | Podcast URL | 音訊 URL>")
+        return True
+    if len(targets) > 1:
+        await send_message(chat_id, f"偵測到 {len(targets)} 個可轉錄網址，將依序排隊處理。")
+    handled = False
+    for target in targets:
+        handled = await _run_transcribe_url_flow(chat_id, target, message_ts=message_ts) or handled
+    return handled
 
 
 async def handle_transcribe_auto_url_message(chat_id: int, text: str, message_ts: datetime | None = None) -> bool:
@@ -1628,15 +1649,20 @@ async def handle_transcribe_auto_url_message(chat_id: int, text: str, message_ts
     if not raw or raw.startswith("/"):
         print(f"[TRANSCRIBE][AUTO_URL][SKIP] chat_id={chat_id} reason=empty_or_command")
         return False
-    target = _extract_supported_transcribe_url(raw)
-    if not target:
+    targets = _extract_supported_transcribe_urls(raw)
+    if not targets:
         print(f"[TRANSCRIBE][AUTO_URL][NO_MATCH] chat_id={chat_id} text={raw[:180]!r}")
         if URL_RE.search(raw):
             await send_message(chat_id, "偵測到網址，但不是可轉錄來源。支援：YouTube / Apple Podcasts / 直接音訊連結。")
             return True
         return False
-    print(f"[TRANSCRIBE][AUTO_URL][MATCH] chat_id={chat_id} target={target}")
-    return await _run_transcribe_url_flow(chat_id, target, message_ts=message_ts)
+    print(f"[TRANSCRIBE][AUTO_URL][MATCH] chat_id={chat_id} targets={targets}")
+    if len(targets) > 1:
+        await send_message(chat_id, f"偵測到 {len(targets)} 個可轉錄網址，將依序排隊處理。")
+    handled = False
+    for target in targets:
+        handled = await _run_transcribe_url_flow(chat_id, target, message_ts=message_ts) or handled
+    return handled
 
 
 async def handle_transcribe_cancel_command(chat_id: int, text: str) -> bool:

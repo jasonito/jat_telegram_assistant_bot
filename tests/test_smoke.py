@@ -206,6 +206,95 @@ transcription = importlib.import_module("transcription")
 
 
 class SmokeTests(unittest.TestCase):
+    def test_extract_supported_transcribe_urls_keeps_multiple_supported_links_in_order(self):
+        text = "\n".join(
+            [
+                "https://podcasts.apple.com/tr/podcast/a/id1?i=100",
+                "https://podcasts.apple.com/tr/podcast/b/id2?i=200",
+                "https://youtu.be/LEHlhpFTRhs?si=xTB7IJvgwRlpXkmu",
+                "https://example.com/not-supported",
+                "https://podcasts.apple.com/tr/podcast/b/id2?i=200",
+            ]
+        )
+
+        urls = app._extract_supported_transcribe_urls(text)
+
+        self.assertEqual(
+            urls,
+            [
+                "https://podcasts.apple.com/tr/podcast/a/id1?i=100",
+                "https://podcasts.apple.com/tr/podcast/b/id2?i=200",
+                "https://youtu.be/LEHlhpFTRhs?si=xTB7IJvgwRlpXkmu",
+            ],
+        )
+
+    def test_handle_transcribe_text_command_processes_multiple_urls_sequentially(self):
+        text = "\n".join(
+            [
+                "/transcribe",
+                "https://podcasts.apple.com/tr/podcast/a/id1?i=100",
+                "https://podcasts.apple.com/tr/podcast/b/id2?i=200",
+                "https://youtu.be/LEHlhpFTRhs?si=xTB7IJvgwRlpXkmu",
+            ]
+        )
+
+        async def _run():
+            with mock.patch.object(app, "FEATURE_TRANSCRIBE_ENABLED", True), mock.patch.object(
+                app, "_run_transcribe_url_flow", new=mock.AsyncMock(return_value=True)
+            ) as mocked_flow, mock.patch.object(
+                app, "send_message", new=mock.AsyncMock(return_value=1)
+            ) as mocked_send:
+                handled = await app.handle_transcribe_text_command(123, text)
+            return handled, mocked_flow, mocked_send
+
+        handled, mocked_flow, mocked_send = asyncio.run(_run())
+
+        self.assertTrue(handled)
+        self.assertEqual(mocked_flow.await_count, 3)
+        self.assertEqual(
+            [call.args[1] for call in mocked_flow.await_args_list],
+            [
+                "https://podcasts.apple.com/tr/podcast/a/id1?i=100",
+                "https://podcasts.apple.com/tr/podcast/b/id2?i=200",
+                "https://youtu.be/LEHlhpFTRhs?si=xTB7IJvgwRlpXkmu",
+            ],
+        )
+        mocked_send.assert_awaited_once_with(123, "偵測到 3 個可轉錄網址，將依序排隊處理。")
+
+    def test_handle_transcribe_auto_url_message_processes_multiple_urls_sequentially(self):
+        text = "\n".join(
+            [
+                "https://podcasts.apple.com/tr/podcast/a/id1?i=100",
+                "https://podcasts.apple.com/tr/podcast/b/id2?i=200",
+                "https://youtu.be/LEHlhpFTRhs?si=xTB7IJvgwRlpXkmu",
+            ]
+        )
+
+        async def _run():
+            with mock.patch.object(app, "FEATURE_TRANSCRIBE_ENABLED", True), mock.patch.object(
+                app, "FEATURE_TRANSCRIBE_AUTO_URL", True
+            ), mock.patch.object(
+                app, "_run_transcribe_url_flow", new=mock.AsyncMock(return_value=True)
+            ) as mocked_flow, mock.patch.object(
+                app, "send_message", new=mock.AsyncMock(return_value=1)
+            ) as mocked_send:
+                handled = await app.handle_transcribe_auto_url_message(123, text)
+            return handled, mocked_flow, mocked_send
+
+        handled, mocked_flow, mocked_send = asyncio.run(_run())
+
+        self.assertTrue(handled)
+        self.assertEqual(mocked_flow.await_count, 3)
+        self.assertEqual(
+            [call.args[1] for call in mocked_flow.await_args_list],
+            [
+                "https://podcasts.apple.com/tr/podcast/a/id1?i=100",
+                "https://podcasts.apple.com/tr/podcast/b/id2?i=200",
+                "https://youtu.be/LEHlhpFTRhs?si=xTB7IJvgwRlpXkmu",
+            ],
+        )
+        mocked_send.assert_awaited_once_with(123, "偵測到 3 個可轉錄網址，將依序排隊處理。")
+
     def test_dropbox_remote_path_for_local_transcript_uses_transcript_root(self):
         tmpdir = Path("tests_runtime_transcribe") / "unit_transcript_path"
         if tmpdir.exists():
