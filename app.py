@@ -365,6 +365,10 @@ _telegram_send_last_status = ""
 _telegram_send_last_error = ""
 _recent_update_ids: dict[int, float] = {}
 _recent_update_ids_lock = threading.Lock()
+_recent_message_fingerprints: dict[str, float] = {}
+_recent_message_fingerprints_lock = threading.Lock()
+_recent_transcribe_request_fingerprints: dict[str, float] = {}
+_recent_transcribe_request_fingerprints_lock = threading.Lock()
 _telegram_update_slots = threading.BoundedSemaphore(max(1, TELEGRAM_UPDATE_MAX_WORKERS * 4))
 
 _telegram_update_executor = ThreadPoolExecutor(
@@ -429,6 +433,94 @@ def _mark_update_seen(update_id: int | None, ttl_seconds: int = 600) -> bool:
             return True
         _recent_update_ids[update_id] = now
     return False
+
+
+def _build_message_fingerprint(message: dict, chat_id: int | str | None) -> str | None:
+    if chat_id is None:
+        return None
+    message_id = message.get("message_id")
+    if message_id is None:
+        return None
+
+    parts = [str(chat_id), str(message_id)]
+    text = (message.get("text") or message.get("caption") or "").strip()
+    if text:
+        parts.append(text)
+
+    document = message.get("document") or {}
+    if document.get("file_unique_id"):
+        parts.append(f"document:{document.get('file_unique_id')}")
+
+    audio = message.get("audio") or {}
+    if audio.get("file_unique_id"):
+        parts.append(f"audio:{audio.get('file_unique_id')}")
+
+    voice = message.get("voice") or {}
+    if voice.get("file_unique_id"):
+        parts.append(f"voice:{voice.get('file_unique_id')}")
+
+    photos = message.get("photo") or []
+    if photos:
+        photo_ids = [str(item.get("file_unique_id") or "") for item in photos if item.get("file_unique_id")]
+        if photo_ids:
+            parts.append(f"photo:{','.join(photo_ids)}")
+
+    return "|".join(parts)
+
+
+def _mark_message_fingerprint_seen(fingerprint: str | None, ttl_seconds: int = 600) -> bool:
+    if not fingerprint:
+        return False
+    now = time.time()
+    with _recent_message_fingerprints_lock:
+        expired = [k for k, ts in _recent_message_fingerprints.items() if now - ts > ttl_seconds]
+        for k in expired:
+            _recent_message_fingerprints.pop(k, None)
+        if fingerprint in _recent_message_fingerprints:
+            return True
+        _recent_message_fingerprints[fingerprint] = now
+    return False
+
+
+def _build_transcribe_request_fingerprint(
+    chat_id: int | str | None,
+    message_id: int | str | None,
+    targets: list[str] | None,
+) -> str | None:
+    if chat_id is None or message_id is None or not targets:
+        return None
+    normalized = [str(t).strip() for t in targets if str(t).strip()]
+    if not normalized:
+        return None
+    return f"{chat_id}|{message_id}|{'||'.join(normalized)}"
+
+
+def _mark_transcribe_request_seen(fingerprint: str | None, ttl_seconds: int = 600) -> bool:
+    if not fingerprint:
+        return False
+    now = time.time()
+    with _recent_transcribe_request_fingerprints_lock:
+        expired = [
+            k for k, ts in _recent_transcribe_request_fingerprints.items() if now - ts > ttl_seconds
+        ]
+        for k in expired:
+            _recent_transcribe_request_fingerprints.pop(k, None)
+        if fingerprint in _recent_transcribe_request_fingerprints:
+            return True
+        _recent_transcribe_request_fingerprints[fingerprint] = now
+    return False
+
+
+def _is_transcribe_only_text(text: str, targets: list[str] | None) -> bool:
+    raw = (text or "").strip()
+    if not raw or not targets:
+        return False
+    stripped = raw
+    for target in targets:
+        if target:
+            stripped = stripped.replace(target, " ")
+    stripped = re.sub(r"[\s\.,;:!?()\[\]{}<>\-_/\\|@#'\"`~]+", "", stripped, flags=re.UNICODE)
+    return not stripped
 
 
 def _register_transcribe_job(chat_id: int, job_id: str, cancel_event: Event) -> bool:
@@ -8457,6 +8549,7 @@ async def process_telegram_update(update: dict) -> None:
         await handle_ocr_choice_callback(callback)
         return
 
+    is_edited_message = bool(update.get("edited_message"))
     message = update.get("message") or update.get("edited_message") or {}
     if not message:
         return
@@ -8465,7 +8558,16 @@ async def process_telegram_update(update: dict) -> None:
     chat_type = chat.get("type")
     chat_id = chat.get("id")
     chat_title = chat.get("title") or chat.get("username") or ""
+    message_id = message.get("message_id")
     text = (message.get("text") or message.get("caption") or "").strip()
+
+    message_fingerprint = _build_message_fingerprint(message, chat_id)
+    if _mark_message_fingerprint_seen(message_fingerprint):
+        print(
+            f"[ROUTE][DUPLICATE_MESSAGE] chat_id={chat_id} "
+            f"message_id={message_id} edited={is_edited_message}"
+        )
+        return
 
     sender = message.get("from", {})
     if sender.get("is_bot"):
@@ -8493,12 +8595,21 @@ async def process_telegram_update(update: dict) -> None:
     is_image_doc = doc.get("mime_type", "").startswith("image/")
     has_image = bool(message.get("photo") or is_image_doc)
     has_audio_attachment = FEATURE_TRANSCRIBE_ENABLED and (_extract_audio_attachment(message) is not None)
+    transcribe_candidate_source = _extract_transcribe_target(text) if text.startswith("/") else text
+    transcribe_candidate_targets = (
+        _extract_supported_transcribe_urls(transcribe_candidate_source) if FEATURE_TRANSCRIBE_ENABLED else []
+    )
 
     cmd_text = text.strip()
     lower_text = cmd_text.lower()
     is_local_control_text = _is_local_control_text(cmd_text)
     is_slash_command = cmd_text.startswith("/")
-    should_store_text = bool(cmd_text) and not is_slash_command and not is_local_control_text
+    should_store_text = (
+        bool(cmd_text)
+        and not is_slash_command
+        and not is_local_control_text
+        and not _is_transcribe_only_text(cmd_text, transcribe_candidate_targets)
+    )
 
     if (is_group or is_private) and chat_id and should_store_text:
         store_message("telegram", str(chat_id), chat_title or chat_type or "", user_id, user_name, text, msg_ts)
@@ -8544,6 +8655,20 @@ async def process_telegram_update(update: dict) -> None:
             if await handle_transcribe_cancel_command(chat_id, cmd_text):
                 print(f"[ROUTE][HANDLED] chat_id={chat_id} by=cancel")
                 return
+            transcribe_targets: list[str] = []
+            if FEATURE_TRANSCRIBE_ENABLED:
+                transcribe_targets = transcribe_candidate_targets
+                transcribe_request_fp = _build_transcribe_request_fingerprint(
+                    chat_id,
+                    message_id,
+                    transcribe_targets,
+                )
+                if _mark_transcribe_request_seen(transcribe_request_fp):
+                    print(
+                        f"[ROUTE][DUPLICATE_TRANSCRIBE] chat_id={chat_id} "
+                        f"message_id={message_id} edited={is_edited_message} targets={transcribe_targets}"
+                    )
+                    return
             if await handle_transcribe_text_command(chat_id, cmd_text, message_ts=msg_ts):
                 print(f"[ROUTE][HANDLED] chat_id={chat_id} by=transcribe_command")
                 return

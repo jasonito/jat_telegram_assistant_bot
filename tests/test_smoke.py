@@ -206,6 +206,11 @@ transcription = importlib.import_module("transcription")
 
 
 class SmokeTests(unittest.TestCase):
+    def setUp(self):
+        app._recent_message_fingerprints.clear()
+        app._recent_update_ids.clear()
+        app._recent_transcribe_request_fingerprints.clear()
+
     def test_extract_supported_transcribe_urls_keeps_multiple_supported_links_in_order(self):
         text = "\n".join(
             [
@@ -602,8 +607,8 @@ class SmokeTests(unittest.TestCase):
             },
         }
 
-        with mock.patch.object(app, "store_message"):
-            with mock.patch.object(app, "append_markdown"):
+        with mock.patch.object(app, "store_message") as mocked_store:
+            with mock.patch.object(app, "append_markdown") as mocked_append:
                 with mock.patch.object(app, "_spawn_background_to_thread") as mocked_bg:
                     with mock.patch.object(app, "handle_transcribe_audio_message", new=mock.AsyncMock(return_value=False)):
                         with mock.patch.object(app, "handle_transcribe_cancel_command", new=mock.AsyncMock(return_value=False)):
@@ -615,12 +620,130 @@ class SmokeTests(unittest.TestCase):
                                 ) as mocked_auto:
                                     asyncio.run(app.process_telegram_update(update))
 
+        mocked_store.assert_not_called()
+        mocked_append.assert_not_called()
+        mocked_bg.assert_not_called()
+        mocked_auto.assert_awaited_once()
+
+    def test_private_youtube_url_with_comment_still_records_note(self):
+        update = {
+            "update_id": 2,
+            "message": {
+                "message_id": 11,
+                "date": 1710391864,
+                "chat": {"id": 123, "type": "private", "username": "alice"},
+                "from": {"id": 456, "username": "alice"},
+                "text": "這集先轉一下 https://youtu.be/hXC7vtZCV_4?si=Lr6qGsGFs9v0ctoq",
+            },
+        }
+
+        with mock.patch.object(app, "store_message") as mocked_store:
+            with mock.patch.object(app, "append_markdown") as mocked_append:
+                with mock.patch.object(app, "_spawn_background_to_thread") as mocked_bg:
+                    with mock.patch.object(app, "handle_transcribe_audio_message", new=mock.AsyncMock(return_value=False)):
+                        with mock.patch.object(app, "handle_transcribe_cancel_command", new=mock.AsyncMock(return_value=False)):
+                            with mock.patch.object(app, "handle_transcribe_text_command", new=mock.AsyncMock(return_value=False)):
+                                with mock.patch.object(
+                                    app,
+                                    "handle_transcribe_auto_url_message",
+                                    new=mock.AsyncMock(return_value=True),
+                                ) as mocked_auto:
+                                    asyncio.run(app.process_telegram_update(update))
+
+        mocked_store.assert_called_once()
+        mocked_append.assert_called_once()
         mocked_bg.assert_called_once_with(
             app.notion_append_chitchat_text,
-            "https://youtu.be/hXC7vtZCV_4?si=Lr6qGsGFs9v0ctoq",
+            "這集先轉一下 https://youtu.be/hXC7vtZCV_4?si=Lr6qGsGFs9v0ctoq",
             mock.ANY,
             label="notion text append",
         )
+        mocked_auto.assert_awaited_once()
+
+    def test_duplicate_edited_message_with_same_url_is_ignored(self):
+        update_message = {
+            "update_id": 101,
+            "message": {
+                "message_id": 10,
+                "date": 1710391864,
+                "chat": {"id": 123, "type": "private", "username": "alice"},
+                "from": {"id": 456, "username": "alice"},
+                "text": "https://youtu.be/hXC7vtZCV_4?si=Lr6qGsGFs9v0ctoq",
+            },
+        }
+        update_edited = {
+            "update_id": 102,
+            "edited_message": {
+                "message_id": 10,
+                "date": 1710391864,
+                "edit_date": 1710391865,
+                "chat": {"id": 123, "type": "private", "username": "alice"},
+                "from": {"id": 456, "username": "alice"},
+                "text": "https://youtu.be/hXC7vtZCV_4?si=Lr6qGsGFs9v0ctoq",
+            },
+        }
+
+        app._recent_message_fingerprints.clear()
+
+        with mock.patch.object(app, "store_message") as mocked_store:
+            with mock.patch.object(app, "append_markdown") as mocked_append:
+                with mock.patch.object(app, "_spawn_background_to_thread") as mocked_bg:
+                    with mock.patch.object(app, "handle_transcribe_audio_message", new=mock.AsyncMock(return_value=False)):
+                        with mock.patch.object(app, "handle_transcribe_cancel_command", new=mock.AsyncMock(return_value=False)):
+                            with mock.patch.object(app, "handle_transcribe_text_command", new=mock.AsyncMock(return_value=False)):
+                                with mock.patch.object(
+                                    app,
+                                    "handle_transcribe_auto_url_message",
+                                    new=mock.AsyncMock(return_value=True),
+                                ) as mocked_auto:
+                                    asyncio.run(app.process_telegram_update(update_message))
+                                    asyncio.run(app.process_telegram_update(update_edited))
+
+        mocked_store.assert_not_called()
+        mocked_append.assert_not_called()
+        mocked_bg.assert_not_called()
+        mocked_auto.assert_awaited_once()
+
+    def test_edited_message_with_same_url_but_different_text_skips_duplicate_transcribe(self):
+        update_message = {
+            "update_id": 201,
+            "message": {
+                "message_id": 20,
+                "date": 1710391864,
+                "chat": {"id": 123, "type": "private", "username": "alice"},
+                "from": {"id": 456, "username": "alice"},
+                "text": "這集不錯 https://youtu.be/hXC7vtZCV_4?si=Lr6qGsGFs9v0ctoq",
+            },
+        }
+        update_edited = {
+            "update_id": 202,
+            "edited_message": {
+                "message_id": 20,
+                "date": 1710391864,
+                "edit_date": 1710391866,
+                "chat": {"id": 123, "type": "private", "username": "alice"},
+                "from": {"id": 456, "username": "alice"},
+                "text": "這集真的不錯 https://youtu.be/hXC7vtZCV_4?si=Lr6qGsGFs9v0ctoq",
+            },
+        }
+
+        with mock.patch.object(app, "store_message") as mocked_store:
+            with mock.patch.object(app, "append_markdown") as mocked_append:
+                with mock.patch.object(app, "_spawn_background_to_thread") as mocked_bg:
+                    with mock.patch.object(app, "handle_transcribe_audio_message", new=mock.AsyncMock(return_value=False)):
+                        with mock.patch.object(app, "handle_transcribe_cancel_command", new=mock.AsyncMock(return_value=False)):
+                            with mock.patch.object(app, "handle_transcribe_text_command", new=mock.AsyncMock(return_value=False)):
+                                with mock.patch.object(
+                                    app,
+                                    "handle_transcribe_auto_url_message",
+                                    new=mock.AsyncMock(return_value=True),
+                                ) as mocked_auto:
+                                    asyncio.run(app.process_telegram_update(update_message))
+                                    asyncio.run(app.process_telegram_update(update_edited))
+
+        self.assertEqual(mocked_store.call_count, 2)
+        self.assertEqual(mocked_append.call_count, 2)
+        self.assertEqual(mocked_bg.call_count, 2)
         mocked_auto.assert_awaited_once()
 
     def test_status_report_includes_telegram_poll_thread_health(self):
