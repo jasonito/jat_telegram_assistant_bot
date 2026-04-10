@@ -4,7 +4,8 @@ param(
   [int]$Port = 8000,
   [switch]$ShowWindow,
   [string]$LogFile = "",
-  [switch]$SkipDepsInstall
+  [switch]$SkipDepsInstall,
+  [int]$StorageWaitTimeoutSeconds = 45
 )
 
  $ErrorActionPreference = 'Stop'
@@ -26,7 +27,7 @@ param(
       throw "Env file not found: $path"
     }
 
-    $lines = Get-Content -Path $path -ErrorAction Stop
+    $lines = Get-Content -Path $path -Encoding UTF8 -ErrorAction Stop
     foreach ($line in $lines) {
       $trim = $line.Trim()
       if ($trim.Length -eq 0) { continue }
@@ -62,7 +63,7 @@ param(
       throw "Env file not found: $path"
     }
 
-    $lines = Get-Content -Path $path -ErrorAction Stop
+    $lines = Get-Content -Path $path -Encoding UTF8 -ErrorAction Stop
     foreach ($line in $lines) {
       $trim = $line.Trim()
       if ($trim.Length -eq 0) { continue }
@@ -126,11 +127,74 @@ param(
     return @($pids | Select-Object -Unique)
   }
 
-  function Wait-HttpHealth([int]$targetPort, [bool]$expectLongPolling) {
+  function Get-LogTail([string]$path, [int]$lineCount = 40) {
+    if (-not $path) {
+      return ""
+    }
+    if (-not (Test-Path -Path $path)) {
+      return ""
+    }
+    try {
+      return ((Get-Content -Path $path -Tail $lineCount -ErrorAction Stop) -join [Environment]::NewLine).Trim()
+    } catch {
+      return ""
+    }
+  }
+
+  function Format-HealthFailureMessage(
+    [int]$targetPort,
+    [string]$lastDetail,
+    $proc,
+    [string]$stdoutLog,
+    [string]$stderrLog
+  ) {
+    $parts = @("Health check did not become ready at http://127.0.0.1:$targetPort/healthz within 30s.")
+    if ($lastDetail) {
+      $parts += "Last detail: $lastDetail"
+    }
+    if ($null -ne $proc) {
+      try { $proc.Refresh() } catch {}
+      if ($proc.HasExited) {
+        $parts += "uvicorn exited early with code $($proc.ExitCode) (pid $($proc.Id))."
+      } else {
+        $parts += "uvicorn still running with pid $($proc.Id)."
+      }
+    }
+    $listeningPids = @(Get-ListeningPidsForPort -targetPort $targetPort)
+    if ($listeningPids.Count -gt 0) {
+      $parts += "Listening pid(s) currently on port ${targetPort}: $($listeningPids -join ', ')"
+    }
+    $stderrTail = Get-LogTail -path $stderrLog
+    if ($stderrTail) {
+      $parts += "Recent STDERR:`n$stderrTail"
+    }
+    $stdoutTail = Get-LogTail -path $stdoutLog
+    if ($stdoutTail) {
+      $parts += "Recent STDOUT:`n$stdoutTail"
+    }
+    return ($parts -join [Environment]::NewLine)
+  }
+
+  function Wait-HttpHealth(
+    [int]$targetPort,
+    [bool]$expectLongPolling,
+    $proc = $null,
+    [string]$stdoutLog = "",
+    [string]$stderrLog = ""
+  ) {
     $healthUrl = "http://127.0.0.1:$targetPort/healthz"
-    $deadline = (Get-Date).AddSeconds(30)
+    $timeoutSeconds = 30
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
     $lastDetail = ""
+    $activity = "Waiting for health ($targetPort)"
     while ((Get-Date) -lt $deadline) {
+      if ($null -ne $proc) {
+        try { $proc.Refresh() } catch {}
+        if ($proc.HasExited) {
+          Write-Progress -Activity $activity -Completed
+          throw (Format-HealthFailureMessage -targetPort $targetPort -lastDetail "uvicorn process exited before health became ready" -proc $proc -stdoutLog $stdoutLog -stderrLog $stderrLog)
+        }
+      }
       try {
         $resp = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 3
         if ($null -eq $resp) {
@@ -145,14 +209,94 @@ param(
           $stale = if ($resp.telegram_poll) { [bool]$resp.telegram_poll.stale } else { $true }
           $lastDetail = "poll thread not ready (alive=$threadAlive stale=$stale)"
         } else {
+          Write-Progress -Activity $activity -Completed
           return $resp
         }
       } catch {
         $lastDetail = $_.Exception.Message
       }
+      $remaining = [Math]::Max(0, [int][Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds))
+      $elapsed = [Math]::Max(0, $timeoutSeconds - $remaining)
+      $percent = [Math]::Min(99, [int](($elapsed / $timeoutSeconds) * 100))
+      $status = if ($lastDetail) { $lastDetail } else { "starting..." }
+      $current = "remaining ${remaining}s"
+      Write-Progress -Activity $activity -Status $status -CurrentOperation $current -PercentComplete $percent
       Start-Sleep -Milliseconds 800
     }
-    throw "Health check did not become ready at $healthUrl within 30s. Last detail: $lastDetail"
+    Write-Progress -Activity $activity -Completed
+    throw (Format-HealthFailureMessage -targetPort $targetPort -lastDetail $lastDetail -proc $proc -stdoutLog $stdoutLog -stderrLog $stderrLog)
+  }
+
+  function Get-StorageEnvValue([string]$key, [string]$defaultValue) {
+    $rawValue = [System.Environment]::GetEnvironmentVariable($key)
+    $value = if ($rawValue) { $rawValue.Trim() } else { "" }
+    if ($value) {
+      return $value
+    }
+    return $defaultValue
+  }
+
+  function Get-StorageRoots([string[]]$candidatePaths) {
+    $roots = @()
+    foreach ($path in $candidatePaths) {
+      if (-not $path) { continue }
+      try {
+        $fullPath = [System.IO.Path]::GetFullPath($path.Trim())
+        $root = [System.IO.Path]::GetPathRoot($fullPath)
+        if ($root) {
+          $roots += $root
+        }
+      } catch {}
+    }
+    return @($roots | Select-Object -Unique)
+  }
+
+  function Test-StorageRootReady([string]$rootPath) {
+    if (-not $rootPath) {
+      return $true
+    }
+    try {
+      if ($rootPath -match '^[A-Za-z]:\\$') {
+        $deviceId = $rootPath.TrimEnd('\')
+        $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$deviceId'" -ErrorAction SilentlyContinue
+        if ($null -ne $disk) {
+          return $true
+        }
+      }
+      return Test-Path -Path $rootPath -ErrorAction SilentlyContinue
+    } catch {
+      return $false
+    }
+  }
+
+  function Wait-StoragePathsReady([string[]]$candidatePaths, [int]$timeoutSeconds) {
+    $roots = @(Get-StorageRoots -candidatePaths $candidatePaths)
+    if ($roots.Count -eq 0) {
+      return
+    }
+
+    $deadline = (Get-Date).AddSeconds([Math]::Max(0, $timeoutSeconds))
+    $activity = 'Waiting for storage paths'
+    do {
+      $pending = @($roots | Where-Object { -not (Test-StorageRootReady $_) })
+      if ($pending.Count -eq 0) {
+        Write-Progress -Activity $activity -Completed
+        return
+      }
+
+      $remaining = [Math]::Max(0, [int][Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds))
+      $elapsed = [Math]::Max(0, $timeoutSeconds - $remaining)
+      $percent = if ($timeoutSeconds -le 0) { 100 } else { [Math]::Min(99, [int](($elapsed / $timeoutSeconds) * 100)) }
+      $status = "waiting for root: $($pending -join ', ')"
+      $current = "remaining ${remaining}s"
+      Write-Progress -Activity $activity -Status $status -CurrentOperation $current -PercentComplete $percent
+      if ((Get-Date) -ge $deadline) {
+        Write-Progress -Activity $activity -Completed
+        Write-Warn "Storage root not ready before timeout (${timeoutSeconds}s): $($pending -join ', ')"
+        return
+      }
+      Start-Sleep -Milliseconds 500
+    } while ($true)
   }
 
   try {
@@ -176,6 +320,17 @@ param(
       $envFile = Join-Path $PSScriptRoot $EnvFile
     }
     Import-EnvFile -path $envFile
+    $defaultObsidianResourceDir = 'H:\我的雲端硬碟\Obsidian\Resource'
+    $obsidianResourceDir = Get-StorageEnvValue -key 'OBSIDIAN_RESOURCE_DIR' -defaultValue $defaultObsidianResourceDir
+    $noteDir = Get-StorageEnvValue -key 'NOTE_DIR' -defaultValue (Join-Path $obsidianResourceDir 'note')
+    $fullTranscriptsDir = Get-StorageEnvValue -key 'FULL_TRANSCRIPTS_DIR' -defaultValue (Join-Path $obsidianResourceDir 'transcript')
+    $dailyPodcastDir = Get-StorageEnvValue -key 'DAILY_PODCAST_DIR' -defaultValue (Join-Path $obsidianResourceDir 'daily-podcast')
+    Wait-StoragePathsReady -candidatePaths @(
+      $obsidianResourceDir,
+      $noteDir,
+      $fullTranscriptsDir,
+      $dailyPodcastDir
+    ) -timeoutSeconds $StorageWaitTimeoutSeconds
     if (-not $env:PYTHONUTF8) {
       $env:PYTHONUTF8 = '1'
     }
@@ -457,26 +612,30 @@ param(
     if (-not $ShowWindow) {
       $startParams["WindowStyle"] = "Hidden"
     }
+    $logBase = if ($LogFile) {
+      if ([System.IO.Path]::IsPathRooted($LogFile)) { $LogFile } else { Join-Path $PSScriptRoot $LogFile }
+    } else {
+      Join-Path $PSScriptRoot (".logs\runtime\start-{0}-{1}-{2}" -f $appModule, $Port, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    }
+    $logDir = Split-Path -Parent $logBase
+    if ($logDir -and -not (Test-Path -Path $logDir)) {
+      New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+    $stdoutLog = "$logBase.out.log"
+    $stderrLog = "$logBase.err.log"
     if ($LogFile) {
-      $logBase = if ([System.IO.Path]::IsPathRooted($LogFile)) { $LogFile } else { Join-Path $PSScriptRoot $LogFile }
-      $logDir = Split-Path -Parent $logBase
-      if ($logDir -and -not (Test-Path -Path $logDir)) {
-        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-      }
-      $stdoutLog = "$logBase.out.log"
-      $stderrLog = "$logBase.err.log"
       Write-Info "Redirecting uvicorn logs to:"
       Write-Info "  STDOUT: $stdoutLog"
       Write-Info "  STDERR: $stderrLog"
-      $startParams["RedirectStandardOutput"] = $stdoutLog
-      $startParams["RedirectStandardError"] = $stderrLog
     }
+    $startParams["RedirectStandardOutput"] = $stdoutLog
+    $startParams["RedirectStandardError"] = $stderrLog
     $proc = Start-Process @startParams
     if ($null -eq $proc) {
       throw "Failed to start uvicorn process."
     }
     Write-Info "uvicorn pid: $($proc.Id)"
-    $health = Wait-HttpHealth -targetPort $Port -expectLongPolling $isLongPollingMode
+    $health = Wait-HttpHealth -targetPort $Port -expectLongPolling $isLongPollingMode -proc $proc -stdoutLog $stdoutLog -stderrLog $stderrLog
     if ($health -and $health.telegram_mode) {
       Write-Info "Health ready: mode=$($health.telegram_mode) ok=$($health.ok)"
     } else {
