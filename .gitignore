@@ -12,4 +12,8 @@ youtubeconverter/downloads/
 youtubeconverter/transcripts/
 
 data/messages.sqlite
+logs/
+.logs/
+read/_runtime/
+read/messages.sqlite
 

@@ -211,6 +211,42 @@ class SmokeTests(unittest.TestCase):
         app._recent_update_ids.clear()
         app._recent_transcribe_request_fingerprints.clear()
 
+    def test_private_plain_text_records_and_sends_ack(self):
+        update = {
+            "update_id": 3,
+            "message": {
+                "message_id": 12,
+                "date": 1710391864,
+                "chat": {"id": 123, "type": "private", "username": "alice"},
+                "from": {"id": 456, "username": "alice"},
+                "text": "今天先整理研究框架，晚上再補數字。",
+            },
+        }
+
+        with mock.patch.object(app, "store_message") as mocked_store:
+            with mock.patch.object(app, "append_markdown") as mocked_append:
+                with mock.patch.object(app, "_spawn_background_to_thread") as mocked_bg:
+                    with mock.patch.object(app, "send_ack_message", new=mock.AsyncMock(return_value=True)) as mocked_ack:
+                        with mock.patch.object(app, "handle_transcribe_audio_message", new=mock.AsyncMock(return_value=False)):
+                            with mock.patch.object(app, "handle_transcribe_cancel_command", new=mock.AsyncMock(return_value=False)):
+                                with mock.patch.object(app, "handle_transcribe_text_command", new=mock.AsyncMock(return_value=False)):
+                                    with mock.patch.object(
+                                        app,
+                                        "handle_transcribe_auto_url_message",
+                                        new=mock.AsyncMock(return_value=False),
+                                    ):
+                                        asyncio.run(app.process_telegram_update(update))
+
+        mocked_store.assert_called_once()
+        mocked_append.assert_called_once()
+        mocked_bg.assert_called_once_with(
+            app.notion_append_chitchat_text,
+            "今天先整理研究框架，晚上再補數字。",
+            mock.ANY,
+            label="notion text append",
+        )
+        mocked_ack.assert_awaited_once_with(123, "已成功紀錄")
+
     def test_extract_supported_transcribe_urls_keeps_multiple_supported_links_in_order(self):
         text = "\n".join(
             [
@@ -299,6 +335,26 @@ class SmokeTests(unittest.TestCase):
             ],
         )
         mocked_send.assert_awaited_once_with(123, "偵測到 3 個可轉錄網址，將依序排隊處理。")
+
+    def test_handle_transcribe_auto_url_message_ignores_unsupported_url(self):
+        text = "https://example.com/not-supported"
+
+        async def _run():
+            with mock.patch.object(app, "FEATURE_TRANSCRIBE_ENABLED", True), mock.patch.object(
+                app, "FEATURE_TRANSCRIBE_AUTO_URL", True
+            ), mock.patch.object(
+                app, "_run_transcribe_url_flow", new=mock.AsyncMock(return_value=True)
+            ) as mocked_flow, mock.patch.object(
+                app, "send_message", new=mock.AsyncMock(return_value=1)
+            ) as mocked_send:
+                handled = await app.handle_transcribe_auto_url_message(123, text)
+            return handled, mocked_flow, mocked_send
+
+        handled, mocked_flow, mocked_send = asyncio.run(_run())
+
+        self.assertFalse(handled)
+        mocked_flow.assert_not_awaited()
+        mocked_send.assert_not_awaited()
 
     def test_dropbox_remote_path_for_local_transcript_uses_transcript_root(self):
         tmpdir = Path("tests_runtime_transcribe") / "unit_transcript_path"
@@ -418,6 +474,94 @@ class SmokeTests(unittest.TestCase):
             calls,
             ["notion", "build_summary", "prepend_summary", "append_daily_note", "sync_transcript"],
         )
+
+    def test_resolve_daily_podcast_selection_defaults_to_all(self):
+        selected, error = app._resolve_daily_podcast_selection("run all")
+        self.assertIsNone(error)
+        self.assertEqual(len(selected), len(app.DAILY_PODCAST_SHOWS))
+
+    def test_resolve_daily_podcast_selection_accepts_common_run_typo(self):
+        selected, error = app._resolve_daily_podcast_selection("rull all")
+        self.assertIsNone(error)
+        self.assertEqual(len(selected), len(app.DAILY_PODCAST_SHOWS))
+
+    def test_resolve_daily_podcast_selection_supports_multiple_keys(self):
+        selected, error = app._resolve_daily_podcast_selection("tech_orange nyt_daily")
+        self.assertIsNone(error)
+        self.assertEqual(
+            [item["key"] for item in selected],
+            ["tech_orange", "nyt_daily"],
+        )
+
+    def test_estimate_daily_podcast_total_seconds_uses_duration_and_model(self):
+        estimate = app._estimate_daily_podcast_total_seconds(
+            [
+                {"duration_seconds": 1800},
+                {"duration_seconds": 900},
+            ],
+            "small",
+        )
+        self.assertEqual(estimate, int((1800 + 900) * 0.85 + 180))
+
+    def test_daily_podcast_episode_state_key(self):
+        self.assertEqual(
+            app._daily_podcast_episode_state_key("nyt_daily", "123456"),
+            "nyt_daily:123456",
+        )
+
+    def test_daily_podcast_episode_fallback_key(self):
+        episode = {
+            "show_key": "nyt_daily",
+            "title": "Big Markets, Big Moves",
+            "publish_date": "2026-04-05T00:00:00Z",
+            "source_url": "https://podcasts.apple.com/us/podcast/the-daily/id1200361736",
+        }
+        key = app._daily_podcast_episode_fallback_key(episode)
+        self.assertIsNotNone(key)
+        self.assertTrue(key.startswith("nyt_daily:fallback:"))
+
+    def test_is_daily_podcast_episode_processed_checks_existing_state_path(self):
+        episode = {
+            "show_key": "nyt_daily",
+            "episode_id": "123456",
+            "title": "Big Markets, Big Moves",
+            "publish_date": "2026-04-05T00:00:00Z",
+            "source_url": "https://podcasts.apple.com/us/podcast/the-daily/id1200361736",
+        }
+        with mock.patch.object(app, "get_sync_state", return_value="some/path.md") as mocked_get:
+            with mock.patch.object(app, "_daily_podcast_state_path_exists", return_value=True) as mocked_exists:
+                self.assertTrue(app._is_daily_podcast_episode_processed(episode))
+        mocked_get.assert_called_once_with("daily_podcast_episode", "nyt_daily:123456")
+        mocked_exists.assert_called_once_with("some/path.md")
+
+    def test_is_daily_podcast_episode_processed_uses_fallback_key_when_episode_id_missing(self):
+        episode = {
+            "show_key": "nyt_daily",
+            "title": "Big Markets, Big Moves",
+            "publish_date": "2026-04-05T00:00:00Z",
+            "source_url": "https://podcasts.apple.com/us/podcast/the-daily/id1200361736",
+        }
+        with mock.patch.object(app, "get_sync_state", return_value="some/path.md") as mocked_get:
+            with mock.patch.object(app, "_daily_podcast_state_path_exists", return_value=True):
+                self.assertTrue(app._is_daily_podcast_episode_processed(episode))
+        called_key = mocked_get.call_args[0][1]
+        self.assertTrue(called_key.startswith("nyt_daily:fallback:"))
+
+    def test_mark_daily_podcast_episode_processed_uses_all_state_keys(self):
+        episode = {
+            "show_key": "nyt_daily",
+            "episode_id": "123456",
+            "title": "Big Markets, Big Moves",
+            "publish_date": "2026-04-05T00:00:00Z",
+            "source_url": "https://podcasts.apple.com/us/podcast/the-daily/id1200361736",
+        }
+        with mock.patch.object(app, "upsert_sync_state") as mocked_upsert:
+            app._mark_daily_podcast_episode_processed(episode, Path("out.md"))
+        self.assertEqual(mocked_upsert.call_count, 2)
+        first_key = mocked_upsert.call_args_list[0][0][1]
+        second_key = mocked_upsert.call_args_list[1][0][1]
+        self.assertEqual(first_key, "nyt_daily:123456")
+        self.assertTrue(second_key.startswith("nyt_daily:fallback:"))
 
     def test_local_datetime_from_unix_uses_local_tz(self):
         dt = app._local_datetime_from_unix(0)
@@ -660,6 +804,37 @@ class SmokeTests(unittest.TestCase):
         )
         mocked_auto.assert_awaited_once()
 
+    def test_private_unsupported_url_still_records_note(self):
+        update = {
+            "update_id": 4,
+            "message": {
+                "message_id": 13,
+                "date": 1710391864,
+                "chat": {"id": 123, "type": "private", "username": "alice"},
+                "from": {"id": 456, "username": "alice"},
+                "text": "https://example.com/not-supported",
+            },
+        }
+
+        with mock.patch.object(app, "store_message") as mocked_store:
+            with mock.patch.object(app, "append_markdown") as mocked_append:
+                with mock.patch.object(app, "_spawn_background_to_thread") as mocked_bg:
+                    with mock.patch.object(app, "send_ack_message", new=mock.AsyncMock(return_value=True)) as mocked_ack:
+                        with mock.patch.object(app, "handle_transcribe_audio_message", new=mock.AsyncMock(return_value=False)):
+                            with mock.patch.object(app, "handle_transcribe_cancel_command", new=mock.AsyncMock(return_value=False)):
+                                with mock.patch.object(app, "handle_transcribe_text_command", new=mock.AsyncMock(return_value=False)):
+                                    asyncio.run(app.process_telegram_update(update))
+
+        mocked_store.assert_called_once()
+        mocked_append.assert_called_once()
+        mocked_bg.assert_called_once_with(
+            app.notion_append_chitchat_text,
+            "https://example.com/not-supported",
+            mock.ANY,
+            label="notion text append",
+        )
+        mocked_ack.assert_awaited_once_with(123, "已成功紀錄")
+
     def test_duplicate_edited_message_with_same_url_is_ignored(self):
         update_message = {
             "update_id": 101,
@@ -785,29 +960,6 @@ class SmokeTests(unittest.TestCase):
             with mock.patch.object(app.requests, "RequestException", Exception, create=True):
                 with mock.patch.object(app.requests, "post", side_effect=Exception("boom")):
                     app.set_telegram_commands()
-
-    def test_build_scoped_summary_syncs_dropbox_before_note_summary(self):
-        with mock.patch.object(app, "_sync_dropbox_before_weekly_report") as mocked_presync:
-            with mock.patch.object(app, "build_note_digest_recent", return_value=["weekly"]) as mocked_digest:
-                result = app.build_scoped_summary("2026-03-09", "note", recent_days=7)
-
-        self.assertEqual(result, ["weekly"])
-        mocked_presync.assert_called_once_with("2026-03-09", 7)
-        mocked_digest.assert_called_once_with("2026-03-09", days=7)
-
-    def test_build_scoped_summary_skips_dropbox_sync_when_disabled(self):
-        with mock.patch.object(app, "_sync_dropbox_before_weekly_report") as mocked_presync:
-            with mock.patch.object(app, "build_note_digest", return_value=["daily"]) as mocked_digest:
-                result = app.build_scoped_summary("2026-03-09", "note")
-
-        self.assertEqual(result, ["daily"])
-        mocked_presync.assert_called_once_with("2026-03-09", 1)
-        mocked_digest.assert_called_once_with("2026-03-09")
-
-    def test_weekly_commands_return_disabled_message_when_feature_flag_off(self):
-        with mock.patch.object(app, "FEATURE_WEEKLY_REPORT_ENABLED", False):
-            self.assertEqual(app.handle_command("/summary_notes_weekly"), "週報功能目前已關閉。")
-            self.assertEqual(app.handle_command("/summary_news_weekly"), "週報功能目前已關閉。")
 
     def test_estimate_weekly_topic_count_scales_to_ten(self):
         self.assertEqual(app._estimate_weekly_topic_count("短摘要", 3), 2)
@@ -1278,20 +1430,6 @@ class SmokeTests(unittest.TestCase):
                     if fp.is_dir():
                         fp.rmdir()
 
-    def test_presync_weekly_report_syncs_requested_date_range(self):
-        with mock.patch.object(app, "DROPBOX_SYNC_ENABLED", True):
-            with mock.patch.object(app, "run_dropbox_sync", return_value={}) as mocked_sync:
-                with mock.patch.object(app, "sync_dropbox_notes_range_to_local", return_value={
-                    "notes_remote_scanned": 2,
-                    "notes_remote_downloaded": 1,
-                    "notes_remote_skipped": 1,
-                    "notes_remote_failed": 0,
-                }) as mocked_range:
-                    app._sync_dropbox_before_weekly_report("2026-03-09", 7)
-
-        mocked_sync.assert_called_once_with(full_scan=False)
-        mocked_range.assert_called_once_with("2026-03-03", "2026-03-09")
-
     def test_transcribe_audio_splits_long_audio_into_chunks(self):
         temp_dir = Path("tests_runtime_transcribe")
         temp_dir.mkdir(exist_ok=True)
@@ -1352,6 +1490,20 @@ class SmokeTests(unittest.TestCase):
                 for fp in sorted(temp_dir.rglob("*"), reverse=True):
                     if fp.is_dir():
                         fp.rmdir()
+
+    def test_safe_filename_preserves_readable_title(self):
+        title = "《財報狗 - 掌握台股美股時事議題 - 513.【財經時事放大鏡】光油並進》"
+        self.assertEqual(
+            transcription._safe_filename(title),
+            "《財報狗 - 掌握台股美股時事議題 - 513.【財經時事放大鏡】光油並進》.md",
+        )
+
+    def test_safe_filename_removes_windows_invalid_chars(self):
+        title = 'Podcast: Q&A / Earnings <Recap>?*'
+        self.assertEqual(
+            transcription._safe_filename(title),
+            "Podcast Q&A Earnings Recap.md",
+        )
 
 
 if __name__ == "__main__":

@@ -33,64 +33,72 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 `start.ps1` loads env values from `-EnvFile`, and `start-both.ps1` already uses `.env.main` + `.env.chitchat`.
 
 ### Segment A: Profile / Runtime
-- Purpose: select bot profile and data root.
-- Keys: `APP_MODULE`, `APP_PROFILE`, `DATA_DIR`.
+- 用途：選擇 bot profile 與資料根目錄。
+- 主要參數：`APP_MODULE`、`APP_PROFILE`、`DATA_DIR`。
+- 目前預設儲存位置：
+- `main` 純文字 note：`H:\我的雲端硬碟\Obsidian\Resource\note`
+- `main` transcript：`H:\我的雲端硬碟\Obsidian\Resource\transcript`
+- `/daily_podcast` transcript：`H:\我的雲端硬碟\Obsidian\Resource\daily-podcast`
+- `chitchat` 本地資料根目錄：`DATA_DIR`（僅用於 sqlite、images、runtime 暫存）
+- `chitchat` 文字／圖片／transcript chatlog：Notion
 
 ### Segment B: Telegram Core
-- Purpose: Telegram token, webhook/polling mode, and network retry behavior.
-- Keys: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_GROUPS`, `TELEGRAM_ALLOWED_CONTROL_USERS`, `TELEGRAM_LONG_POLLING`, `TELEGRAM_LOCAL_WEBHOOK_URL`.
-- Optional tuning: `TELEGRAM_FILE_FETCH_*`, `TELEGRAM_POLL_*`.
+- 用途：設定 Telegram token、webhook/polling 模式與重試行為。
+- 主要參數：`TELEGRAM_BOT_TOKEN`、`TELEGRAM_ALLOWED_GROUPS`、`TELEGRAM_ALLOWED_CONTROL_USERS`、`TELEGRAM_LONG_POLLING`、`TELEGRAM_LOCAL_WEBHOOK_URL`。
+- 可選調整：`TELEGRAM_FILE_FETCH_*`、`TELEGRAM_POLL_*`。
 
 ### Segment C: Feature Flags
-- Purpose: toggle major functions without code changes.
-- Keys: `FEATURE_NEWS_ENABLED`, `FEATURE_WEEKLY_REPORT_ENABLED`, `FEATURE_TRANSCRIBE_ENABLED`, `FEATURE_TRANSCRIBE_AUTO_URL`, `FEATURE_OCR_ENABLED`, `FEATURE_OCR_CHOICE_ENABLED`, `FEATURE_SLACK_ENABLED`.
-- OCR choice behavior: `OCR_CHOICE_SCOPE`, `OCR_CHOICE_TIMEOUT_SECONDS`, `OCR_CHOICE_TIMEOUT_DEFAULT`.
+- 用途：不改程式碼就切換主要功能。
+- 主要參數：`FEATURE_NEWS_ENABLED`、`FEATURE_TRANSCRIBE_ENABLED`、`FEATURE_TRANSCRIBE_AUTO_URL`、`FEATURE_OCR_ENABLED`、`FEATURE_OCR_CHOICE_ENABLED`、`FEATURE_SLACK_ENABLED`。
+- OCR 選擇行為：`OCR_CHOICE_SCOPE`、`OCR_CHOICE_TIMEOUT_SECONDS`、`OCR_CHOICE_TIMEOUT_DEFAULT`。
 
 ### Segment D: Transcription Engine
-- Purpose: control Whisper quality/speed/memory and chunking.
-- Keys: `TRANSCRIBE_MAX_DURATION_SECONDS`, `TRANSCRIBE_CHUNK_MINUTES`, `TRANSCRIBE_CHECKPOINT_FLUSH_SECONDS`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`, `WHISPER_BEAM_SIZE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_CPU_THREADS`, `WHISPER_BATCH_SIZE`, `FFMPEG_LOCATION`, `TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS`.
-- Current default: `WHISPER_MODEL=small`.
-- Long audio is now chunked inside `transcribe_audio()` before Whisper runs, then merged back with original timestamps.
-- Current code path initializes Whisper on `cpu`. GPU use requires both a working CUDA stack on the host and code changes.
+- 用途：控制 Whisper 的品質、速度、記憶體使用與分段策略。
+- 主要參數：`TRANSCRIBE_MAX_DURATION_SECONDS`、`TRANSCRIBE_CHUNK_MINUTES`、`TRANSCRIBE_CHECKPOINT_FLUSH_SECONDS`、`WHISPER_MODEL`、`WHISPER_LANGUAGE`、`WHISPER_BEAM_SIZE`、`WHISPER_COMPUTE_TYPE`、`WHISPER_CPU_THREADS`、`WHISPER_BATCH_SIZE`、`FFMPEG_LOCATION`、`TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS`。
+- 目前預設：`WHISPER_MODEL=small`。
+- 長音訊會先在 `transcribe_audio()` 內部分段，再交給 Whisper，最後合併回原始時間戳。
+- 目前程式路徑預設使用 `cpu`。若要改用 GPU，除了主機 CUDA 環境可用外，還需要額外程式調整。
 
 ### Segment E: OCR Provider
-- Purpose: configure image OCR backend.
-- Keys: `OCR_PROVIDER`, `OCR_LANG_HINTS`, `GOOGLE_APPLICATION_CREDENTIALS`.
+- 用途：設定圖片 OCR 後端。
+- 主要參數：`OCR_PROVIDER`、`OCR_LANG_HINTS`、`GOOGLE_APPLICATION_CREDENTIALS`。
 
 ### Segment F: News / Digest
-- Purpose: collect, filter, and summarize news.
-- Keys: `NEWS_ENABLED`, `NEWS_FETCH_INTERVAL_MINUTES`, `NEWS_LOOKBACK_HOURS`, `NEWS_STARTUP_FETCH_ENABLED`, `NEWS_STARTUP_NOTIFY_ENABLED`, `NEWS_PUSH_ENABLED`, `NEWS_PUSH_MAX_ITEMS`, `NEWS_GNEWS_*`, `NEWS_RSS_URLS`, `NEWS_RSS_URLS_FILE`, `NEWS_URL_FETCH_*`, `NEWS_DIGEST_*`, `NEWS_CLASSIFY_BATCH_SIZE`, `NOTE_DIGEST_MAX_ITEMS`.
-- Current main profile defaults: `NEWS_FETCH_INTERVAL_MINUTES=360`, `NEWS_LOOKBACK_HOURS=24`, `NEWS_STARTUP_FETCH_ENABLED=1`, `NEWS_STARTUP_NOTIFY_ENABLED=1`.
-- Current behavior: on bot startup, news ingestion runs once immediately, sends a Telegram notice to enabled `news_subscriptions`, then continues on aligned 6-hour slots. The fetch window is 24 hours so the next startup can backfill after the PC was off.
-- `/news` reads local markdown under `DATA_DIR\news`, filters items by `published_at` within the last 24 hours in `Asia/Taipei`, classifies them into 7 categories (AI, 半導體, 台灣產業, 政治及地緣, 金融市場, 消費電子產品, 其他) using LLM batch classification with keyword fallback, and renders grouped clickable HTML links.
-- News classification uses LLM when `AI_SUMMARY_ENABLED=1`; falls back to keyword-based classification otherwise. Batch size is configurable via `NEWS_CLASSIFY_BATCH_SIZE` (default 40).
-- If local `news` markdown for the recent window is missing, the bot first tries Dropbox remote-to-local news sync and then retries the local read.
-- Note/transcript AI input budget: `NOTE_AI_INPUT_MAX_CHARS` (current default `28000`).
+- 用途：蒐集、分類與整理新聞。
+- 主要參數：`NEWS_ENABLED`、`NEWS_FETCH_INTERVAL_MINUTES`、`NEWS_LOOKBACK_HOURS`、`NEWS_STARTUP_FETCH_ENABLED`、`NEWS_STARTUP_NOTIFY_ENABLED`、`NEWS_PUSH_ENABLED`、`NEWS_PUSH_MAX_ITEMS`、`NEWS_GNEWS_*`、`NEWS_RSS_URLS`、`NEWS_RSS_URLS_FILE`、`NEWS_URL_FETCH_*`、`NEWS_DIGEST_*`、`NEWS_CLASSIFY_BATCH_SIZE`、`NOTE_DIGEST_MAX_ITEMS`。
+- `main` profile 目前預設：`NEWS_FETCH_INTERVAL_MINUTES=360`、`NEWS_LOOKBACK_HOURS=24`、`NEWS_STARTUP_FETCH_ENABLED=1`、`NEWS_STARTUP_NOTIFY_ENABLED=1`。
+- 目前行為：bot 啟動時會先立即執行一次新聞 ingest，通知已啟用的 `news_subscriptions`，之後每 6 小時固定跑一次。抓取視窗是 24 小時，因此電腦關機後下次啟動仍可補抓。
+- `/news` 會讀取 `DATA_DIR\news` 下的本地 markdown，依 `Asia/Taipei` 時區篩選最近 24 小時的 `published_at`，再用 LLM 批次分類加上關鍵字 fallback，分成 7 類後輸出可點擊的 HTML 連結。
+- `/news` 只使用 `DATA_DIR\news`。不會寫入 Obsidian `note`，也不會寫入 Notion。
+- 當 `AI_SUMMARY_ENABLED=1` 時，新聞分類會使用 LLM；否則退回關鍵字分類。批次大小可用 `NEWS_CLASSIFY_BATCH_SIZE` 調整，預設為 40。
+- 若近期區間的本地 `news` markdown 缺失，bot 會先嘗試從 Dropbox 同步回本地，再重試讀取。
+- note/transcript 的 AI 輸入上限由 `NOTE_AI_INPUT_MAX_CHARS` 控制，目前預設 `28000`。
 
 ### Segment G: AI Summary Providers
-- Purpose: shared AI config for digest/weekly report and transcript summary blocks.
-- Keys: `AI_SUMMARY_ENABLED`, `AI_SUMMARY_PROVIDER`, `AI_SUMMARY_TIMEOUT_SECONDS`, `AI_SUMMARY_MAX_CHARS`, `AI_SUMMARY_TEMPERATURE`.
-- Provider keys: `OPENAI_*`, `GEMINI_*`, `ANTHROPIC_*`, `HUGGINGFACE_*`, `OLLAMA_*`.
-- News title translation can use a separate provider via `NEWS_TITLE_TRANSLATION_PROVIDER` (for example `ollama` or `deeplx`).
-- Optional DeepLX keys: `DEEPLX_API_URL`, `DEEPLX_AUTH_KEY`.
+- 用途：提供 digest 與 transcript 摘要共用的 AI 設定。
+- 主要參數：`AI_SUMMARY_ENABLED`、`AI_SUMMARY_PROVIDER`、`AI_SUMMARY_TIMEOUT_SECONDS`、`AI_SUMMARY_MAX_CHARS`、`AI_SUMMARY_TEMPERATURE`。
+- 各家 provider 參數：`OPENAI_*`、`GEMINI_*`、`ANTHROPIC_*`、`HUGGINGFACE_*`、`OLLAMA_*`。
+- 新聞標題翻譯可透過 `NEWS_TITLE_TRANSLATION_PROVIDER` 使用獨立 provider，例如 `ollama` 或 `deeplx`。
+- DeepLX 可選參數：`DEEPLX_API_URL`、`DEEPLX_AUTH_KEY`。
 
 ### Segment H: Dropbox Sync
-- Purpose: sync notes/images/news/weekly report and import transcript files.
-- Keys: `DROPBOX_ACCESS_TOKEN`, `DROPBOX_REFRESH_TOKEN`, `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS`, `DROPBOX_ROOT_PATH`, `DROPBOX_SYNC_ENABLED`, `DROPBOX_SYNC_TIME`, `DROPBOX_SYNC_TZ`, `DROPBOX_SYNC_ON_STARTUP`, `DROPBOX_TRANSCRIPTS_PATH`, `DROPBOX_TRANSCRIPTS_SYNC_ENABLED`.
-
-### Segment H-2: Weekly Report Push
-- Purpose: auto-push weekly recap to recent Telegram chats and persist markdown report.
-- Keys: `WEEKLY_REPORT_PUSH_ENABLED`, `WEEKLY_REPORT_PUSH_WEEKDAY` (1=Mon ... 7=Sun), `WEEKLY_REPORT_PUSH_TIME` (`HH:MM`), `WEEKLY_REPORT_PUSH_TZ`, `WEEKLY_REPORT_PUSH_LOOKBACK_DAYS`, `WEEKLY_REPORT_PUSH_MAX_CHATS`.
+- 用途：同步 notes、images、news，並處理 transcript 檔案同步。
+- 主要參數：`DROPBOX_ACCESS_TOKEN`、`DROPBOX_REFRESH_TOKEN`、`DROPBOX_APP_KEY`、`DROPBOX_APP_SECRET`、`DROPBOX_TOKEN_REFRESH_LEEWAY_SECONDS`、`DROPBOX_ROOT_PATH`、`DROPBOX_SYNC_ENABLED`、`DROPBOX_SYNC_TIME`、`DROPBOX_SYNC_TZ`、`DROPBOX_SYNC_ON_STARTUP`、`DROPBOX_TRANSCRIPTS_PATH`、`DROPBOX_TRANSCRIPTS_SYNC_ENABLED`。
 
 ### Segment I: Notion (mainly chitchat)
-- Purpose: append chitchat logs/images/transcripts to Notion pages.
-- Keys: `NOTION_ENABLED`, `NOTION_TOKEN`, `NOTION_VERSION`, `NOTION_CHATLOG_YEAR_PAGES_JSON`, `NOTION_CHATLOG_FALLBACK_PAGE_ID`, `NOTION_CHATLOG_IMAGE_MODE`, `NOTION_FILE_UPLOAD_VERSION`, `NOTION_CHATLOG_OCR_MODE`, `NOTION_CHATLOG_INCLUDE_TIME`.
+- 用途：把 chitchat 的文字、圖片、transcript 追加到 Notion 頁面。
+- 主要參數：`NOTION_ENABLED`、`NOTION_TOKEN`、`NOTION_VERSION`、`NOTION_CHATLOG_YEAR_PAGES_JSON`、`NOTION_CHATLOG_FALLBACK_PAGE_ID`、`NOTION_CHATLOG_IMAGE_MODE`、`NOTION_FILE_UPLOAD_VERSION`、`NOTION_CHATLOG_OCR_MODE`、`NOTION_CHATLOG_INCLUDE_TIME`。
 
 ### Segment J: Slack (optional)
-- Purpose: enable Socket Mode DM logging.
-- Keys: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_USER_ID`, `SLACK_DEBUG`.
+- 用途：啟用 Socket Mode DM logging。
+- 主要參數：`SLACK_BOT_TOKEN`、`SLACK_APP_TOKEN`、`SLACK_USER_ID`、`SLACK_DEBUG`。
 
 ### Templates
+
+- main profile 範本：`.env.main.example`
+- chitchat profile 範本：`.env.chitchat.example`
+- digest profile 範本：`.env.digest.example`
+- 舊版通用範本：`.env.example`
 
 - Main profile template: `.env.main.example`
 - Chitchat profile template: `.env.chitchat.example`
@@ -263,104 +271,47 @@ Run smoke tests:
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
-Private chat commands:
+`/news` 與 `/transcribe` 是否可用，取決於 `FEATURE_NEWS_ENABLED` 與 `FEATURE_TRANSCRIBE_ENABLED`。
 
-```text
-/whoami
-open https://google.com
-notepad
-sort downloads
-/summary_notes_daily
-/summary_notes_weekly
-/summary_news_weekly
-/news
-/transcribe https://www.youtube.com/watch?v=VIDEO_ID
-```
+`/summary_news_daily` 與 `/news_latest` 目前仍保留為相容別名，但主要入口是 `/news`。
 
-`/news` and `/transcribe` availability depends on `FEATURE_NEWS_ENABLED` and `FEATURE_TRANSCRIBE_ENABLED`.
+本地控制白名單：
+- 將 `TELEGRAM_ALLOWED_CONTROL_USERS` 設為以逗號分隔的 Telegram `user_id` 與／或 `username`。
+- 範例：`TELEGRAM_ALLOWED_CONTROL_USERS=123456789,my_telegram_username`
+- 可在 Telegram 使用 `/whoami` 查看目前的 `user_id` 與 `chat_id`。
 
-`/summary_news_daily` and `/news_latest` are kept as compatibility aliases, but the main entry point is `/news`.
+轉錄流程：bot 會在 transcript 存檔後先送出 `transcript saved`，若有啟用 AI 摘要，之後再補送摘要。
 
-## Weekly Note Digest And Weekly Report
+群組記錄（不回覆）：
+- `main` bot 在允許群組中的訊息會寫入 SQLite，並追加到 Obsidian note markdown。
+- Markdown 檔案：`H:\我的雲端硬碟\Obsidian\Resource\note\YYYY-MM-DD_note.md`
+- SQLite 資料庫：`DATA_DIR\messages.sqlite`
+- `chitchat` bot 的一般聊天文字不會追加到本地 note markdown；chatlog 會寫到 Notion。
 
-- `/summary_notes_weekly` uses AI summarization when `AI_SUMMARY_ENABLED=1`.
-- Weekly commands and weekly push can be disabled entirely with `FEATURE_WEEKLY_REPORT_ENABLED=0`.
-- Before note daily/weekly summary runs, the bot syncs Dropbox note markdown for the requested date range into local `DATA_DIR\notes\...`.
-- Weekly note AI input now prefers larger raw transcript sections over aggressively compressed extracted lines, to preserve more source material.
-- Raw URL-only lines and note metadata lines are removed before the AI call.
-- Weekly note / weekly report output rules currently aim for:
-  - dynamic topic count based on available content, up to 10 points
-  - at most 1 action item per point
-  - merged duplicate event chains
-  - same-topic bucket limits to reduce over-concentration
-  - Traditional Chinese news titles in the weekly report news block
-  - 7-category LLM-based news classification (AI, 半導體, 台灣產業, 政治及地緣, 金融市場, 消費電子產品, 其他) with priority-ordered disambiguation
-- Weekly report generation logs a Dropbox pre-sync step before summarization.
-- For debugging, a pre-AI weekly note input snapshot can be written under `tests\weekly_note_ai_input_YYYY-MM-DD_YYYY-MM-DD.txt`.
+Slack DM logging（不回覆）：
+- 來自指定 `SLACK_USER_ID` 的 DM 會依照目前 profile 的同一路由寫入 SQLite/Markdown。
+- 啟動 uvicorn 後，再對 bot 傳送 DM。
 
-Local control white list:
-- Set `TELEGRAM_ALLOWED_CONTROL_USERS` to a comma-separated list of Telegram `user_id` and/or `username`.
-- Example: `TELEGRAM_ALLOWED_CONTROL_USERS=123456789,my_telegram_username`
-- Use `/whoami` in Telegram to see your current `user_id` and `chat_id`.
-Transcription flow: bot sends `已�??��??�` right after transcript is saved, then sends AI summary afterward (if enabled).
-
-Group logging (no reply):
-- Messages in allowed groups are stored in SQLite and appended to Markdown files.
-- Markdown files: `DATA_DIR\notes\telegram\YYYY-MM-DD_telegram.md`
-- SQLite DB: `DATA_DIR\messages.sqlite`
-
-Slack DM logging (no reply):
-- DMs from the configured `SLACK_USER_ID` are stored in the same SQLite/Markdown.
-- Run uvicorn, then send a DM to your bot.
-
-Transcription runtime behavior:
-- Long audio is transcribed chunk-by-chunk and reports `Transcribing segment n/m...` while running.
-- If transcription appears stuck at `0%`, the usual bottleneck is Whisper not producing its first segment yet; model size, CPU speed, chunking, and `ffmpeg/ffprobe` availability all matter.
+轉錄執行行為：
+- 長音訊會逐段轉錄，執行時會回報 `Transcribing segment n/m...`。
+- 如果轉錄長時間停在 `0%`，通常表示 Whisper 尚未產生第一段輸出；此時模型大小、CPU 速度、chunking 與 `ffmpeg/ffprobe` 是否可用都會影響。
 
 ## Debug Recipes
 
-Generate a pre-AI weekly note input snapshot for inspection:
+診斷看起來卡住的轉錄工作：
 
-```powershell
-@'
-from pathlib import Path
-import app
-
-end_day = "2026-03-09"
-days = 7
-start_day = app.shift_day(end_day, -(days - 1))
-day_to_raw = {}
-for day in app.day_range(start_day, end_day):
-    files = app._summary_files_for_day(day)
-    raw = app._load_raw_summary_files(files, clip_chars=None).strip()
-    if raw:
-        day_to_raw[day] = raw
-
-text = app._compose_note_ai_input_from_raw(day_to_raw, max_chars=app.NOTE_AI_INPUT_MAX_CHARS)
-out = Path("tests") / f"weekly_note_ai_input_{start_day}_{end_day}.txt"
-out.write_text(text, encoding="utf-8")
-print(out)
-'@ | python -
-```
-
-What this gives you:
-- the exact note/transcript text assembled before the first AI weekly note summary call
-- useful to confirm which days and which transcript sections were actually included
-
-Diagnose a transcription job that appears stuck:
-
-1. Check whether the bot is still in download / normalization / Whisper stage by watching the progress message text.
-2. If the message stays at `0%` for a long time, assume Whisper has not emitted its first segment yet.
-3. Confirm chunking is active by looking for status updates like `Transcribing segment 1/3...`.
-4. Verify media tooling:
+1. 先看進度訊息，確認 bot 目前卡在下載、正規化還是 Whisper 轉錄階段。
+2. 如果訊息長時間停在 `0%`，先假設 Whisper 還沒產生第一段。
+3. 確認 chunking 是否有啟動，例如是否出現 `Transcribing segment 1/3...` 之類的狀態。
+4. 檢查媒體工具：
    - `ffmpeg -version`
    - `ffprobe -version`
-5. Verify the active Whisper model in the env file used by the running bot:
-   - `.env.main` or `.env.chitchat`
-   - current recommended baseline is `WHISPER_MODEL=small`
-6. Restart the bot after env changes; model changes do not apply to an already-running process.
+5. 確認目前 bot 使用的 env 檔內 Whisper model 設定：
+   - `.env.main` 或 `.env.chitchat`
+   - 目前建議基線是 `WHISPER_MODEL=small`
+6. 修改 env 後要重啟 bot；已在執行中的程序不會自動套用新 model。
 
-Useful local checks:
+常用本地檢查：
 
 ```powershell
 python -c "import transcription; print(transcription.get_transcribe_runtime_info())"
@@ -371,26 +322,36 @@ ffmpeg -version
 ffprobe -version
 ```
 
-Image OCR and cloud sync:
-- Telegram private image uploads are saved to `DATA_DIR\\images\YYYY-MM-DD\`.
-- If OCR choice is enabled, bot asks per image: `?��? OCR` or `?��??�`; timeout defaults to save-only.
-- OCR output is appended to `DATA_DIR\\notes\\telegram\\YYYY-MM-DD_telegram.md`.
-- A Dropbox worker syncs local `notes` and `images` to:
+圖片 OCR 與雲端同步：
+- Telegram 私訊上傳的圖片會存到 `DATA_DIR\\images\YYYY-MM-DD\`。
+- 若啟用 OCR 選擇，bot 會逐張詢問：`OCR` 或 `save only`；逾時預設為 save-only。
+- `main` 的 OCR 輸出會追加到 `H:\我的雲端硬碟\Obsidian\Resource\note\YYYY-MM-DD_note.md`。
+- `chitchat` 的 OCR/chatlog 會寫到 Notion，不會寫到本地 Obsidian note markdown。
+- Dropbox worker 會把本地 `notes` 與 `images` 同步到：
 - `/read & chat/read/notes`
 - `/read & chat/read/images`
-- Weekly report markdown is saved under `DATA_DIR\\weekly report\\` and also synced to Dropbox.
 
-Current sync notes:
-- The active local data root is `read/`, not the old `data/` path.
-- Dropbox sync covers `notes`, `news`, and `images` under `/read & chat/read/...`.
-- `news` supports Dropbox remote-to-local sync before `/news` reads the local markdown cache.
-- Weekly report storage and sync only matter when `FEATURE_WEEKLY_REPORT_ENABLED=1`.
+目前同步說明：
+- 目前啟用的本地資料根目錄是 `read/`，不是舊的 `data/`。
+- `main` 的 Dropbox sync 會涵蓋 `/read & chat/read/...` 底下的 `notes`、`news`、`images`。
+- `chitchat` 不應把本地 note markdown 視為主要 chatlog 儲存位置。
+- `news` 會先支援 Dropbox 遠端同步回本地，再由 `/news` 讀取本地 markdown cache。
 
+## Storage Map
+
+- `main` bot 純文字訊息：`H:\我的雲端硬碟\Obsidian\Resource\note`
+- `main` bot OCR note 追加：`H:\我的雲端硬碟\Obsidian\Resource\note`
+- `main` bot transcript 檔案：`H:\我的雲端硬碟\Obsidian\Resource\transcript`
+- `chitchat` bot 文字／圖片／transcript chatlog：Notion
+- `/news` 本地快取與輸出 markdown：`DATA_DIR\news`
+- `/daily_podcast` transcript 檔案：`H:\我的雲端硬碟\Obsidian\Resource\daily-podcast`
+- SQLite 資料庫：`DATA_DIR\messages.sqlite`
+- Telegram images：`DATA_DIR\images\YYYY-MM-DD\`
 
 ## Markdown Cleanup Maintenance
 
-- Use `python tools\cleanup_dropbox_notes_md.py` to normalize existing note markdown (deduplicate duplicated headings/blocks and convert old Telegram line format to `- [HH:MM:SS] text`).
-- Main profile cleanup:
-  - `python tools\cleanup_dropbox_notes_md.py --env-file .env.main --remote-root "/read & chat/read" --local-notes "read/notes"`
-- Chitchat profile cleanup:
-  - `python tools\cleanup_dropbox_notes_md.py --env-file .env.chitchat --remote-root "/read & chat/chitchat" --local-notes "chitchat/notes"`
+- 使用 `python tools\cleanup_dropbox_notes_md.py` 正規化既有 note markdown（去除重複標題／區塊，並把舊版 Telegram 行格式轉成 `- [HH:MM:SS] text`）。
+- main profile cleanup：
+  - `python tools\cleanup_dropbox_notes_md.py --env-file .env.main --remote-root "/read & chat/read" --local-notes "H:\我的雲端硬碟\Obsidian\Resource\note"`
+- chitchat profile cleanup：
+  - `chitchat` 正常流程不應依賴本地 note cleanup，因為 chatlog 的設計目標是寫入 Notion。

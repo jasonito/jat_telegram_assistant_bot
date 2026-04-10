@@ -20,7 +20,7 @@ import calendar
 from contextlib import contextmanager
 from email.message import EmailMessage
 
-from typing import Iterator
+from typing import Callable, Iterator
 from urllib.parse import parse_qsl
 from urllib.parse import quote
 from urllib.parse import urlencode
@@ -177,11 +177,70 @@ SQLITE_BUSY_TIMEOUT_MS = max(1000, int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "1500
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "read")).resolve()
 DB_PATH = DATA_DIR / "messages.sqlite"
 NEWS_MD_DIR = DATA_DIR / "news"
-NOTES_DIR = DATA_DIR / "notes"
-TELEGRAM_MD_DIR = NOTES_DIR / "telegram"
+APP_PROFILE = (os.getenv("APP_PROFILE", "main") or "main").strip().lower()
+APP_MODULE_NAME = (os.getenv("APP_MODULE", "") or "").strip().lower()
+IS_CHITCHAT_PROFILE = APP_PROFILE == "chitchat" or ("chitchat" in APP_MODULE_NAME)
+
+
+def _safe_resolve_path(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
+def _storage_anchor_available(path: Path) -> bool:
+    anchor = path.anchor
+    if not anchor:
+        return True
+    try:
+        return Path(anchor).exists()
+    except OSError:
+        return False
+
+
+def _resolve_storage_path(env_name: str, preferred: Path, fallback: Path) -> Path:
+    raw = os.getenv(env_name)
+    candidate = Path(raw) if raw else preferred
+    candidate = candidate.expanduser()
+    if not candidate.is_absolute():
+        return _safe_resolve_path(candidate)
+    if not _storage_anchor_available(candidate):
+        fallback_path = _safe_resolve_path(fallback)
+        print(
+            f"[WARN] {env_name} path unavailable ({candidate}); using fallback: {fallback_path}"
+        )
+        return fallback_path
+    return _safe_resolve_path(candidate)
+
+
+OBSIDIAN_RESOURCE_DIR = _resolve_storage_path(
+    "OBSIDIAN_RESOURCE_DIR",
+    Path(r"H:\我的雲端硬碟\Obsidian\Resource"),
+    DATA_DIR / "obsidian_resource",
+)
+DAILY_PODCAST_RESOURCE_DIR = _resolve_storage_path(
+    "DAILY_PODCAST_RESOURCE_DIR",
+    Path(r"H:\我的雲端硬碟\Obsidian\Resource\daily-podcast"),
+    DATA_DIR / "daily-podcast",
+)
+_default_notes_dir = DATA_DIR / "note" if IS_CHITCHAT_PROFILE else OBSIDIAN_RESOURCE_DIR / "note"
+NOTES_DIR = _resolve_storage_path("NOTE_DIR", _default_notes_dir, DATA_DIR / "note")
+TELEGRAM_MD_DIR = NOTES_DIR
 INBOX_IMAGES_DIR = DATA_DIR / "images"
-WEEKLY_REPORT_DIR = DATA_DIR / "weekly report"
-TRANSCRIPTS_DIR = DATA_DIR / "Transcript"
+TRANSCRIPTS_DIR = _resolve_storage_path(
+    "FULL_TRANSCRIPTS_DIR",
+    OBSIDIAN_RESOURCE_DIR / "transcript",
+    DATA_DIR / "transcript",
+)
+DAILY_PODCAST_DIR = _resolve_storage_path(
+    "DAILY_PODCAST_DIR",
+    DAILY_PODCAST_RESOURCE_DIR,
+    DATA_DIR / "daily-podcast",
+)
+print(f"[INFO] NOTES_DIR={NOTES_DIR}")
+print(f"[INFO] TRANSCRIPTS_DIR={TRANSCRIPTS_DIR}")
+print(f"[INFO] DAILY_PODCAST_DIR={DAILY_PODCAST_DIR}")
 TRANSCRIPTS_TMP_DIR = DATA_DIR / "_runtime" / "transcribe_tmp"
 ALLOWED_GROUPS = {
     g.strip()
@@ -265,14 +324,6 @@ DROPBOX_SYNC_ENABLED = os.getenv("DROPBOX_SYNC_ENABLED", "1").lower() in {"1", "
 DROPBOX_SYNC_TIME = os.getenv("DROPBOX_SYNC_TIME", "00:10").strip() or "00:10"
 DROPBOX_SYNC_TZ_NAME = os.getenv("DROPBOX_SYNC_TZ", "Asia/Taipei").strip() or "Asia/Taipei"
 DROPBOX_SYNC_ON_STARTUP = os.getenv("DROPBOX_SYNC_ON_STARTUP", "1").lower() in {"1", "true", "yes"}
-WEEKLY_REPORT_PUSH_ENABLED = _env_flag("WEEKLY_REPORT_PUSH_ENABLED", True)
-WEEKLY_REPORT_PUSH_WEEKDAY = int(os.getenv("WEEKLY_REPORT_PUSH_WEEKDAY", "1"))
-if WEEKLY_REPORT_PUSH_WEEKDAY < 1 or WEEKLY_REPORT_PUSH_WEEKDAY > 7:
-    WEEKLY_REPORT_PUSH_WEEKDAY = 1
-WEEKLY_REPORT_PUSH_TIME = os.getenv("WEEKLY_REPORT_PUSH_TIME", "09:00").strip() or "09:00"
-WEEKLY_REPORT_PUSH_TZ_NAME = os.getenv("WEEKLY_REPORT_PUSH_TZ", "Asia/Taipei").strip() or "Asia/Taipei"
-WEEKLY_REPORT_PUSH_LOOKBACK_DAYS = max(1, int(os.getenv("WEEKLY_REPORT_PUSH_LOOKBACK_DAYS", "14")))
-WEEKLY_REPORT_PUSH_MAX_CHATS = max(1, int(os.getenv("WEEKLY_REPORT_PUSH_MAX_CHATS", "20")))
 
 NEWS_RSS_URLS_ENV = os.getenv("NEWS_RSS_URLS", "")
 NEWS_RSS_URLS_FILE = os.getenv("NEWS_RSS_URLS_FILE", "")
@@ -297,7 +348,6 @@ NEWS_GNEWS_HL = os.getenv("NEWS_GNEWS_HL", "en-US")
 NEWS_GNEWS_GL = os.getenv("NEWS_GNEWS_GL", "US")
 NEWS_GNEWS_CEID = os.getenv("NEWS_GNEWS_CEID", "US:en")
 FEATURE_NEWS_ENABLED = _env_flag("FEATURE_NEWS_ENABLED", NEWS_ENABLED)
-FEATURE_WEEKLY_REPORT_ENABLED = _env_flag("FEATURE_WEEKLY_REPORT_ENABLED", True)
 FEATURE_TRANSCRIBE_ENABLED = _env_flag("FEATURE_TRANSCRIBE_ENABLED", True)
 FEATURE_TRANSCRIBE_AUTO_URL = _env_flag("FEATURE_TRANSCRIBE_AUTO_URL", False)
 TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS = max(10, int(os.getenv("TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS", "30")))
@@ -310,7 +360,7 @@ OCR_CHOICE_SCOPE = (os.getenv("OCR_CHOICE_SCOPE", "private") or "private").strip
 OCR_CHOICE_TIMEOUT_SECONDS = int(os.getenv("OCR_CHOICE_TIMEOUT_SECONDS", "60"))
 OCR_CHOICE_TIMEOUT_DEFAULT = (os.getenv("OCR_CHOICE_TIMEOUT_DEFAULT", "skip") or "skip").strip().lower()
 FEATURE_SLACK_ENABLED = _env_flag("FEATURE_SLACK_ENABLED", True)
-APP_PROFILE = (os.getenv("APP_PROFILE", "main") or "main").strip().lower()
+LOCAL_NOTES_ENABLED = _env_flag("LOCAL_NOTES_ENABLED", not IS_CHITCHAT_PROFILE)
 KOL_WATCHLIST_PATH = Path(os.getenv("KOL_WATCHLIST_PATH", str(DEFAULT_WATCHLIST_PATH))).resolve()
 KOL_DIGEST_ENABLED = _env_flag("KOL_DIGEST_ENABLED", APP_PROFILE == "digest")
 KOL_DIGEST_DB_PATH = Path(os.getenv("KOL_DIGEST_DB_PATH", str(DATA_DIR / "kol_digest.sqlite"))).resolve()
@@ -321,6 +371,44 @@ KOL_X_SOURCE_PROVIDER = (os.getenv("KOL_X_SOURCE_PROVIDER", "snscrape") or "snsc
 KOL_FACEBOOK_SOURCE_PROVIDER = (os.getenv("KOL_FACEBOOK_SOURCE_PROVIDER", "stub") or "stub").strip().lower()
 KOL_DIGEST_TIME = os.getenv("KOL_DIGEST_TIME", "08:00").strip() or "08:00"
 KOL_DIGEST_TZ_NAME = os.getenv("KOL_DIGEST_TZ", "Asia/Taipei").strip() or "Asia/Taipei"
+
+DAILY_PODCAST_SHOWS: tuple[dict[str, str], ...] = (
+    {
+        "key": "tech_orange",
+        "label": "科技早餐",
+        "url": "https://podcasts.apple.com/tw/podcast/%E7%A7%91%E6%8A%80%E5%A0%B1%E6%A9%98/id1473264362",
+    },
+    {
+        "key": "nyt_daily",
+        "label": "NYT - The Daily",
+        "url": "https://podcasts.apple.com/us/podcast/the-daily/id1200361736",
+    },
+    {
+        "key": "wsj_tech_news_briefing",
+        "label": "WSJ Tech News Briefing",
+        "url": "https://podcasts.apple.com/tw/podcast/wsj-tech-news-briefing/id74844126",
+    },
+    {
+        "key": "wsj_the_journal",
+        "label": "WSJ - The Journal",
+        "url": "https://podcasts.apple.com/ug/podcast/the-journal/id1469394914",
+    },
+    {
+        "key": "ft_unhedged",
+        "label": "FT - Unhedged",
+        "url": "https://podcasts.apple.com/mo/podcast/unhedged/id1691284824",
+    },
+    {
+        "key": "ft_news_briefing",
+        "label": "FT News Briefing",
+        "url": "https://podcasts.apple.com/mo/podcast/ft-news-briefing/id1438449989",
+    },
+    {
+        "key": "ms_thoughts_on_the_market",
+        "label": "MS - Thoughts on the Market",
+        "url": "https://podcasts.apple.com/tw/podcast/thoughts-on-the-market/id1466686717",
+    },
+)
 
 NOTION_ENABLED = _env_flag("NOTION_ENABLED", False)
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
@@ -641,11 +729,13 @@ def _process_telegram_update_sync(update: dict) -> None:
 
 def init_storage() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    NOTES_DIR.mkdir(parents=True, exist_ok=True)
-    TELEGRAM_MD_DIR.mkdir(parents=True, exist_ok=True)
+    # This runs during module import, before some helper functions are defined.
+    if LOCAL_NOTES_ENABLED:
+        NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        TELEGRAM_MD_DIR.mkdir(parents=True, exist_ok=True)
     INBOX_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    WEEKLY_REPORT_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    DAILY_PODCAST_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_TMP_DIR.mkdir(parents=True, exist_ok=True)
     if FEATURE_NEWS_ENABLED:
         NEWS_MD_DIR.mkdir(parents=True, exist_ok=True)
@@ -929,11 +1019,189 @@ async def _handle_recent_news_email_delivery(chat_id: int, html: str) -> bool:
     return True
 
 
-async def edit_message(chat_id: int, message_id: int, text: str) -> bool:
+def _clamp_progress_percent(percent: int | float | None) -> int:
+    try:
+        value = int(percent or 0)
+    except Exception:
+        value = 0
+    return max(0, min(100, value))
+
+
+def _build_progress_bar(percent: int | float | None, width: int = 10) -> str:
+    pct = _clamp_progress_percent(percent)
+    filled = min(width, max(0, round((pct / 100) * width)))
+    return f"[{'■' * filled}{'□' * (width - filled)}]"
+
+
+def _build_news_progress_message(percent: int | float | None, status: str, detail: str | None = None) -> str:
+    pct = _clamp_progress_percent(percent)
+    lines = [f"新聞進度：{pct}%", f"{_build_progress_bar(pct)} {status}"]
+    if detail:
+        lines.append(detail)
+    return "\n".join(lines)
+
+
+def _estimate_transcribe_stage_progress(raw_status: str, localized_status: str) -> float:
+    raw = (raw_status or "").strip().lower()
+    localized = (localized_status or "").strip()
+    if not raw and not localized:
+        return 0.0
+    if "取得媒體資訊" in localized or raw.startswith("checking video info") or raw.startswith("resolving media url"):
+        return 0.08
+    if "下載音訊" in localized or raw.startswith("downloading"):
+        return 0.24
+    if "準備音訊" in localized or raw.startswith("preparing"):
+        return 0.38
+    if "分段轉錄" in localized:
+        match = re.search(r"(\d+)/(\d+)", localized)
+        if match:
+            current = max(1, int(match.group(1)))
+            total = max(current, int(match.group(2)))
+            return 0.45 + (current / total) * 0.45
+        return 0.55
+    if "轉錄中：" in localized or raw.startswith("transcribing"):
+        match = re.search(r"(\d+)%", localized or raw_status or "")
+        if match:
+            return 0.45 + (min(100, int(match.group(1))) / 100.0) * 0.5
+        return 0.6
+    return 0.1
+
+
+def _build_daily_podcast_progress_message(
+    percent: int | float | None,
+    batch_label: str,
+    current_label: str,
+    current_title: str,
+    status_text: str,
+    *,
+    total_estimate_seconds: int | None = None,
+) -> str:
+    pct = _clamp_progress_percent(percent)
+    lines = [
+        f"整體進度：{pct}%",
+        f"{_build_progress_bar(pct)} {batch_label}",
+    ]
+    if total_estimate_seconds:
+        lines.append(f"整體預估總耗時：約 {_format_seconds_rough(total_estimate_seconds)}")
+    lines.extend(
+        [
+            f"目前節目：{current_label}",
+            f"集數：{current_title}",
+            status_text,
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _get_news_command_render_options(cmd_text: str) -> tuple[str | None, bool | None]:
+    tokens = (cmd_text or "").split()
+    sub = tokens[1].lower() if len(tokens) > 1 else ""
+    parse_mode = "HTML" if sub in {"", "latest"} else None
+    disable_preview = True if parse_mode == "HTML" else None
+    return parse_mode, disable_preview
+
+
+async def handle_news_command_with_progress(
+    chat_id: int,
+    cmd_text: str,
+    user_id: str | None = None,
+    user_name: str | None = None,
+) -> bool:
+    if not FEATURE_NEWS_ENABLED or not (cmd_text or "").strip().lower().startswith("/news"):
+        return False
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[int, str, str | None]] = asyncio.Queue()
+
+    def on_status(percent: int, status: str, detail: str | None = None) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, (_clamp_progress_percent(percent), status, detail))
+
+    progress_message_id = await send_message(chat_id, _build_news_progress_message(0, "正在準備新聞指令"))
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            handle_news_command,
+            cmd_text,
+            str(chat_id),
+            user_id=user_id,
+            user_name=user_name,
+            status_callback=on_status,
+        )
+    )
+
+    while not task.done():
+        try:
+            percent, status, detail = await asyncio.wait_for(queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+        if progress_message_id:
+            await edit_message(chat_id, progress_message_id, _build_news_progress_message(percent, status, detail))
+
+    replies = await task
+    parse_mode, disable_preview = _get_news_command_render_options(cmd_text)
+
+    if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
+        if progress_message_id:
+            await edit_message(chat_id, progress_message_id, _build_news_progress_message(100, "新聞整理完成，正在寄送 email..."))
+        await _handle_recent_news_email_delivery(chat_id, replies[0])
+        return True
+
+    if not replies:
+        if progress_message_id:
+            await edit_message(chat_id, progress_message_id, _build_news_progress_message(100, "新聞指令執行完成，沒有可顯示的結果。"))
+        return True
+
+    used_progress_message = False
+    for reply in replies:
+        for chunk in _chunk_text_for_telegram(reply):
+            if progress_message_id and not used_progress_message:
+                edited = await edit_message(
+                    chat_id,
+                    progress_message_id,
+                    chunk,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=disable_preview,
+                )
+                if edited:
+                    used_progress_message = True
+                    continue
+            sent_id = await send_message(
+                chat_id,
+                chunk,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_preview,
+            )
+            if sent_id is None:
+                print(f"[WARN] news reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
+
+    if progress_message_id and not used_progress_message:
+        await edit_message(chat_id, progress_message_id, _build_news_progress_message(100, "新聞指令執行完成。"))
+    return True
+
+
+async def edit_message(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    parse_mode: str | None = None,
+    disable_web_page_preview: bool | None = None,
+) -> bool:
     def _edit() -> bool:
         payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if disable_web_page_preview is not None:
+            payload["disable_web_page_preview"] = disable_web_page_preview
         try:
             resp = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload, timeout=10)
+            if resp.status_code >= 300 and parse_mode:
+                fallback_payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+                if disable_web_page_preview is not None:
+                    fallback_payload["disable_web_page_preview"] = disable_web_page_preview
+                resp = requests.post(
+                    f"{TELEGRAM_API}/editMessageText",
+                    json=fallback_payload,
+                    timeout=10,
+                )
             data = resp.json() if resp.content else {}
             print(f"editMessageText status={resp.status_code} ok={bool(data.get('ok'))}")
             if resp.status_code < 300 and data.get("ok"):
@@ -1257,6 +1525,155 @@ def _extract_supported_transcribe_url(text: str) -> str:
     return matches[0] if matches else ""
 
 
+def _extract_daily_podcast_args(text: str) -> str | None:
+    m = re.match(r"^/daily_podcast(?:@\w+)?\s*(.*)$", (text or "").strip(), flags=re.I | re.S)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _resolve_daily_podcast_selection(raw_args: str) -> tuple[list[dict[str, str]], str | None]:
+    raw = (raw_args or "").strip()
+    if not raw or raw.lower() in {"run", "all"}:
+        return list(DAILY_PODCAST_SHOWS), None
+    if raw.lower() == "list":
+        return [], None
+    verb, _, remainder = raw.partition(" ")
+    if verb.lower() in {"run", "rull"}:
+        raw = remainder.strip()
+        if not raw or raw.lower() == "all":
+            return list(DAILY_PODCAST_SHOWS), None
+    tokens = [t.strip().lower() for t in re.split(r"[\s,]+", raw) if t.strip()]
+    if not tokens:
+        return list(DAILY_PODCAST_SHOWS), None
+    by_key = {item["key"]: item for item in DAILY_PODCAST_SHOWS}
+    by_label = {item["label"].strip().lower(): item for item in DAILY_PODCAST_SHOWS}
+    selected: list[dict[str, str]] = []
+    seen: set[str] = set()
+    unknown: list[str] = []
+    for token in tokens:
+        item = by_key.get(token) or by_label.get(token)
+        if item is None:
+            for candidate in DAILY_PODCAST_SHOWS:
+                label = candidate["label"].strip().lower()
+                if token in label or label in token:
+                    item = candidate
+                    break
+        if item is None:
+            unknown.append(token)
+            continue
+        if item["key"] in seen:
+            continue
+        seen.add(item["key"])
+        selected.append(item)
+    if unknown:
+        return [], f"找不到節目：{', '.join(unknown)}"
+    if not selected:
+        return [], "沒有可執行的節目。"
+    return selected, None
+
+
+def _format_seconds_rough(total_seconds: int | float | None) -> str:
+    if not total_seconds or total_seconds <= 0:
+        return "未知"
+    total = int(total_seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours} 小時 {minutes} 分"
+    if minutes:
+        return f"{minutes} 分 {seconds} 秒"
+    return f"{seconds} 秒"
+
+
+def _estimate_transcribe_multiplier(model_name: str) -> float:
+    model = (model_name or "").strip().lower()
+    if model in {"tiny", "tiny.en"}:
+        return 0.35
+    if model in {"base", "base.en"}:
+        return 0.55
+    if model in {"small", "small.en"}:
+        return 0.85
+    if model in {"medium", "medium.en"}:
+        return 1.25
+    if model.startswith("large"):
+        return 1.8
+    return 1.0
+
+
+def _estimate_daily_podcast_total_seconds(episodes: list[dict[str, object]], whisper_model: str) -> int | None:
+    durations = [int(ep.get("duration_seconds") or 0) for ep in episodes if int(ep.get("duration_seconds") or 0) > 0]
+    if not durations:
+        return None
+    audio_total = sum(durations)
+    per_show_overhead = 90 * len(episodes)
+    estimate = int(audio_total * _estimate_transcribe_multiplier(whisper_model) + per_show_overhead)
+    return max(estimate, audio_total // 3)
+
+
+def _build_daily_podcast_usage() -> str:
+    lines = [
+        "用法：/daily_podcast run [all|節目 key]",
+        "例如：/daily_podcast run all",
+        "例如：/daily_podcast run tech_orange nyt_daily",
+        "可用節目：",
+    ]
+    for item in DAILY_PODCAST_SHOWS:
+        lines.append(f"- {item['key']}: {item['label']}")
+    return "\n".join(lines)
+
+
+def _daily_podcast_episode_state_key(show_key: str, episode_id: str) -> str:
+    return f"{(show_key or '').strip()}:{(episode_id or '').strip()}"
+
+
+def _daily_podcast_episode_fallback_key(episode: dict[str, object]) -> str | None:
+    show_key = str(episode.get("show_key") or "").strip()
+    title = _clean_plain_text(str(episode.get("title") or "")).strip().lower()
+    publish_date = str(episode.get("publish_date") or "").strip()
+    source_url = str(episode.get("source_url") or "").strip()
+    if not show_key or not title:
+        return None
+    raw = "|".join([show_key, title, publish_date, source_url])
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return f"{show_key}:fallback:{digest}"
+
+
+def _daily_podcast_episode_state_keys(episode: dict[str, object]) -> list[str]:
+    keys: list[str] = []
+    show_key = str(episode.get("show_key") or "").strip()
+    episode_id = str(episode.get("episode_id") or "").strip()
+    if show_key and episode_id:
+        keys.append(_daily_podcast_episode_state_key(show_key, episode_id))
+    fallback_key = _daily_podcast_episode_fallback_key(episode)
+    if fallback_key:
+        keys.append(fallback_key)
+    return keys
+
+
+def _daily_podcast_state_path_exists(state_value: str | None) -> bool:
+    if not state_value:
+        return False
+    try:
+        return Path(state_value).exists()
+    except OSError:
+        return False
+
+
+def _is_daily_podcast_episode_processed(episode: dict[str, object]) -> bool:
+    for key in _daily_podcast_episode_state_keys(episode):
+        state_value = get_sync_state("daily_podcast_episode", key)
+        if state_value and _daily_podcast_state_path_exists(state_value):
+            return True
+    return False
+
+
+def _mark_daily_podcast_episode_processed(episode: dict[str, object], transcript_path: Path) -> None:
+    transcript_value = str(transcript_path)
+    for key in _daily_podcast_episode_state_keys(episode):
+        upsert_sync_state("daily_podcast_episode", key, transcript_value)
+
+
 def _build_transcript_ai_summary(transcript_path: Path, title: str) -> str | None:
     try:
         content = transcript_path.read_text(encoding="utf-8", errors="replace")
@@ -1316,32 +1733,62 @@ def _prepend_summary_to_transcript(transcript_path: Path, summary_text: str | li
     transcript_path.write_text(block + raw, encoding="utf-8")
 
 
-def _append_transcript_to_telegram_markdown(
+def _daily_note_path(message_ts: datetime | None, label: str = "note") -> Path:
+    day = (message_ts or datetime.now()).strftime("%Y-%m-%d")
+    return NOTES_DIR / f"{day}_{label}.md"
+
+
+def _local_notes_enabled() -> bool:
+    return LOCAL_NOTES_ENABLED
+
+
+def _ensure_note_file(md_path: Path, title: str = "note") -> None:
+    if md_path.exists():
+        return
+    stem = md_path.stem
+    day = stem.split("_", 1)[0] if "_" in stem else stem
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(f"# {day} {title}\n\n", encoding="utf-8")
+
+
+def _append_transcript_summary_to_note_markdown(
     chat_id: int,
     title: str,
     source: str,
     transcript_path: Path,
     message_ts: datetime | None,
+    summary_text: str | None,
 ) -> Path:
-    day = (message_ts or datetime.now()).strftime("%Y-%m-%d")
-    md_path = TELEGRAM_MD_DIR / f"{day}_telegram.md"
-    if not md_path.exists():
-        md_path.write_text(f"# {day} telegram\n\n", encoding="utf-8")
-    content = transcript_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not _local_notes_enabled():
+        return _daily_note_path(message_ts)
+    md_path = _daily_note_path(message_ts)
+    _ensure_note_file(md_path)
     time_str = (message_ts or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     normalized_title = _normalize_text_value(title, "untitled")
     normalized_source = _normalize_text_value(source, "unknown")
+    normalized_summary = _normalize_text_value(summary_text, "[summary unavailable]")
+    try:
+        transcript_ref = transcript_path.resolve().relative_to(TRANSCRIPTS_DIR.resolve()).as_posix()
+    except Exception:
+        transcript_ref = str(transcript_path)
     with md_path.open("a", encoding="utf-8") as f:
-        f.write(f"## [{time_str}] transcript chat={chat_id}\n")
+        f.write(f"## [{time_str}] transcript summary chat={chat_id}\n")
         f.write(f"- title: {normalized_title}\n")
         f.write(f"- source: {normalized_source}\n\n")
-        if content:
-            f.write(content)
-            f.write("\n\n")
-        else:
-            f.write("[empty transcript]\n\n")
+        f.write(f"- full_transcript: `{transcript_ref}`\n")
+        f.write("- summary:\n\n")
+        f.write(normalized_summary)
+        f.write("\n\n")
     _sync_single_note_file_to_dropbox(md_path)
     return md_path
+
+
+def _note_sync_state_key(local_path: Path) -> str | None:
+    try:
+        rel = local_path.resolve().relative_to(NOTES_DIR.resolve()).as_posix()
+    except Exception:
+        return None
+    return f"notes/{rel}"
 
 
 def _sync_single_note_file_to_dropbox(local_path: Path) -> None:
@@ -1359,7 +1806,9 @@ def _sync_single_note_file_to_dropbox(local_path: Path) -> None:
         rel = path.relative_to(NOTES_DIR).as_posix()
         remote_path = f"{root}/notes/{rel}".replace("//", "/")
         _local_changed, _remote_changed = sync_markdown_with_merge(path, remote_path)
-        local_key = path.relative_to(DATA_DIR).as_posix()
+        local_key = _note_sync_state_key(path)
+        if not local_key:
+            return
         fingerprint = compute_file_fingerprint(path)
         upsert_sync_state("dropbox", local_key, fingerprint)
     except Exception as e:
@@ -1457,6 +1906,8 @@ async def _run_transcribe_job_with_progress(
     *,
     cancel_event: Event,
     job_id: str,
+    progress_message_id: int | None = None,
+    status_text_builder: Callable[[str, str | None], str] | None = None,
 ):
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[str] = asyncio.Queue()
@@ -1467,8 +1918,16 @@ async def _run_transcribe_job_with_progress(
             return
         loop.call_soon_threadsafe(queue.put_nowait, text)
 
-    progress_text = _build_transcribe_status_message(intro_text, "處理中...")
-    progress_message_id = await send_message(chat_id, progress_text)
+    def render_status(status_text: str, raw_status: str | None = None) -> str:
+        if status_text_builder:
+            return status_text_builder(status_text, raw_status)
+        return _build_transcribe_status_message(intro_text, status_text)
+
+    progress_text = render_status("處理中...")
+    if progress_message_id:
+        await edit_message(chat_id, progress_message_id, progress_text)
+    else:
+        progress_message_id = await send_message(chat_id, progress_text)
     _set_transcribe_progress_message_id(chat_id, job_id, progress_message_id)
     job = asyncio.create_task(_cancellable_to_thread(cancel_event, worker, on_status))
     last_status = ""
@@ -1500,7 +1959,7 @@ async def _run_transcribe_job_with_progress(
                     f"{last_status}\n"
                     f"（此階段已等待 {elapsed_sec // 60} 分 {elapsed_sec % 60} 秒）"
                 )
-            heartbeat_text = _build_transcribe_status_message(intro_text, heartbeat)
+            heartbeat_text = render_status(heartbeat)
             if progress_message_id:
                 await edit_message(chat_id, progress_message_id, heartbeat_text)
             last_heartbeat_at = now
@@ -1543,7 +2002,7 @@ async def _run_transcribe_job_with_progress(
             transcribe_percent_text = "--%"
             transcribe_zero_since = None
         if progress_message_id:
-            text = _build_transcribe_status_message(intro_text, ui_status)
+            text = render_status(ui_status, raw_status)
             await edit_message(chat_id, progress_message_id, text)
         last_status = ui_status
         last_sent_at = now
@@ -1569,20 +2028,260 @@ async def _postprocess_transcript_output(
         msg_ts=message_ts,
     )
     summary = await asyncio.to_thread(_build_transcript_ai_summary, transcript_path, title)
-    if summary:
-        await asyncio.to_thread(_prepend_summary_to_transcript, transcript_path, summary)
     await asyncio.to_thread(
-        _append_transcript_to_telegram_markdown,
+        _append_transcript_summary_to_note_markdown,
         chat_id,
         title,
         source,
         transcript_path,
         message_ts,
+        summary,
     )
     await asyncio.to_thread(_sync_single_transcript_file_to_dropbox, transcript_path)
     if summary:
         for chunk in _chunk_text_for_telegram(f"摘要：\n{summary}"):
             await send_message(chat_id, chunk)
+
+
+def _fetch_latest_daily_podcast_episode(tx, show: dict[str, str]) -> dict[str, object]:
+    episodes = tx.fetch_apple_podcast_episodes(show["url"])
+    if not episodes:
+        raise ValueError(f"找不到最新集數：{show['label']}")
+    episode = dict(episodes[0])
+    episode["show_key"] = show["key"]
+    episode["show_label"] = show["label"]
+    episode["source_url"] = show["url"]
+    return episode
+
+
+async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
+    if not FEATURE_TRANSCRIBE_ENABLED:
+        return False
+    raw_args = _extract_daily_podcast_args(text)
+    if raw_args is None:
+        return False
+    if not raw_args or raw_args.lower() == "list":
+        await send_message(chat_id, _build_daily_podcast_usage())
+        return True
+
+    selected, error = _resolve_daily_podcast_selection(raw_args)
+    if error:
+        await send_message(chat_id, f"{error}\n\n{_build_daily_podcast_usage()}")
+        return True
+    try:
+        tx = _load_transcription_module()
+    except Exception as e:
+        await send_message(chat_id, f"轉錄模組不可用：{e}")
+        return True
+
+    job_id = str(uuid.uuid4())
+    cancel_event = Event()
+    if not _register_transcribe_job(chat_id, job_id, cancel_event):
+        busy_message_id = await send_message(chat_id, "已有一筆youtube或podcast轉錄正在執行，請/cancel或等待完成")
+        _track_transcribe_busy_notice(chat_id, busy_message_id)
+        return True
+
+    progress_message_id: int | None = None
+    try:
+        planning_text = await send_message(chat_id, f"正在整理節目清單，共 {len(selected)} 個節目...")
+        progress_message_id = planning_text
+        _set_transcribe_progress_message_id(chat_id, job_id, progress_message_id)
+
+        episodes: list[dict[str, object]] = []
+        failures: list[str] = []
+        skipped: list[str] = []
+        for idx, show in enumerate(selected, start=1):
+            if cancel_event.is_set():
+                raise TranscribeJobCancelled("Cancelled by user.")
+            planning_percent = int((idx - 1) * 15 / max(1, len(selected)))
+            status = _build_daily_podcast_progress_message(
+                planning_percent,
+                f"批次進度：0/{len(selected)}",
+                show["label"],
+                "正在取得最新集資訊",
+                f"正在讀取節目資訊（{idx}/{len(selected)}）",
+            )
+            if progress_message_id:
+                await edit_message(chat_id, progress_message_id, status)
+            try:
+                episode = await asyncio.to_thread(_fetch_latest_daily_podcast_episode, tx, show)
+                episode_id = str(episode.get("episode_id") or "").strip()
+                if _is_daily_podcast_episode_processed(episode):
+                    reason = f"episode_id={episode_id}" if episode_id else "fallback key matched"
+                    skipped.append(f"{show['label']}：已處理過最新一集（{reason}）")
+                    continue
+                episodes.append(episode)
+            except Exception as e:
+                failures.append(f"{show['label']}：{e}")
+
+        if not episodes:
+            lines = ["沒有可轉錄的 podcast 集數。"]
+            lines.extend(f"- 跳過 {item}" for item in skipped)
+            lines.extend(f"- {item}" for item in failures)
+            await send_message(chat_id, "\n".join(lines))
+            return True
+
+        whisper_model = getattr(tx, "WHISPER_MODEL", "small")
+        total_estimate_seconds = _estimate_daily_podcast_total_seconds(episodes, whisper_model)
+        intro_lines = [
+            f"即將開始批次轉錄 {len(episodes)} 個節目",
+            f"輸出資料夾：{DAILY_PODCAST_DIR / datetime.now(tz=get_local_tz()).date().isoformat()}",
+            f"估計總耗時：約 {_format_seconds_rough(total_estimate_seconds)}",
+        ]
+        if failures:
+            intro_lines.append(f"略過 {len(failures)} 個節目，原因見下方。")
+        if skipped:
+            intro_lines.append(f"已跳過 {len(skipped)} 個已處理節目。")
+        detail_lines = []
+        for episode in episodes:
+            duration_text = _format_seconds_rough(int(episode.get("duration_seconds") or 0))
+            detail_lines.append(
+                f"- {episode['show_label']}: {episode.get('title') or 'Unknown Episode'}"
+                f"（長度：約 {duration_text}）"
+            )
+        if failures:
+            detail_lines.extend(f"- 略過 {item}" for item in failures)
+        if skipped:
+            detail_lines.extend(f"- 跳過 {item}" for item in skipped)
+        start_text = "\n".join(intro_lines + [""] + detail_lines)
+        if progress_message_id:
+            await edit_message(
+                chat_id,
+                progress_message_id,
+                _build_daily_podcast_progress_message(
+                    15,
+                    f"批次進度：0/{len(episodes)}",
+                    "待開始",
+                    "待開始",
+                    start_text,
+                    total_estimate_seconds=total_estimate_seconds,
+                ),
+            )
+
+        successes: list[str] = []
+        for idx, episode in enumerate(episodes, start=1):
+            if cancel_event.is_set():
+                raise TranscribeJobCancelled("Cancelled by user.")
+            show_label = str(episode["show_label"])
+            episode_title = str(episode.get("title") or "Unknown Episode")
+            episode_count = max(1, len(episodes))
+
+            def _build_episode_status_text(status_text: str, raw_status: str | None = None) -> str:
+                stage_progress = _estimate_transcribe_stage_progress(raw_status or "", status_text)
+                overall_percent = 15 + int((((idx - 1) + stage_progress) / episode_count) * 80)
+                return _build_daily_podcast_progress_message(
+                    overall_percent,
+                    f"批次進度：{idx}/{len(episodes)}",
+                    show_label,
+                    episode_title,
+                    status_text,
+                    total_estimate_seconds=total_estimate_seconds,
+                )
+
+            intro_text = _build_daily_podcast_progress_message(
+                15 + int(((idx - 1) / episode_count) * 80),
+                f"批次進度：{idx}/{len(episodes)}",
+                show_label,
+                episode_title,
+                "準備開始轉錄",
+                total_estimate_seconds=total_estimate_seconds,
+            )
+            try:
+                (_title, out_path), progress_message_id = await _run_transcribe_job_with_progress(
+                    chat_id,
+                    lambda on_status, source_url=str(episode["source_url"]): tx.transcribe_url_to_markdown(
+                        source_url,
+                        DAILY_PODCAST_DIR,
+                        TRANSCRIPTS_TMP_DIR,
+                        on_status=on_status,
+                        cancel_event=cancel_event,
+                    ),
+                    intro_text,
+                    cancel_event=cancel_event,
+                    job_id=job_id,
+                    progress_message_id=progress_message_id,
+                    status_text_builder=_build_episode_status_text,
+                )
+                successes.append(f"{show_label} -> {out_path.name}")
+                await asyncio.to_thread(
+                    _mark_daily_podcast_episode_processed,
+                    episode,
+                    out_path,
+                )
+                done_text = _build_daily_podcast_progress_message(
+                    15 + int((idx / episode_count) * 80),
+                    f"批次進度：{idx}/{len(episodes)}",
+                    show_label,
+                    episode_title,
+                    f"已完成並存檔：{out_path.name}",
+                    total_estimate_seconds=total_estimate_seconds,
+                )
+                if progress_message_id:
+                    await edit_message(chat_id, progress_message_id, done_text)
+            except Exception as e:
+                is_cancelled = isinstance(e, TranscribeJobCancelled) or (
+                    hasattr(tx, "JobCancelled") and isinstance(e, tx.JobCancelled)
+                )
+                if is_cancelled:
+                    raise
+                failures.append(f"{show_label}：{e}")
+                err_text = _build_daily_podcast_progress_message(
+                    15 + int((idx / episode_count) * 80),
+                    f"批次進度：{idx}/{len(episodes)}",
+                    show_label,
+                    episode_title,
+                    f"此節目轉錄失敗：{e}",
+                    total_estimate_seconds=total_estimate_seconds,
+                )
+                if progress_message_id:
+                    await edit_message(chat_id, progress_message_id, err_text)
+
+        summary_lines = [
+            f"daily podcast 批次完成：成功 {len(successes)}，失敗 {len(failures)}",
+            f"輸出資料夾：{DAILY_PODCAST_DIR / datetime.now(tz=get_local_tz()).date().isoformat()}",
+        ]
+        if skipped:
+            summary_lines.append(f"已跳過 {len(skipped)} 個已處理節目")
+        if successes:
+            summary_lines.extend(f"- {item}" for item in successes)
+        if failures:
+            summary_lines.extend(f"- {item}" for item in failures)
+        if skipped:
+            summary_lines.extend(f"- {item}" for item in skipped)
+        if progress_message_id:
+            await edit_message(
+                chat_id,
+                progress_message_id,
+                _build_daily_podcast_progress_message(
+                    100,
+                    f"批次進度：{len(episodes)}/{len(episodes)}",
+                    "全部完成",
+                    "全部完成",
+                    "\n".join(summary_lines),
+                    total_estimate_seconds=total_estimate_seconds,
+                ),
+            )
+        else:
+            await send_message(chat_id, "\n".join(summary_lines))
+        return True
+    except Exception as e:
+        is_cancelled = isinstance(e, TranscribeJobCancelled) or (
+            hasattr(tx, "JobCancelled") and isinstance(e, tx.JobCancelled)
+        )
+        if is_cancelled:
+            cancel_text = _build_transcribe_status_message(
+                "",
+                "已取消 daily podcast 批次轉錄",
+            )
+            if progress_message_id:
+                await edit_message(chat_id, progress_message_id, cancel_text)
+            else:
+                await send_message(chat_id, cancel_text)
+            return True
+        raise
+    finally:
+        _clear_transcribe_job(chat_id, job_id)
+        await _dismiss_transcribe_busy_notices(chat_id)
 
 
 async def _dismiss_transcribe_busy_notices(chat_id: int) -> None:
@@ -1744,9 +2443,6 @@ async def handle_transcribe_auto_url_message(chat_id: int, text: str, message_ts
     targets = _extract_supported_transcribe_urls(raw)
     if not targets:
         print(f"[TRANSCRIBE][AUTO_URL][NO_MATCH] chat_id={chat_id} text={raw[:180]!r}")
-        if URL_RE.search(raw):
-            await send_message(chat_id, "偵測到網址，但不是可轉錄來源。支援：YouTube / Apple Podcasts / 直接音訊連結。")
-            return True
         return False
     print(f"[TRANSCRIBE][AUTO_URL][MATCH] chat_id={chat_id} targets={targets}")
     if len(targets) > 1:
@@ -1877,26 +2573,10 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
         parts = build_scoped_summary(day, "note")
         return "\n".join(parts)
 
-    if text_lower.startswith("/summary_notes_weekly"):
-        if not FEATURE_WEEKLY_REPORT_ENABLED:
-            return "週報功能目前已關閉。"
-        day = _parse_day_arg(text)
-        parts = build_scoped_summary(day, "note", recent_days=7)
-        return "\n".join(parts)
-
     if text_lower.startswith("/summary_news_daily"):
         if not FEATURE_NEWS_ENABLED:
             return "新聞功能已關閉。"
         return handle_command("/news", user_id=user_id, user_name=user_name)
-
-    if text_lower.startswith("/summary_news_weekly"):
-        if not FEATURE_WEEKLY_REPORT_ENABLED:
-            return "週報功能目前已關閉。"
-        if not FEATURE_NEWS_ENABLED:
-            return "新聞功能已關閉。"
-        day = _parse_day_arg(text)
-        parts = build_scoped_summary(day, "news", recent_days=7)
-        return "\n".join(parts)
 
     if text_lower.startswith("/status"):
         return build_status_report()
@@ -1985,8 +2665,6 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
             "/status",
             "/summary_notes_daily",
         ]
-        if FEATURE_WEEKLY_REPORT_ENABLED:
-            cmds.append("/summary_notes_weekly")
         if KOL_DIGEST_MODULE_AVAILABLE:
             cmds.extend([
                 "/kol_today",
@@ -1998,8 +2676,6 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
             cmds.append("/notion_test")
         if FEATURE_NEWS_ENABLED:
             cmds.extend(["/news", "/news sources"])
-            if FEATURE_WEEKLY_REPORT_ENABLED:
-                cmds.append("/summary_news_weekly")
         if FEATURE_TRANSCRIBE_ENABLED:
             cmds.append("/transcribe <url>")
             cmds.append("/cancel")
@@ -2030,16 +2706,11 @@ def route_user_text_command(
     reply = handle_command(cmd_text, user_id=user_id, user_name=user_name)
     parse_mode = None
     disable_preview = None
-    if lower.startswith("/summary_notes_daily") or (
-        FEATURE_WEEKLY_REPORT_ENABLED and lower.startswith("/summary_notes_weekly")
-    ):
+    if lower.startswith("/summary_notes_daily"):
         parse_mode = "Markdown"
         disable_preview = True
-    if FEATURE_NEWS_ENABLED and (
-        lower.startswith("/summary_news_daily")
-        or (FEATURE_WEEKLY_REPORT_ENABLED and lower.startswith("/summary_news_weekly"))
-    ):
-        parse_mode = "HTML" if lower.startswith("/summary_news_daily") else "Markdown"
+    if FEATURE_NEWS_ENABLED and lower.startswith("/summary_news_daily"):
+        parse_mode = "HTML"
         disable_preview = True
     return [reply], parse_mode, disable_preview
 
@@ -2279,15 +2950,18 @@ def append_markdown(
     text: str,
     message_ts: datetime,
 ) -> None:
-    day = (message_ts or datetime.now()).strftime("%Y-%m-%d")
+    if not _local_notes_enabled():
+        return
     if platform == "telegram":
-        md_dir = TELEGRAM_MD_DIR
+        md_path = _daily_note_path(message_ts)
+        _ensure_note_file(md_path)
     else:
         md_dir = NOTES_DIR / platform
         md_dir.mkdir(parents=True, exist_ok=True)
-    md_path = md_dir / f"{day}_{platform}.md"
-    if not md_path.exists():
-        md_path.write_text(f"# {day} {platform}\n\n", encoding="utf-8")
+        day = (message_ts or datetime.now()).strftime("%Y-%m-%d")
+        md_path = md_dir / f"{day}_{platform}.md"
+        if not md_path.exists():
+            md_path.write_text(f"# {day} {platform}\n\n", encoding="utf-8")
 
     time_str = (message_ts or datetime.now()).strftime("%H:%M:%S")
     line = f"- [{time_str}] {text}\n"
@@ -2321,10 +2995,10 @@ def append_ocr_markdown(
     text: str,
     message_ts: datetime | None,
 ) -> Path:
-    day = (message_ts or datetime.now()).strftime("%Y-%m-%d")
-    md_path = TELEGRAM_MD_DIR / f"{day}_telegram.md"
-    if not md_path.exists():
-        md_path.write_text(f"# {day} telegram\n\n", encoding="utf-8")
+    if not _local_notes_enabled():
+        return _daily_note_path(message_ts)
+    md_path = _daily_note_path(message_ts)
+    _ensure_note_file(md_path)
     try:
         rel_path = image_path.relative_to(DATA_DIR).as_posix()
     except Exception:
@@ -2393,7 +3067,7 @@ def _dropbox_create_folder_if_missing(dbx, path: str) -> None:
 def ensure_dropbox_folders(dbx, root_path: str) -> None:
     root = normalize_dropbox_path(root_path)
     _dropbox_create_folder_if_missing(dbx, root)
-    folders = ["notes", "images", "weekly report"]
+    folders = ["notes", "images"]
     if FEATURE_NEWS_ENABLED:
         folders.insert(0, "news")
     for folder in folders:
@@ -2401,7 +3075,7 @@ def ensure_dropbox_folders(dbx, root_path: str) -> None:
 
 
 def iter_sync_files() -> Iterator[tuple[str, Path, str]]:
-    roots = [("notes", NOTES_DIR), ("images", INBOX_IMAGES_DIR), ("weekly report", WEEKLY_REPORT_DIR)]
+    roots = [("notes", NOTES_DIR), ("images", INBOX_IMAGES_DIR)]
     if FEATURE_NEWS_ENABLED:
         roots.insert(0, ("news", NEWS_MD_DIR))
     for category, root in roots:
@@ -2988,7 +3662,7 @@ def _parse_notion_year_page_map() -> dict[str, str]:
     return out
 
 
-def _notion_is_chitchat_enabled() -> bool:
+def _notion_chatlog_enabled() -> bool:
     if APP_PROFILE != "chitchat":
         return False
     if not (NOTION_ENABLED and NOTION_TOKEN):
@@ -3295,7 +3969,7 @@ def _notion_ensure_date_heading(page_id: str, day_label: str) -> str:
 
 
 def notion_append_chitchat_text(text: str, msg_ts: datetime | None) -> None:
-    if not _notion_is_chitchat_enabled():
+    if not _notion_chatlog_enabled():
         return
     normalized = (text or "").strip()
     if not normalized:
@@ -3351,7 +4025,7 @@ def notion_append_chitchat_transcript(
     transcript_path: Path,
     msg_ts: datetime | None,
 ) -> None:
-    if not _notion_is_chitchat_enabled():
+    if not _notion_chatlog_enabled():
         return
     page_id = _notion_get_chatlog_year_page_id(msg_ts)
     if not page_id:
@@ -3409,7 +4083,7 @@ def notion_append_chitchat_image(
     ocr_text: str | None = None,
     msg_ts: datetime | None = None,
 ) -> None:
-    if not _notion_is_chitchat_enabled():
+    if not _notion_chatlog_enabled():
         return
     if NOTION_CHATLOG_IMAGE_MODE not in {"link", "embed", "upload"}:
         return
@@ -3540,10 +4214,8 @@ def _notion_test_append_image(page_id: str, heading_id: str, image_path: Path, n
 def run_notion_test() -> str:
     now = datetime.now()
     lines = [f"notion_test time: {now.strftime('%Y-%m-%d %H:%M:%S')}"]
-    if APP_PROFILE != "chitchat":
-        lines.append(f"profile: {APP_PROFILE} (must be chitchat)")
-        return "\n".join(lines)
-    if not _notion_is_chitchat_enabled():
+    lines.append(f"profile: {APP_PROFILE}")
+    if not _notion_chatlog_enabled():
         lines.append("notion: disabled")
         lines.append("check NOTION_ENABLED / NOTION_TOKEN")
         return "\n".join(lines)
@@ -3642,7 +4314,12 @@ def run_dropbox_sync(full_scan: bool = False) -> dict[str, int]:
                     print(f"[WARN] Dropbox transcript upload failed for {local_path}: {e}")
     for category, local_path, rel in iter_sync_files():
         stats["scanned"] += 1
-        local_key = local_path.relative_to(DATA_DIR).as_posix()
+        if category == "notes":
+            local_key = _note_sync_state_key(local_path)
+        else:
+            local_key = local_path.relative_to(DATA_DIR).as_posix()
+        if not local_key:
+            continue
         try:
             remote_path = f"{root}/{category}/{rel}".replace("//", "/")
             is_markdown_note = category == "notes" and local_path.suffix.lower() in {".md", ".markdown"}
@@ -4439,7 +5116,6 @@ def build_scoped_summary(day: str, scope: str, *, recent_days: int | None = None
             return build_news_digest_recent(day, days=days)
         return build_news_digest(day)
     if scope_norm == "note":
-        _sync_dropbox_before_weekly_report(day, days)
         if days > 1:
             return build_note_digest_recent(day, days=days)
         return build_note_digest(day)
@@ -5077,9 +5753,7 @@ def _compact_note_summary_line(text: str, max_len: int = 88) -> str:
 
 
 def _is_chitchat_profile() -> bool:
-    profile = (APP_PROFILE or "").strip().lower()
-    app_module = (os.getenv("APP_MODULE", "") or "").strip().lower()
-    return profile == "chitchat" or ("chitchat" in app_module)
+    return IS_CHITCHAT_PROFILE
 
 
 def _is_noise_digest_text(text: str) -> bool:
@@ -6629,140 +7303,6 @@ def build_news_digest_recent(end_day: str, days: int = 3) -> list[str]:
     return lines
 
 
-def _weekly_report_week_key(day: str) -> str:
-    dt = datetime.strptime(day, "%Y-%m-%d").date()
-    iso_year, iso_week, _ = dt.isocalendar()
-    return f"{iso_year}-W{iso_week:02d}"
-
-
-def _weekly_report_window(end_day: str) -> tuple[str, str]:
-    end_dt = datetime.strptime(end_day, "%Y-%m-%d").replace(tzinfo=get_local_tz())
-    start_dt = (end_dt - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
-
-
-def _weekly_report_file_path(end_day: str) -> Path:
-    week_key = _weekly_report_week_key(end_day)
-    filename = f"{week_key}_{APP_PROFILE}_weekly_report.md"
-    return WEEKLY_REPORT_DIR / filename
-
-
-def _sync_dropbox_before_weekly_report(end_day: str, days: int) -> None:
-    if not DROPBOX_SYNC_ENABLED:
-        return
-    start_day, _ = _weekly_report_window(end_day) if days >= 7 else (end_day, end_day)
-    if days > 1 and days < 7:
-        end_dt = datetime.strptime(end_day, "%Y-%m-%d").replace(tzinfo=get_local_tz())
-        start_dt = (end_dt - timedelta(days=max(0, days - 1))).replace(hour=0, minute=0, second=0, microsecond=0)
-        start_day = start_dt.strftime("%Y-%m-%d")
-    try:
-        print(f"[INFO] Weekly report pre-sync: starting Dropbox sync for {start_day} to {end_day}")
-        run_dropbox_sync(full_scan=False)
-        note_stats = sync_dropbox_notes_range_to_local(start_day, end_day)
-        print(
-            "[INFO] Weekly report pre-sync: Dropbox sync completed "
-            f"notes_remote_scanned={note_stats.get('notes_remote_scanned', 0)} "
-            f"notes_remote_downloaded={note_stats.get('notes_remote_downloaded', 0)} "
-            f"notes_remote_skipped={note_stats.get('notes_remote_skipped', 0)} "
-            f"notes_remote_failed={note_stats.get('notes_remote_failed', 0)}"
-        )
-    except Exception as e:
-        print(f"[WARN] Weekly report Dropbox sync failed: {e}")
-
-
-def _compose_weekly_report_prompt(
-    start_day: str,
-    end_day: str,
-    notes_context: str,
-    news_context: str,
-    include_actions: bool,
-) -> str:
-    if APP_PROFILE == "main":
-        action_block = (
-            "3) 針對每個重點只提供 1 個具體行動建議，格式：\n"
-            "   - 行動建議：...\n"
-        )
-        if not include_actions:
-            action_block = ""
-        return (
-            f"請根據 {start_day} 到 {end_day} 的資料，產出主線週報。\n"
-            "要求：\n"
-            "1) 使用繁體中文、正式語氣、邏輯清晰。\n"
-            "2) 依資料量動態列出 2-10 個當周重點，每點 2-4 句，優先涵蓋不同主題；若多條資訊屬於同一事件或因果鏈，必須合併成同一點；同一類主題最多保留 2 點。\n"
-            f"{action_block}"
-            "4) 最後補上「下週優先任務」3 點（條列）。\n"
-            "5) 僅使用提供內容，不可杜撰。\n\n"
-            f"[筆記與逐字稿]\n{notes_context}\n\n"
-            f"[新聞摘要]\n{news_context}"
-        )
-
-    return (
-        f"請根據 {start_day} 到 {end_day} 的資料，產出 chitchat 週回顧。\n"
-        "要求：\n"
-        "1) 使用繁體中文，語氣自然但條理清楚。\n"
-        "2) 先列出 5-7 個本週趣事或對話亮點，每點 2-3 句。\n"
-        "3) 補上「本週關鍵詞」8-12 個（#tag）。\n"
-        "4) 最後給一段 3-5 句的下週聊天主題建議。\n"
-        "5) 僅使用提供內容，不可杜撰。\n\n"
-        f"[筆記與逐字稿]\n{notes_context}"
-    )
-
-
-def _save_weekly_report(end_day: str, lines: list[str]) -> Path | None:
-    if not lines:
-        return None
-    report_path = _weekly_report_file_path(end_day)
-    try:
-        WEEKLY_REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        report_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
-        get_or_create_dropbox_shared_link_for_local_file(report_path, prefer_temporary=False)
-        return report_path
-    except Exception as e:
-        print(f"[WARN] weekly report save failed: {e}")
-        return None
-
-
-def generate_weekly_report(day: str, *, include_actions: bool, save_report: bool = False) -> list[str]:
-    start_day, end_day = _weekly_report_window(day)
-    notes_parts = build_scoped_summary(end_day, "note", recent_days=7)
-    notes_context = "\n".join(notes_parts)
-
-    news_context = "新聞功能未啟用。"
-    if FEATURE_NEWS_ENABLED:
-        news_parts = build_scoped_summary(end_day, "news", recent_days=7)
-        news_context = "\n".join(news_parts)
-
-    prompt = _compose_weekly_report_prompt(
-        start_day=start_day,
-        end_day=end_day,
-        notes_context=notes_context,
-        news_context=news_context,
-        include_actions=include_actions,
-    )
-    system_prompt = "Use only provided content. Do not invent facts. Output must be in Traditional Chinese."
-    body = _run_ai_chat(system_prompt, prompt)
-
-    header = f"{start_day} ~ {end_day} {APP_PROFILE} 週報"
-    if not body:
-        fallback = [header, "", "（AI 生成失敗，以下為週摘要原始內容）", "", notes_context]
-        if FEATURE_NEWS_ENABLED:
-            fallback.extend(["", news_context])
-        if save_report:
-            _save_weekly_report(end_day, fallback)
-        return fallback
-
-    lines = [header, "", body.strip()]
-    if save_report:
-        _save_weekly_report(end_day, lines)
-    return lines
-
-
-def summary_weekly(day: str) -> list[str]:
-    if not FEATURE_WEEKLY_REPORT_ENABLED:
-        return ["週報功能目前已關閉。"]
-    return generate_weekly_report(day, include_actions=(APP_PROFILE == "main"), save_report=False)
-
-
 def summary_ai(day: str, scope: str = "all") -> list[str]:
     scope = (scope or "all").strip().lower()
     if scope == "notes":
@@ -7002,9 +7542,21 @@ def get_source_weight(source: str | None) -> int:
     return 1
 
 
-def fetch_news_entries() -> list[dict]:
+def fetch_news_entries(
+    status_callback: Callable[[int, str, str | None], None] | None = None,
+) -> list[dict]:
     items = []
-    for url in get_news_rss_urls():
+    urls = get_news_rss_urls()
+    total_urls = max(1, len(urls))
+    if status_callback:
+        status_callback(10, "正在讀取新聞來源", f"來源數量：{len(urls)}")
+    for idx, url in enumerate(urls, start=1):
+        if status_callback:
+            status_callback(
+                10 + int((idx - 1) * 35 / total_urls),
+                "正在抓取 RSS",
+                f"第 {idx}/{len(urls)} 個來源",
+            )
         feed = feedparser.parse(url)
         source_name = get_news_source_name(feed, url)
         for entry in getattr(feed, "entries", []):
@@ -7022,6 +7574,12 @@ def fetch_news_entries() -> list[dict]:
                     "summary": summary.strip(),
                     "published_at": published_at,
                 }
+            )
+        if status_callback:
+            status_callback(
+                10 + int(idx * 35 / total_urls),
+                "正在抓取 RSS",
+                f"已完成 {idx}/{len(urls)} 個來源：{source_name}",
             )
     items.sort(key=lambda x: x["published_at"] or datetime.now(tz=get_local_tz()))
     return items
@@ -7155,16 +7713,26 @@ def ensure_cluster(
     return cluster_id
 
 
-def fetch_and_store_news(*, lookback_hours: int | None = None) -> set[str]:
+def fetch_and_store_news(
+    *,
+    lookback_hours: int | None = None,
+    status_callback: Callable[[int, str, str | None], None] | None = None,
+) -> set[str]:
     changed_dates: set[str] = set()
-    entries = fetch_news_entries()
+    if status_callback:
+        status_callback(5, "正在準備抓取新聞", None)
+    entries = fetch_news_entries(status_callback=status_callback)
     if not entries:
+        if status_callback:
+            status_callback(100, "新聞抓取完成", "沒有新的 RSS 內容")
         return changed_dates
 
     now = datetime.now(tz=get_local_tz())
     effective_lookback_hours = max(1, int(lookback_hours or NEWS_LOOKBACK_HOURS))
     cutoff_dt = now - timedelta(hours=effective_lookback_hours)
     cutoff_iso = cutoff_dt.isoformat()
+    if status_callback:
+        status_callback(50, "正在整理候選新聞", f"候選筆數：{len(entries)}")
     with _connect_db() as conn:
         recent_rows = conn.execute(
             """
@@ -7177,7 +7745,8 @@ def fetch_and_store_news(*, lookback_hours: int | None = None) -> set[str]:
             (cutoff_iso,),
         ).fetchall()
 
-        for item in entries:
+        total_entries = max(1, len(entries))
+        for idx, item in enumerate(entries, start=1):
             published_dt = item.get("published_at")
             if not published_dt:
                 continue
@@ -7222,10 +7791,21 @@ def fetch_and_store_news(*, lookback_hours: int | None = None) -> set[str]:
             ).fetchone()
             if row and row[0]:
                 changed_dates.add(row[0])
+            if status_callback and (idx == 1 or idx == len(entries) or idx % 10 == 0):
+                percent = 50 + int(idx * 35 / total_entries)
+                status_callback(percent, "正在寫入新聞資料庫", f"已處理 {idx}/{len(entries)} 筆")
         conn.commit()
 
+    if status_callback:
+        if changed_dates:
+            status_callback(90, "正在產出新聞檔案", f"日期數量：{len(changed_dates)}")
+        else:
+            status_callback(95, "新聞資料庫已更新", "沒有新的日期檔案需要重建")
     for cluster_date in changed_dates:
         write_news_markdown_for_date(cluster_date)
+    if status_callback:
+        detail = f"更新 {len(changed_dates)} 個日期檔案" if changed_dates else "沒有新增新聞檔案"
+        status_callback(100, "新聞抓取完成", detail)
     return changed_dates
 
 
@@ -7379,6 +7959,7 @@ def handle_news_command(
     chat_id: str,
     user_id: str | None = None,
     user_name: str | None = None,
+    status_callback: Callable[[int, str, str | None], None] | None = None,
 ) -> list[str]:
     if not FEATURE_NEWS_ENABLED:
         return ["新聞功能已關閉。"]
@@ -7386,8 +7967,14 @@ def handle_news_command(
     tokens = text.strip().split()
     sub = tokens[1].lower() if len(tokens) > 1 else ""
     if sub in {"", "latest"}:
+        if status_callback:
+            status_callback(20, "正在讀取本地新聞資料", None)
+        if status_callback:
+            status_callback(75, "正在整理最新新聞輸出", None)
         return [build_recent_news_links_html()]
     if sub == "sources":
+        if status_callback:
+            status_callback(35, "正在整理新聞來源", None)
         rows = list_news_feeds()
         if rows:
             lines = ["News sources:"]
@@ -7396,10 +7983,16 @@ def handle_news_command(
                 status = "enabled" if enabled else "disabled"
                 lines.append(f"- #{feed_id} [{status}] {label}")
                 lines.append(f"  {url}")
+            if status_callback:
+                status_callback(100, "新聞來源整理完成", f"來源數量：{len(rows)}")
             return ["\n".join(lines)]
         srcs = get_news_rss_urls()
+        if status_callback:
+            status_callback(100, "新聞來源整理完成", f"來源數量：{len(srcs)}")
         return ["News sources:\n" + "\n".join(srcs)]
     if sub == "add":
+        if status_callback:
+            status_callback(30, "正在新增新聞來源", None)
         if not _is_allowed_control_user(user_id, user_name):
             return ["未授權使用新聞來源管理指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"]
         raw_args = text.strip()[len(tokens[0]) + len(tokens[1]) + 2 :].strip() if len(tokens) >= 2 else ""
@@ -7409,47 +8002,67 @@ def handle_news_command(
         try:
             actor = user_name or user_id or "telegram"
             feed_id, display_name = add_news_feed(url_part.strip(), str(actor), name=name_part.strip() if sep else None)
+            if status_callback:
+                status_callback(100, "新聞來源新增完成", display_name)
             return [f"已新增新聞來源 #{feed_id}: {display_name}"]
         except ValueError as e:
             return [f"新增失敗：{e}"]
     if sub == "remove":
+        if status_callback:
+            status_callback(30, "正在移除新聞來源", None)
         if not _is_allowed_control_user(user_id, user_name):
             return ["未授權使用新聞來源管理指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"]
         if len(tokens) < 3 or not tokens[2].isdigit():
             return ["Usage: /news remove <feed_id>"]
         try:
             name, url = remove_news_feed(int(tokens[2]))
+            if status_callback:
+                status_callback(100, "新聞來源移除完成", name or url)
             return [f"已刪除新聞來源 #{tokens[2]}: {name or url}"]
         except ValueError as e:
             return [f"刪除失敗：{e}"]
     if sub == "enable":
+        if status_callback:
+            status_callback(30, "正在啟用新聞來源", None)
         if not _is_allowed_control_user(user_id, user_name):
             return ["未授權使用新聞來源管理指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"]
         if len(tokens) < 3 or not tokens[2].isdigit():
             return ["Usage: /news enable <feed_id>"]
         try:
             name, url, _enabled = set_news_feed_enabled(int(tokens[2]), True)
+            if status_callback:
+                status_callback(100, "新聞來源已啟用", name or url)
             return [f"已啟用新聞來源 #{tokens[2]}: {name or url}"]
         except ValueError as e:
             return [f"啟用失敗：{e}"]
     if sub == "disable":
+        if status_callback:
+            status_callback(30, "正在停用新聞來源", None)
         if not _is_allowed_control_user(user_id, user_name):
             return ["未授權使用新聞來源管理指令。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"]
         if len(tokens) < 3 or not tokens[2].isdigit():
             return ["Usage: /news disable <feed_id>"]
         try:
             name, url, _enabled = set_news_feed_enabled(int(tokens[2]), False)
+            if status_callback:
+                status_callback(100, "新聞來源已停用", name or url)
             return [f"已停用新聞來源 #{tokens[2]}: {name or url}"]
         except ValueError as e:
             return [f"停用失敗：{e}"]
     if sub == "search":
         if len(tokens) < 3:
             return ["Usage: /news search <keywords>"]
-        fetch_and_store_news()
+        fetch_and_store_news(status_callback=status_callback)
+        if status_callback:
+            status_callback(92, "正在搜尋新聞資料庫", "關鍵字搜尋中")
         rows = search_clusters(" ".join(tokens[2:]), 10)
+        if status_callback:
+            status_callback(100, "新聞搜尋完成", f"找到 {len(rows)} 筆結果")
         return [format_cluster_list(rows)]
     if sub == "debug":
-        fetch_and_store_news()
+        fetch_and_store_news(status_callback=status_callback)
+        if status_callback:
+            status_callback(92, "正在檢查新聞來源狀態", None)
         now = datetime.now(tz=get_local_tz())
         cutoff_iso = (now - timedelta(hours=12)).isoformat()
         with _connect_db() as conn:
@@ -7465,14 +8078,20 @@ def handle_news_command(
             ).fetchall()
         if not rows:
             email_ready, email_status = _get_recent_news_email_status()
+            if status_callback:
+                status_callback(100, "新聞偵錯完成", "最近 12 小時沒有 ingest 資料")
             return [f"No news items ingested in the last 12 hours.\nEmail: {'ready' if email_ready else 'not ready'}\n{email_status}"]
         lines = ["News items by source (last 12 hours):"]
         for source, cnt in rows:
             lines.append(f"- {source}: {cnt}")
         email_ready, email_status = _get_recent_news_email_status()
         lines.extend(["", f"Email: {'ready' if email_ready else 'not ready'}", email_status])
+        if status_callback:
+            status_callback(100, "新聞偵錯完成", f"來源數量：{len(rows)}")
         return ["\n".join(lines)]
     if sub == "help":
+        if status_callback:
+            status_callback(100, "新聞說明整理完成", None)
         return [
             "News commands: /news, /news search <keywords>, /news sources, /news add <url> | <name>, /news remove <id>, /news enable <id>, /news disable <id>, /news debug"
         ]
@@ -7483,8 +8102,6 @@ def set_telegram_commands() -> None:
     commands = [
         {"command": "summary_notes_daily", "description": "Daily notes digest"},
     ]
-    if FEATURE_WEEKLY_REPORT_ENABLED:
-        commands.append({"command": "summary_notes_weekly", "description": "Weekly notes digest"})
     if APP_PROFILE == "digest":
         commands.extend(
             [
@@ -7509,10 +8126,9 @@ def set_telegram_commands() -> None:
                 {"command": "news_help", "description": "News command help"},
             ]
         )
-        if FEATURE_WEEKLY_REPORT_ENABLED:
-            commands.append({"command": "summary_news_weekly", "description": "Weekly news digest"})
     if FEATURE_TRANSCRIBE_ENABLED:
         commands.append({"command": "transcribe", "description": "Transcribe url/audio to markdown"})
+        commands.append({"command": "daily_podcast", "description": "Batch transcribe fixed podcasts"})
         commands.append({"command": "cancel", "description": "Cancel active transcription"})
     commands.append({"command": "status", "description": "Bot health status"})
     resp = None
@@ -7679,9 +8295,9 @@ def build_status_report() -> str:
         f"db path exists: {'yes' if DB_PATH.exists() else 'no'}",
     ]
     if APP_PROFILE == "chitchat":
-        notion_ready = "yes" if _notion_is_chitchat_enabled() else "no"
+        notion_ready = "yes" if _notion_chatlog_enabled() else "no"
         notion_year_page = _notion_get_chatlog_year_page_id(now)
-        lines.append(f"notion chitchat sync: {notion_ready}")
+        lines.append(f"notion chatlog sync: {notion_ready}")
         lines.append(f"notion target page ({now.year}): {notion_year_page or 'missing'}")
     if FEATURE_NEWS_ENABLED:
         lines.append(f"news clusters (24h): {news_24h}")
@@ -7709,12 +8325,6 @@ def build_status_report() -> str:
     lines.extend([
         f"note markdown files (3d): {notes_3d}",
         f"dropbox sync: {'on' if DROPBOX_SYNC_ENABLED else 'off'} ({DROPBOX_SYNC_TIME} {DROPBOX_SYNC_TZ_NAME})",
-        "weekly report push: "
-        + (
-            f"on (weekday={WEEKLY_REPORT_PUSH_WEEKDAY} {WEEKLY_REPORT_PUSH_TIME} {WEEKLY_REPORT_PUSH_TZ_NAME})"
-            if WEEKLY_REPORT_PUSH_ENABLED
-            else "off"
-        ),
         "kol digest: "
         + (
             "unavailable "
@@ -7948,85 +8558,6 @@ def push_news_to_subscribers() -> None:
             conn.commit()
 
 
-def _get_weekly_report_push_tz():
-    try:
-        return ZoneInfo(WEEKLY_REPORT_PUSH_TZ_NAME)
-    except ZoneInfoNotFoundError:
-        return get_local_tz()
-
-
-def _weekly_push_sent(provider_key: str, key: str) -> bool:
-    return bool(get_sync_state(provider_key, key))
-
-
-def _mark_weekly_push_sent(provider_key: str, key: str) -> None:
-    upsert_sync_state(provider_key, key, datetime.now(tz=get_local_tz()).isoformat())
-
-
-def _list_recent_telegram_chats_for_weekly_push(limit: int) -> list[str]:
-    now = datetime.now(tz=get_local_tz())
-    cutoff_iso = (now - timedelta(days=WEEKLY_REPORT_PUSH_LOOKBACK_DAYS)).isoformat()
-    with _connect_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT chat_id, MAX(received_ts) AS last_seen
-            FROM messages
-            WHERE platform = 'telegram'
-              AND chat_id IS NOT NULL
-              AND chat_id <> ''
-              AND received_ts >= ?
-            GROUP BY chat_id
-            ORDER BY last_seen DESC
-            LIMIT ?
-            """,
-            (cutoff_iso, limit),
-        ).fetchall()
-    return [str(row[0]) for row in rows if row and row[0]]
-
-
-def push_weekly_report_to_recent_chats(force_day: str | None = None) -> None:
-    if not WEEKLY_REPORT_PUSH_ENABLED:
-        return
-
-    now = datetime.now(tz=_get_weekly_report_push_tz())
-    report_day = force_day or now.strftime("%Y-%m-%d")
-    week_key = _weekly_report_week_key(report_day)
-    week_guard_key = f"{APP_PROFILE}:{week_key}"
-    provider_report = "weekly_report_generated"
-    if not _weekly_push_sent(provider_report, week_guard_key):
-        if APP_PROFILE == "main":
-            payload = build_scoped_summary(report_day, "note", recent_days=7)
-            _save_weekly_report(report_day, payload)
-        else:
-            generate_weekly_report(report_day, include_actions=(APP_PROFILE == "main"), save_report=True)
-        _mark_weekly_push_sent(provider_report, week_guard_key)
-
-    report_path = _weekly_report_file_path(report_day)
-    report_link = get_or_create_dropbox_shared_link_for_local_file(report_path) if report_path.exists() else None
-    if report_path.exists():
-        text = report_path.read_text(encoding="utf-8", errors="replace").strip()
-    else:
-        if APP_PROFILE == "main":
-            payload = build_scoped_summary(report_day, "note", recent_days=7)
-        else:
-            payload = generate_weekly_report(report_day, include_actions=(APP_PROFILE == "main"), save_report=False)
-        text = "\n".join(payload)
-    if report_link:
-        text = f"{text}\n\n週報檔案：{report_link}"
-
-    chat_ids = _list_recent_telegram_chats_for_weekly_push(WEEKLY_REPORT_PUSH_MAX_CHATS)
-    if not chat_ids:
-        return
-
-    provider_push = "weekly_report_push"
-    for chat_id in chat_ids:
-        sent_key = f"{APP_PROFILE}:{week_key}:{chat_id}"
-        if _weekly_push_sent(provider_push, sent_key):
-            continue
-        send_message_sync(chat_id, text)
-        _mark_weekly_push_sent(provider_push, sent_key)
-
-
 def start_news_thread() -> None:
     if not FEATURE_NEWS_ENABLED:
         print("[INFO] News worker disabled by FEATURE_NEWS_ENABLED=0")
@@ -8128,32 +8659,6 @@ def start_kol_digest_thread() -> None:
             time.sleep(60)
 
     t = threading.Thread(target=loop, daemon=True, name="kol-digest-worker")
-    t.start()
-
-
-def start_weekly_report_thread() -> None:
-    if not FEATURE_WEEKLY_REPORT_ENABLED or not WEEKLY_REPORT_PUSH_ENABLED:
-        return
-
-    run_hour, run_minute = parse_hhmm(WEEKLY_REPORT_PUSH_TIME, default_hour=9, default_minute=0)
-
-    def loop():
-        last_run_key = ""
-        while True:
-            try:
-                now = datetime.now(tz=_get_weekly_report_push_tz())
-                day_key = now.strftime("%Y-%m-%d")
-                weekday = now.isoweekday()
-                minute_ok = now.hour == run_hour and now.minute == run_minute
-                run_key = f"{APP_PROFILE}:{day_key}:{run_hour:02d}:{run_minute:02d}"
-                if weekday == WEEKLY_REPORT_PUSH_WEEKDAY and minute_ok and run_key != last_run_key:
-                    push_weekly_report_to_recent_chats(force_day=day_key)
-                    last_run_key = run_key
-            except Exception as e:
-                print(f"[WARN] Weekly report worker error: {e}")
-            time.sleep(60)
-
-    t = threading.Thread(target=loop, daemon=True)
     t.start()
 
 
@@ -8655,6 +9160,17 @@ async def process_telegram_update(update: dict) -> None:
             if await handle_transcribe_cancel_command(chat_id, cmd_text):
                 print(f"[ROUTE][HANDLED] chat_id={chat_id} by=cancel")
                 return
+            if await handle_daily_podcast_command(chat_id, cmd_text):
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=daily_podcast")
+                return
+            if await handle_news_command_with_progress(
+                chat_id,
+                cmd_text,
+                user_id=user_id,
+                user_name=sender.get("username") or user_name,
+            ):
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=news_with_progress")
+                return
             transcribe_targets: list[str] = []
             if FEATURE_TRANSCRIBE_ENABLED:
                 transcribe_targets = transcribe_candidate_targets
@@ -8712,6 +9228,14 @@ async def process_telegram_update(update: dict) -> None:
     if is_group and chat_id and text and is_slash_command and not has_image and not has_audio_attachment:
         try:
             print(f"[ROUTE][GROUP_CMD] chat_id={chat_id} text={cmd_text[:180]!r}")
+            if await handle_news_command_with_progress(
+                chat_id,
+                cmd_text,
+                user_id=user_id,
+                user_name=sender.get("username") or user_name,
+            ):
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=news_with_progress")
+                return
             replies, parse_mode, disable_preview = route_user_text_command(
                 cmd_text,
                 str(chat_id),
@@ -8873,14 +9397,6 @@ def start_slack_socket_mode() -> None:
         parts = build_scoped_summary(day, "note")
         respond("\n".join(parts))
 
-    @slack_app.command("/summary_notes_weekly")
-    def handle_slack_summary_notes_weekly(ack, respond, command):
-        ack()
-        text = (command.get("text") or "").strip()
-        day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
-        parts = build_scoped_summary(day, "note", recent_days=7)
-        respond("\n".join(parts))
-
     @slack_app.command("/status")
     def handle_slack_status(ack, respond, command):
         ack()
@@ -8895,17 +9411,6 @@ def start_slack_socket_mode() -> None:
         text = (command.get("text") or "").strip()
         day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
         parts = build_scoped_summary(day, "news")
-        respond("\n".join(parts))
-
-    @slack_app.command("/summary_news_weekly")
-    def handle_slack_summary_news_weekly(ack, respond, command):
-        ack()
-        if not FEATURE_NEWS_ENABLED:
-            respond("新聞功能已關閉。")
-            return
-        text = (command.get("text") or "").strip()
-        day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
-        parts = build_scoped_summary(day, "news", recent_days=7)
         respond("\n".join(parts))
 
     @slack_app.event("message")
@@ -8951,12 +9456,6 @@ def start_slack_socket_mode() -> None:
                 ok, msg = process_slack_note(channel_id, user_id, user_name, payload, msg_ts)
                 say(msg)
                 return
-        if text.startswith("/summary_notes_weekly"):
-            tokens = text.split()
-            day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
-            parts = build_scoped_summary(day, "note", recent_days=7)
-            say("\n".join(parts))
-            return
         if text.startswith("/summary_notes_daily"):
             tokens = text.split()
             day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
@@ -8970,15 +9469,6 @@ def start_slack_socket_mode() -> None:
             tokens = text.split()
             day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
             parts = build_scoped_summary(day, "news")
-            say("\n".join(parts))
-            return
-        if text.startswith("/summary_news_weekly"):
-            if not FEATURE_NEWS_ENABLED:
-                say("新聞功能已關閉。")
-                return
-            tokens = text.split()
-            day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
-            parts = build_scoped_summary(day, "news", recent_days=7)
             say("\n".join(parts))
             return
         if text.startswith("/status"):
@@ -9012,7 +9502,6 @@ def start_background_workers_once() -> None:
         set_telegram_commands()
         start_news_thread()
         start_kol_digest_thread()
-        start_weekly_report_thread()
         start_slack_thread()
         start_dropbox_sync_thread()
         start_ocr_choice_expire_thread()

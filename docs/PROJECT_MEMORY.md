@@ -55,6 +55,20 @@ For each entry, capture:
 
 ## Change Log
 
+### 2026-04-05 - Profile storage boundaries for main vs chitchat
+
+- Summary: documented the intended storage split between `main` and `chitchat` so Telegram text logging, transcript output, AI summaries, Notion sync, and `/daily_podcast` outputs do not get merged accidentally.
+- Files: `docs/PROJECT_MEMORY.md`
+- Technologies: profile-based routing, markdown persistence, transcript storage, Notion sync
+- Pitfalls:
+  - `chitchat` bot Telegram messages should sync to Notion only; they must not be appended into local note markdown.
+  - `main` bot is the profile that records note content locally.
+  - Full transcript files from YouTube/podcast transcription belong in `transcript`, not in `notes`.
+  - AI transcript summaries belong in `notes`; do not treat full transcript markdown and summary markdown as the same storage target.
+  - `/daily_podcast` is the only current exception: it pulls the seven latest fixed podcast shows and stores the full transcript markdown under `daily-podcast`.
+- Validation:
+  - User clarified expected behavior on 2026-04-05 during review of recent regressions in Telegram routing and storage paths.
+
 ### 2026-03-10 - Telegram-manageable RSS feed registry
 
 - Summary: moved news feed management into SQLite, added Telegram `/news add|remove|enable|disable` subcommands, and changed `/news sources` to show feed ids plus enabled status for operator workflows.
@@ -144,21 +158,6 @@ For each entry, capture:
 - Validation:
   - Decision recorded after evaluating `snscrape`, official APIs, and custom crawler tradeoffs for recurring KOL tracking.
 
-### 2026-03-09 - Weekly digest pipeline and transcription chunking
-
-- Summary: weekly note/report generation now pre-syncs Dropbox notes for the requested date window, preserves larger raw transcript sections for AI summarization, and transcription now chunks long audio with `small` as the default Whisper model.
-- Files: `app.py`, `transcription.py`, `tests/test_smoke.py`, `.env.main`, `README.md`
-- Technologies: Dropbox API sync, Markdown note ingestion, AI summarization prompt assembly, Faster Whisper, ffmpeg-based audio chunking, Python `unittest`
-- Pitfalls:
-  - Do not reintroduce `raw[:AI_SUMMARY_MAX_CHARS]` as the main weekly note input path; it biases the summary toward the first long transcript block.
-  - `/summary_notes_weekly` is AI-backed in current behavior. Treat it as an AI feature, not a pure local rule-based formatter.
-  - Weekly note/report generation depends on pre-syncing the full requested Dropbox note date range, not just locally existing files.
-  - Chunking in `transcribe_audio()` must preserve absolute timestamps when merging chunk results back together.
-  - Current transcription runtime is CPU-oriented by default; increasing the model size without checking host capacity will regress turnaround time quickly.
-- Validation:
-  - `python -m py_compile app.py transcription.py tests\\test_smoke.py`
-  - `python -m unittest tests.test_smoke`
-
 ### 2026-03-09 - Reliability and control hardening
 
 - Summary: reduced Telegram processing contention, fixed timestamp handling, streamed file downloads, and added control-command allowlisting.
@@ -212,7 +211,7 @@ For each entry, capture:
 
 ### 2026-03-18 - LLM batch news classification
 
-- Summary: replaced simple 5-category keyword classification with 7-category LLM batch classification for both `/news` output and weekly report news block. Categories: AI, 半導體, 台灣產業, 政治及地緣, 金融市場, 消費電子產品, 其他. Added priority-ordered disambiguation rules (Taiwan company → policy → financial → AI → semiconductor). Also fixed email HTML formatting (newlines not rendering in Gmail).
+- Summary: replaced simple 5-category keyword classification with 7-category LLM batch classification for `/news` output. Categories: AI, 半導體, 台灣產業, 政治及地緣, 金融市場, 消費電子產品, 其他. Added priority-ordered disambiguation rules (Taiwan company → policy → financial → AI → semiconductor). Also fixed email HTML formatting (newlines not rendering in Gmail).
 - Files: `app.py`, `.env.example`, `.env.main.example`, `README.md`, `docs/PROJECT_MEMORY.md`
 - Technologies: LLM batch prompting via `_run_ai_chat()`, regex-based output parsing, keyword fallback classifier, priority-ordered disambiguation, configurable batch size
 - Pitfalls:

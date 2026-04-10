@@ -102,6 +102,7 @@ if ($Monitor) {
 
 Ensure-SharedDependencies
 
+Write-Progress -Activity "Starting bots" -Status "Preparing ports" -PercentComplete 5
 $mainSelectedPort = Get-NextFreePort -StartPort $MainPort -ReservedPorts @()
 if ($mainSelectedPort -ne $MainPort) {
   Write-Host "[WARN] Requested main port $MainPort is unavailable. Preselected fallback: $mainSelectedPort"
@@ -115,6 +116,7 @@ if ($mainSelectedPort -eq $chitchatSelectedPort) {
   throw "Internal port selection conflict: both bots resolved to port $mainSelectedPort."
 }
 
+Write-Progress -Activity "Starting bots" -Status "Starting main bot" -PercentComplete 20
 Write-Host "[INFO] Starting main bot with $MainEnv on port $mainSelectedPort"
 $mainParams = @{
   EnvFile = $MainEnv
@@ -127,9 +129,11 @@ if ($EnableLogs -and $mainLog) {
 }
 & "$PSScriptRoot\start.ps1" @mainParams
 if ($LASTEXITCODE -ne 0) {
+  Write-Progress -Activity "Starting bots" -Completed
   throw "Main bot start failed with exit code $LASTEXITCODE"
 }
 
+Write-Progress -Activity "Starting bots" -Status "Starting chitchat bot" -PercentComplete 60
 Write-Host "[INFO] Starting chitchat bot with $ChitchatEnv on port $chitchatSelectedPort"
 $chitchatParams = @{
   EnvFile = $ChitchatEnv
@@ -142,9 +146,12 @@ if ($EnableLogs -and $chitchatLog) {
 }
 & "$PSScriptRoot\start.ps1" @chitchatParams
 if ($LASTEXITCODE -ne 0) {
+  Write-Progress -Activity "Starting bots" -Completed
   throw "Chitchat bot start failed with exit code $LASTEXITCODE"
 }
 
+Write-Progress -Activity "Starting bots" -Status "Startup complete" -PercentComplete 100
+Write-Progress -Activity "Starting bots" -Completed
 Write-Host "[INFO] Both start commands submitted."
 if ($EnableLogs) {
   Write-Host "[INFO] Logs:"

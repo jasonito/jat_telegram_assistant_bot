@@ -14,9 +14,5 @@ os.environ.setdefault("FEATURE_SLACK_ENABLED", "0")
 os.environ.setdefault("AI_SUMMARY_PROVIDER", "gemini")
 os.environ.setdefault("GEMINI_MODEL", "gemini-2.5-flash")
 os.environ.setdefault("AI_SUMMARY_TEMPERATURE", "0.6")
-os.environ.setdefault("WEEKLY_REPORT_PUSH_ENABLED", "1")
-os.environ.setdefault("WEEKLY_REPORT_PUSH_WEEKDAY", "1")
-os.environ.setdefault("WEEKLY_REPORT_PUSH_TIME", "09:00")
-os.environ.setdefault("WEEKLY_REPORT_PUSH_TZ", "Asia/Taipei")
 
 from app import app  # noqa: E402,F401

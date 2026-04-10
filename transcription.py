@@ -29,7 +29,6 @@ from typing import Callable
 
 import requests
 import yt_dlp
-from slugify import slugify
 
 try:
     from faster_whisper import BatchedInferencePipeline, WhisperModel  # type: ignore
@@ -446,6 +445,7 @@ def fetch_apple_podcast_episodes(url: str) -> list[dict]:
                 "audio_url": episode_url,
                 "show_name": entry.get("collectionName", ""),
                 "publish_date": entry.get("releaseDate", ""),
+                "duration_seconds": int((entry.get("trackTimeMillis") or 0) // 1000),
             }
         )
     if target_episode_id:
@@ -728,8 +728,37 @@ def _transcript_output_dir(base_dir: Path, today: datetime.date | None = None) -
 
 
 def _safe_filename(title: str) -> str:
-    title_slug = slugify(title, max_length=80) or "transcript"
-    return f"{title_slug}.md"
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", str(title or "")).strip()
+    text = re.sub(r"\s+", " ", text)
+    text = text.rstrip(". ")
+    if not text:
+        text = "transcript"
+    if text.upper() in {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "COM2",
+        "COM3",
+        "COM4",
+        "COM5",
+        "COM6",
+        "COM7",
+        "COM8",
+        "COM9",
+        "LPT1",
+        "LPT2",
+        "LPT3",
+        "LPT4",
+        "LPT5",
+        "LPT6",
+        "LPT7",
+        "LPT8",
+        "LPT9",
+    }:
+        text = f"transcript {text}"
+    return f"{text[:120]}.md"
 
 
 def save_transcript_md(
