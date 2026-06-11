@@ -19,11 +19,13 @@ import traceback
 import calendar
 from contextlib import contextmanager
 from email.message import EmailMessage
+from html.parser import HTMLParser
 
 from typing import Callable, Iterator
 from urllib.parse import parse_qsl
 from urllib.parse import quote
 from urllib.parse import urlencode
+from urllib.parse import urljoin
 from urllib.parse import urlparse
 from urllib.parse import urlunparse
 from datetime import datetime, timedelta, timezone
@@ -133,6 +135,7 @@ if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+_REDACTED_TELEGRAM_API = "https://api.telegram.org/bot<redacted>"
 TELEGRAM_LONG_POLLING = os.getenv("TELEGRAM_LONG_POLLING", "0").lower() in {
     "1",
     "true",
@@ -146,6 +149,10 @@ TELEGRAM_FILE_FETCH_CONNECT_TIMEOUT = max(1, int(os.getenv("TELEGRAM_FILE_FETCH_
 TELEGRAM_FILE_FETCH_READ_TIMEOUT = max(3, int(os.getenv("TELEGRAM_FILE_FETCH_READ_TIMEOUT", "12")))
 TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS = max(
     0.1, float(os.getenv("TELEGRAM_FILE_FETCH_RETRY_DELAY_SECONDS", "0.25"))
+)
+TELEGRAM_GETFILE_MAX_BYTES = max(
+    0,
+    int(os.getenv("TELEGRAM_GETFILE_MAX_BYTES", str(20 * 1024 * 1024))),
 )
 TELEGRAM_POLL_TIMEOUT_SECONDS = max(5, int(os.getenv("TELEGRAM_POLL_TIMEOUT_SECONDS", "20")))
 TELEGRAM_POLL_CONNECT_TIMEOUT_SECONDS = max(
@@ -170,6 +177,15 @@ TELEGRAM_POLL_STALE_SECONDS = max(
     float(TELEGRAM_POLL_READ_TIMEOUT_SECONDS + 30),
     _env_float("TELEGRAM_POLL_STALE_SECONDS", float(TELEGRAM_POLL_READ_TIMEOUT_SECONDS + 45)),
 )
+
+
+def _redact_telegram_secrets(value: object) -> str:
+    text = "" if value is None else str(value)
+    if BOT_TOKEN:
+        text = text.replace(BOT_TOKEN, "<redacted>")
+        text = text.replace(TELEGRAM_API, _REDACTED_TELEGRAM_API)
+        text = text.replace(f"bot{BOT_TOKEN}", "bot<redacted>")
+    return text
 
 TELEGRAM_UPDATE_MAX_WORKERS = max(1, int(os.getenv("TELEGRAM_UPDATE_MAX_WORKERS", "8")))
 SQLITE_BUSY_TIMEOUT_MS = max(1000, int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "15000")))
@@ -224,6 +240,16 @@ DAILY_PODCAST_RESOURCE_DIR = _resolve_storage_path(
     Path(r"H:\我的雲端硬碟\Obsidian\Resource\daily-podcast"),
     DATA_DIR / "daily-podcast",
 )
+CHINA_PODCAST_RESOURCE_DIR = _resolve_storage_path(
+    "CHINA_PODCAST_RESOURCE_DIR",
+    Path(r"H:\我的雲端硬碟\Obsidian\Resource\china-podcast"),
+    DATA_DIR / "china-podcast",
+)
+HOUSE_PODCAST_RESOURCE_DIR = _resolve_storage_path(
+    "HOUSE_PODCAST_RESOURCE_DIR",
+    Path(r"H:\我的雲端硬碟\Obsidian\Resource\house-podcast"),
+    DATA_DIR / "house-podcast",
+)
 _default_notes_dir = DATA_DIR / "note" if IS_CHITCHAT_PROFILE else OBSIDIAN_RESOURCE_DIR / "note"
 NOTES_DIR = _resolve_storage_path("NOTE_DIR", _default_notes_dir, DATA_DIR / "note")
 TELEGRAM_MD_DIR = NOTES_DIR
@@ -238,9 +264,21 @@ DAILY_PODCAST_DIR = _resolve_storage_path(
     DAILY_PODCAST_RESOURCE_DIR,
     DATA_DIR / "daily-podcast",
 )
+CHINA_PODCAST_DIR = _resolve_storage_path(
+    "CHINA_PODCAST_DIR",
+    CHINA_PODCAST_RESOURCE_DIR,
+    DATA_DIR / "china-podcast",
+)
+HOUSE_PODCAST_DIR = _resolve_storage_path(
+    "HOUSE_PODCAST_DIR",
+    HOUSE_PODCAST_RESOURCE_DIR,
+    DATA_DIR / "house-podcast",
+)
 print(f"[INFO] NOTES_DIR={NOTES_DIR}")
 print(f"[INFO] TRANSCRIPTS_DIR={TRANSCRIPTS_DIR}")
 print(f"[INFO] DAILY_PODCAST_DIR={DAILY_PODCAST_DIR}")
+print(f"[INFO] CHINA_PODCAST_DIR={CHINA_PODCAST_DIR}")
+print(f"[INFO] HOUSE_PODCAST_DIR={HOUSE_PODCAST_DIR}")
 TRANSCRIPTS_TMP_DIR = DATA_DIR / "_runtime" / "transcribe_tmp"
 ALLOWED_GROUPS = {
     g.strip()
@@ -343,10 +381,72 @@ NEWS_EMAIL_PASSWORD = os.getenv("NEWS_EMAIL_PASSWORD", "").strip()
 NEWS_EMAIL_FROM = os.getenv("NEWS_EMAIL_FROM", NEWS_EMAIL_USERNAME).strip()
 NEWS_EMAIL_TO = [addr.strip() for addr in os.getenv("NEWS_EMAIL_TO", "").split(",") if addr.strip()]
 NEWS_EMAIL_SUBJECT_PREFIX = os.getenv("NEWS_EMAIL_SUBJECT_PREFIX", "[JAT News]").strip()
+HOUSE_NEWS_EMAIL_SUBJECT_PREFIX = os.getenv("HOUSE_NEWS_EMAIL_SUBJECT_PREFIX", "[HOUSE News]").strip()
+NEWS_EXPORT_WEBHOOK_URL = os.getenv("NEWS_EXPORT_WEBHOOK_URL", "").strip()
+NEWS_EXPORT_WEBHOOK_SECRET = os.getenv("NEWS_EXPORT_WEBHOOK_SECRET", "").strip()
+NEWS_EXPORT_WEBHOOK_TIMEOUT_SECONDS = max(1, int(os.getenv("NEWS_EXPORT_WEBHOOK_TIMEOUT_SECONDS", "30")))
 NEWS_GNEWS_QUERY = os.getenv("NEWS_GNEWS_QUERY", "site:reuters.com semiconductors technology")
 NEWS_GNEWS_HL = os.getenv("NEWS_GNEWS_HL", "en-US")
 NEWS_GNEWS_GL = os.getenv("NEWS_GNEWS_GL", "US")
 NEWS_GNEWS_CEID = os.getenv("NEWS_GNEWS_CEID", "US:en")
+SINYI_DAILYNEWS_URL = "https://www.sinyinews.com.tw/dailynews"
+SINYI_CATEGORY_URLS = [
+    "https://www.sinyinews.com.tw/dailynews/0",   # 新聞總覽
+    "https://www.sinyinews.com.tw/dailynews/14",  # 房市快訊
+    "https://www.sinyinews.com.tw/dailynews/7",   # 房產趨勢
+    "https://www.sinyinews.com.tw/dailynews/4",   # 房市焦點
+    "https://www.sinyinews.com.tw/dailynews/1",   # 地區新聞
+]
+TWHG_NEWS_URL = "https://news.twhg.com.tw/re_news_list.php#loc"
+UDN_HOUSE_RSS_URL = "https://money.udn.com/rssfeed/news/1001/5593/5930?ch=money"
+CTEE_HOUSE_GNEWS_URL = (
+    "https://news.google.com/rss/search?q="
+    f"{quote('工商時報 房市')}"
+    "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+)
+HOUSEFUN_GNEWS_URL = (
+    "https://news.google.com/rss/search?q="
+    f"{quote('site:news.housefun.com.tw')}"
+    "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+)
+CAIXIN_GLOBAL_GNEWS_URL = (
+    "https://news.google.com/rss/search?q="
+    f"{quote('site:caixinglobal.com China OR business')}"
+    "&hl=en-US&gl=US&ceid=US:en"
+)
+REUTERS_CHINA_GNEWS_URL = (
+    "https://news.google.com/rss/search?q="
+    f"{quote('site:reuters.com/world/china/')}"
+    "&hl=en-US&gl=US&ceid=US:en"
+)
+RER_NCCU_LIST_URLS = {
+    "https://rer.nccu.edu.tw/article/list/36": "政大不動產研究中心 - 名家專欄",
+    "https://rer.nccu.edu.tw/article/list/71": "政大不動產研究中心 - 亞洲海外新知",
+    "https://rer.nccu.edu.tw/article/list/72": "政大不動產研究中心 - 美洲",
+}
+MYHOUSING_FEED_URL = "https://www.myhousing.com.tw/category/n/n01/feed/"
+# Single source of truth for house (real-estate) feeds: maps each feed URL to the source
+# name its articles are tagged with. The fetch-scope set (HOUSE_NEWS_FEED_URLS) and the
+# filter-scope set (HOUSE_NEWS_SOURCE_NAMES) are both derived from this, so registering a
+# house feed only takes one entry here. None means the emitted source name is dynamic
+# (e.g. 信義 prefixes, handled by the startswith check in _is_house_news_source).
+HOUSE_NEWS_FEEDS: dict[str, str | None] = {
+    SINYI_DAILYNEWS_URL: None,
+    TWHG_NEWS_URL: "台灣房屋新聞",
+    UDN_HOUSE_RSS_URL: "經濟日報房市",
+    CTEE_HOUSE_GNEWS_URL: "工商時報房市(GNews)",
+    HOUSEFUN_GNEWS_URL: "好房網News(GNews)",
+    MYHOUSING_FEED_URL: "房市動態 | 住展雜誌",
+    **RER_NCCU_LIST_URLS,
+}
+HOUSE_NEWS_FEED_URLS = set(HOUSE_NEWS_FEEDS)
+# Extra source-name aliases not tied 1:1 to a feed URL (title variants and 信義 sources
+# that are also matched by prefix, kept explicit for clarity).
+HOUSE_NEWS_SOURCE_NAMES = {name for name in HOUSE_NEWS_FEEDS.values() if name} | {
+    "信義房屋每日新聞",
+    "信義房屋",
+    "住展雜誌 - 房市動態",
+}
 FEATURE_NEWS_ENABLED = _env_flag("FEATURE_NEWS_ENABLED", NEWS_ENABLED)
 FEATURE_TRANSCRIBE_ENABLED = _env_flag("FEATURE_TRANSCRIBE_ENABLED", True)
 FEATURE_TRANSCRIBE_AUTO_URL = _env_flag("FEATURE_TRANSCRIBE_AUTO_URL", False)
@@ -407,6 +507,117 @@ DAILY_PODCAST_SHOWS: tuple[dict[str, str], ...] = (
         "key": "ms_thoughts_on_the_market",
         "label": "MS - Thoughts on the Market",
         "url": "https://podcasts.apple.com/tw/podcast/thoughts-on-the-market/id1466686717",
+    },
+    {
+        "key": "exchanges",
+        "label": "Exchanges",
+        "url": "https://podcasts.apple.com/tw/podcast/exchanges/id948913991",
+    },
+    {
+        "key": "moonshots_peter_diamandis",
+        "label": "Moonshots with Peter Diamandis",
+        "url": "https://podcasts.apple.com/tw/podcast/moonshots-with-peter-diamandis/id1648228034",
+    },
+    {
+        "key": "lex_fridman",
+        "label": "Lex Fridman Podcast",
+        "url": "https://podcasts.apple.com/tw/podcast/lex-fridman-podcast/id1434243584",
+    },
+    {
+        "key": "a16z",
+        "label": "a16z",
+        "url": "https://podcasts.apple.com/tw/channel/a16z/id6442932622",
+    },
+    {
+        "key": "ycombinator_startup",
+        "label": "Y Combinator Startup Podcast",
+        "url": "https://podcasts.apple.com/tw/podcast/y-combinator-startup-podcast/id1236907421",
+    },
+    {
+        "key": "statementdog",
+        "label": "財報狗 - 掌握台股美股時事議題",
+        "url": "https://podcasts.apple.com/us/podcast/%E8%B2%A1%E5%A0%B1%E7%8B%97-%E6%8E%8C%E6%8F%A1%E5%8F%B0%E8%82%A1%E7%BE%8E%E8%82%A1%E6%99%82%E4%BA%8B%E8%AD%B0%E9%A1%8C/id1513810531",
+    },
+    {
+        "key": "ting_jingji",
+        "label": "聽經濟",
+        "url": "https://podcasts.apple.com/tw/podcast/%E8%81%BD%E7%B6%93%E6%BF%9F/id1571066725",
+    },
+    {
+        "key": "ting_tianxia",
+        "label": "聽天下",
+        "url": "https://podcasts.apple.com/tw/podcast/%E8%81%BD%E5%A4%A9%E4%B8%8B-%E5%A4%A9%E4%B8%8B%E9%9B%9C%E8%AA%8Cpodcast/id1486227803",
+    },
+    {
+        "key": "meet_the_leader",
+        "label": "Meet the Leader",
+        "url": "https://podcasts.apple.com/tw/podcast/meet-the-leader/id1534915560",
+    },
+    {
+        "key": "in_the_know",
+        "label": "In the Know",
+        "url": "https://podcasts.apple.com/tw/podcast/in-the-know/id1691164140",
+    },
+)
+
+CHINA_PODCAST_SHOWS: tuple[dict[str, str], ...] = (
+    {
+        "key": "hudson_china_insider",
+        "label": "Hudson Institute - China Insider",
+        "url": "https://podcasts.apple.com/gb/podcast/china-insider/id1657304008",
+    },
+    {
+        "key": "csis_chinapower",
+        "label": "CSIS - ChinaPower",
+        "url": "https://podcasts.apple.com/gb/podcast/chinapower/id1144663360",
+    },
+    {
+        "key": "sinica_conversation_on_china",
+        "label": "Sinica - Conversation on China",
+        "url": "https://podcasts.apple.com/gb/podcast/sinica-podcast/id1121407665",
+    },
+    {
+        "key": "chinatalk",
+        "label": "ChinaTalk",
+        "url": "https://podcasts.apple.com/gb/podcast/chinatalk/id1289062927",
+    },
+    {
+        "key": "china_update",
+        "label": "China Update",
+        "url": "https://podcasts.apple.com/tw/podcast/china-update/id1597684509",
+    },
+    {
+        "key": "china_desk",
+        "label": "China Desk",
+        "url": "https://podcasts.apple.com/us/podcast/china-desk/id1673496111",
+    },
+    {
+        "key": "taiwanplus_china_perspective",
+        "label": "這樣看中國 - 蔡明芳時間",
+        "url": "https://podcasts.apple.com/tw/podcast/%E9%80%99%E6%A8%A3%E7%9C%8B%E4%B8%AD%E5%9C%8B-%E8%94%A1%E6%98%8E%E8%8A%B3%E6%99%82%E9%96%93/id1521629204",
+    },
+)
+
+HOUSE_PODCAST_SHOWS: tuple[dict[str, str], ...] = (
+    {
+        "key": "estate_learning_voice",
+        "label": "地產好學聲",
+        "url": "https://podcasts.apple.com/tw/podcast/%E5%9C%B0%E7%94%A2%E5%A5%BD%E5%AD%B8%E8%81%B2/id1529842418",
+    },
+    {
+        "key": "real_estate_jango",
+        "label": "地產詹哥老實說",
+        "url": "https://podcasts.apple.com/tw/podcast/%E5%9C%B0%E7%94%A2%E8%A9%B9%E5%93%A5%E8%80%81%E5%AF%A6%E8%AA%AA/id1535918552",
+    },
+    {
+        "key": "real_estate_sinyi",
+        "label": "地產聽信義",
+        "url": "https://podcasts.apple.com/tw/podcast/%E6%88%BF%E5%B1%8B%E8%81%BD%E4%BF%A1%E7%BE%A9/id1630353466",
+    },
+    {
+        "key": "find_place_live_real_estate",
+        "label": "找地方住聊房地產",
+        "url": "https://podcasts.apple.com/tw/podcast/%E6%89%BE%E5%9C%B0%E6%96%B9%E4%BD%8F%E8%81%8A%E6%88%BF%E5%9C%B0%E7%94%A2/id1669975492",
     },
 )
 
@@ -476,6 +687,10 @@ _TRANSCRIBE_BUSY_NOTICE_IDS_LOCK = threading.Lock()
 
 class TranscribeJobCancelled(Exception):
     """Raised when active transcription job is cancelled."""
+
+
+class TelegramFileTooLargeError(RuntimeError):
+    """Raised when Telegram Bot API refuses getFile because the file is too large."""
 
 
 def _normalize_text_value(value, default: str = "") -> str:
@@ -736,6 +951,8 @@ def init_storage() -> None:
     INBOX_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     DAILY_PODCAST_DIR.mkdir(parents=True, exist_ok=True)
+    CHINA_PODCAST_DIR.mkdir(parents=True, exist_ok=True)
+    HOUSE_PODCAST_DIR.mkdir(parents=True, exist_ok=True)
     TRANSCRIPTS_TMP_DIR.mkdir(parents=True, exist_ok=True)
     if FEATURE_NEWS_ENABLED:
         NEWS_MD_DIR.mkdir(parents=True, exist_ok=True)
@@ -846,21 +1063,7 @@ def init_storage() -> None:
                 existing_count = int(row[0]) if row else 0
                 if existing_count == 0:
                     now_iso = datetime.now(tz=NEWS_TZ).isoformat()
-                    q = quote(NEWS_GNEWS_QUERY)
-                    gnews_url = (
-                        f"https://news.google.com/rss/search?q={q}"
-                        f"&hl={NEWS_GNEWS_HL}&gl={NEWS_GNEWS_GL}&ceid={NEWS_GNEWS_CEID}"
-                    )
-                    default_feeds = [
-                        ("Reuters Technology", "https://www.reuters.com/technology/rss"),
-                        ("Reuters(GNews)", gnews_url),
-                        ("Bloomberg Technology", "https://feeds.bloomberg.com/technology/news.rss"),
-                        ("Bloomberg AI", "https://feeds.bloomberg.com/technology/ai/news.rss"),
-                        ("SemiAnalysis", "https://semianalysis.com/feed/"),
-                        ("Nikkei Asia", "https://asia.nikkei.com/rss/feed/nar"),
-                        ("Nikkei Asia Technology", "https://asia.nikkei.com/rss/feed/technology"),
-                    ]
-                    for name, url in default_feeds:
+                    for name, url in get_default_news_feeds():
                         conn.execute(
                             """
                             INSERT OR IGNORE INTO news_feeds(url, name, enabled, created_by, created_at, updated_at)
@@ -965,8 +1168,8 @@ async def send_message(
                 resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=fallback_payload, timeout=10)
         except Exception as e:
             _telegram_send_last_status = "request_error"
-            _telegram_send_last_error = f"{type(e).__name__}: {e}"
-            print(f"sendMessage error: {type(e).__name__}: {e}")
+            _telegram_send_last_error = f"{type(e).__name__}: {_redact_telegram_secrets(e)}"
+            print(f"sendMessage error: {type(e).__name__}: {_redact_telegram_secrets(e)}")
             return None
         try:
             data = resp.json() if resp.content else {}
@@ -1006,14 +1209,20 @@ def _spawn_background_to_thread(func, /, *args, label: str = "background") -> No
     asyncio.create_task(_runner())
 
 
-async def _handle_recent_news_email_delivery(chat_id: int, html: str) -> bool:
+async def _handle_recent_news_email_delivery(chat_id: int, html: str, *, scope: str = "news") -> bool:
+    if '• <a href=' not in (html or ""):
+        await send_message(chat_id, "新聞資料不足，email 未寄出。")
+        return True
     email_ready, email_status = _get_recent_news_email_status()
     if not email_ready:
         await send_message(chat_id, f"Email 未寄出：{email_status}")
         return True
-    sent = await asyncio.to_thread(_send_recent_news_email, html)
+    sent = await asyncio.to_thread(_send_recent_news_email, html, scope=scope)
     if sent:
         await send_message(chat_id, "已成功送出mail")
+        _export_sent, export_status = await asyncio.to_thread(_trigger_recent_news_drive_export, scope=scope)
+        if export_status:
+            await send_message(chat_id, export_status)
     else:
         await send_message(chat_id, "Email 未寄出：寄送失敗，請檢查 Gmail SMTP 設定或稍後再試。")
     return True
@@ -1067,38 +1276,65 @@ def _estimate_transcribe_stage_progress(raw_status: str, localized_status: str) 
     return 0.1
 
 
-def _build_daily_podcast_progress_message(
+def _build_fixed_podcast_progress_message(
     percent: int | float | None,
     batch_label: str,
     current_label: str,
     current_title: str,
     status_text: str,
-    *,
-    total_estimate_seconds: int | None = None,
 ) -> str:
     pct = _clamp_progress_percent(percent)
     lines = [
-        f"整體進度：{pct}%",
-        f"{_build_progress_bar(pct)} {batch_label}",
+        f"進度：{pct}% {_build_progress_bar(pct)}",
+        batch_label,
     ]
-    if total_estimate_seconds:
-        lines.append(f"整體預估總耗時：約 {_format_seconds_rough(total_estimate_seconds)}")
-    lines.extend(
-        [
-            f"目前節目：{current_label}",
-            f"集數：{current_title}",
-            status_text,
-        ]
-    )
+    if current_label != "全部完成":
+        lines.append(f"目前：{current_label}")
+    if current_title != "全部完成":
+        lines.append(f"集數：{current_title}")
+    lines.append(status_text)
     return "\n".join(lines)
 
 
 def _get_news_command_render_options(cmd_text: str) -> tuple[str | None, bool | None]:
-    tokens = (cmd_text or "").split()
-    sub = tokens[1].lower() if len(tokens) > 1 else ""
-    parse_mode = "HTML" if sub in {"", "latest"} else None
+    command = _get_slash_command_name(cmd_text)
+    sub = _get_news_command_subcommand(cmd_text)
+    parse_mode = "HTML" if command in {"/news", "/news_latest", "/house_news"} and sub in {"", "latest"} else None
     disable_preview = True if parse_mode == "HTML" else None
     return parse_mode, disable_preview
+
+
+def _get_slash_command_name(text: str) -> str:
+    first = (text or "").strip().split(maxsplit=1)[0].lower() if (text or "").strip() else ""
+    return first.split("@", 1)[0]
+
+
+def _is_news_command_text(text: str) -> bool:
+    return _get_slash_command_name(text) in {
+        "/news",
+        "/house_news",
+        "/news_source",
+        "/news_sources",
+        "/news_latest",
+        "/news_debug",
+        "/news_help",
+    }
+
+
+def _get_news_command_subcommand(text: str) -> str:
+    command = _get_slash_command_name(text)
+    if command in {"/news", "/house_news"}:
+        tokens = (text or "").strip().split()
+        return tokens[1].lower() if len(tokens) > 1 else ""
+    if command == "/news_latest":
+        return "latest"
+    if command in {"/news_source", "/news_sources"}:
+        return "sources"
+    if command == "/news_debug":
+        return "debug"
+    if command == "/news_help":
+        return "help"
+    return ""
 
 
 async def handle_news_command_with_progress(
@@ -1107,7 +1343,7 @@ async def handle_news_command_with_progress(
     user_id: str | None = None,
     user_name: str | None = None,
 ) -> bool:
-    if not FEATURE_NEWS_ENABLED or not (cmd_text or "").strip().lower().startswith("/news"):
+    if not FEATURE_NEWS_ENABLED or not _is_news_command_text(cmd_text):
         return False
 
     loop = asyncio.get_running_loop()
@@ -1142,7 +1378,7 @@ async def handle_news_command_with_progress(
     if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
         if progress_message_id:
             await edit_message(chat_id, progress_message_id, _build_news_progress_message(100, "新聞整理完成，正在寄送 email..."))
-        await _handle_recent_news_email_delivery(chat_id, replies[0])
+        await _handle_recent_news_email_delivery(chat_id, replies[0], scope=_get_news_email_scope(cmd_text))
         return True
 
     if not replies:
@@ -1489,7 +1725,7 @@ def delete_telegram_webhook(drop_pending: bool = False) -> None:
         )
         print(f"deleteWebhook status={resp.status_code} body={resp.text}")
     except Exception as e:
-        print(f"deleteWebhook error: {e}")
+        print(f"deleteWebhook error: {_redact_telegram_secrets(e)}")
 
 
 def _extract_transcribe_target(text: str) -> str:
@@ -1525,36 +1761,51 @@ def _extract_supported_transcribe_url(text: str) -> str:
     return matches[0] if matches else ""
 
 
-def _extract_daily_podcast_args(text: str) -> str | None:
-    m = re.match(r"^/daily_podcast(?:@\w+)?\s*(.*)$", (text or "").strip(), flags=re.I | re.S)
+def _extract_fixed_podcast_args(text: str, command_name: str) -> str | None:
+    m = re.match(rf"^{re.escape(command_name)}(?:@\w+)?\s*(.*)$", (text or "").strip(), flags=re.I | re.S)
     if not m:
         return None
     return m.group(1).strip()
 
 
-def _resolve_daily_podcast_selection(raw_args: str) -> tuple[list[dict[str, str]], str | None]:
+def _extract_daily_podcast_args(text: str) -> str | None:
+    return _extract_fixed_podcast_args(text, "/daily_podcast")
+
+
+def _extract_china_podcast_args(text: str) -> str | None:
+    return _extract_fixed_podcast_args(text, "/china_podcast")
+
+
+def _extract_house_podcast_args(text: str) -> str | None:
+    return _extract_fixed_podcast_args(text, "/house_podcast")
+
+
+def _resolve_fixed_podcast_selection(
+    raw_args: str,
+    shows: tuple[dict[str, str], ...] | list[dict[str, str]],
+) -> tuple[list[dict[str, str]], str | None]:
     raw = (raw_args or "").strip()
     if not raw or raw.lower() in {"run", "all"}:
-        return list(DAILY_PODCAST_SHOWS), None
+        return list(shows), None
     if raw.lower() == "list":
         return [], None
     verb, _, remainder = raw.partition(" ")
     if verb.lower() in {"run", "rull"}:
         raw = remainder.strip()
         if not raw or raw.lower() == "all":
-            return list(DAILY_PODCAST_SHOWS), None
+            return list(shows), None
     tokens = [t.strip().lower() for t in re.split(r"[\s,]+", raw) if t.strip()]
     if not tokens:
-        return list(DAILY_PODCAST_SHOWS), None
-    by_key = {item["key"]: item for item in DAILY_PODCAST_SHOWS}
-    by_label = {item["label"].strip().lower(): item for item in DAILY_PODCAST_SHOWS}
+        return list(shows), None
+    by_key = {item["key"]: item for item in shows}
+    by_label = {item["label"].strip().lower(): item for item in shows}
     selected: list[dict[str, str]] = []
     seen: set[str] = set()
     unknown: list[str] = []
     for token in tokens:
         item = by_key.get(token) or by_label.get(token)
         if item is None:
-            for candidate in DAILY_PODCAST_SHOWS:
+            for candidate in shows:
                 label = candidate["label"].strip().lower()
                 if token in label or label in token:
                     item = candidate
@@ -1573,6 +1824,18 @@ def _resolve_daily_podcast_selection(raw_args: str) -> tuple[list[dict[str, str]
     return selected, None
 
 
+def _resolve_daily_podcast_selection(raw_args: str) -> tuple[list[dict[str, str]], str | None]:
+    return _resolve_fixed_podcast_selection(raw_args, DAILY_PODCAST_SHOWS)
+
+
+def _resolve_china_podcast_selection(raw_args: str) -> tuple[list[dict[str, str]], str | None]:
+    return _resolve_fixed_podcast_selection(raw_args, CHINA_PODCAST_SHOWS)
+
+
+def _resolve_house_podcast_selection(raw_args: str) -> tuple[list[dict[str, str]], str | None]:
+    return _resolve_fixed_podcast_selection(raw_args, HOUSE_PODCAST_SHOWS)
+
+
 def _format_seconds_rough(total_seconds: int | float | None) -> str:
     if not total_seconds or total_seconds <= 0:
         return "未知"
@@ -1584,6 +1847,17 @@ def _format_seconds_rough(total_seconds: int | float | None) -> str:
     if minutes:
         return f"{minutes} 分 {seconds} 秒"
     return f"{seconds} 秒"
+
+
+def _local_file_uri(path: Path) -> str:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    text = str(resolved).replace("\\", "/")
+    if re.match(r"^[A-Za-z]:/", text):
+        text = f"/{text}"
+    return "file://" + quote(text, safe="/:")
 
 
 def _estimate_transcribe_multiplier(model_name: str) -> float:
@@ -1611,44 +1885,97 @@ def _estimate_daily_podcast_total_seconds(episodes: list[dict[str, object]], whi
     return max(estimate, audio_total // 3)
 
 
-def _build_daily_podcast_usage() -> str:
+def _build_fixed_podcast_usage(
+    command_name: str,
+    shows: tuple[dict[str, str], ...] | list[dict[str, str]],
+    *,
+    include_run_all_example: bool = True,
+) -> str:
     lines = [
-        "用法：/daily_podcast run [all|節目 key]",
-        "例如：/daily_podcast run all",
-        "例如：/daily_podcast run tech_orange nyt_daily",
+        f"用法：{command_name}",
+        f"或：{command_name} run [all|節目 key]",
+        f"或：{command_name} list",
+        f"例如：{command_name}",
         "可用節目：",
     ]
-    for item in DAILY_PODCAST_SHOWS:
+    if include_run_all_example:
+        lines.insert(4, f"例如：{command_name} run all")
+    sample_keys = " ".join(item["key"] for item in list(shows)[:2])
+    if sample_keys:
+        insert_at = 5 if include_run_all_example else 4
+        lines.insert(insert_at, f"例如：{command_name} run {sample_keys}")
+    for item in shows:
         lines.append(f"- {item['key']}: {item['label']}")
     return "\n".join(lines)
+
+
+def _build_daily_podcast_usage() -> str:
+    return _build_fixed_podcast_usage("/daily_podcast", DAILY_PODCAST_SHOWS)
+
+
+def _build_china_podcast_usage() -> str:
+    return _build_fixed_podcast_usage(
+        "/china_podcast",
+        CHINA_PODCAST_SHOWS,
+        include_run_all_example=False,
+    )
+
+
+def _build_house_podcast_usage() -> str:
+    return _build_fixed_podcast_usage(
+        "/house_podcast",
+        HOUSE_PODCAST_SHOWS,
+        include_run_all_example=False,
+    )
 
 
 def _daily_podcast_episode_state_key(show_key: str, episode_id: str) -> str:
     return f"{(show_key or '').strip()}:{(episode_id or '').strip()}"
 
 
-def _daily_podcast_episode_fallback_key(episode: dict[str, object]) -> str | None:
+def _fixed_podcast_episode_fallback_key(episode: dict[str, object]) -> str | None:
     show_key = str(episode.get("show_key") or "").strip()
     title = _clean_plain_text(str(episode.get("title") or "")).strip().lower()
     publish_date = str(episode.get("publish_date") or "").strip()
-    source_url = str(episode.get("source_url") or "").strip()
     if not show_key or not title:
         return None
-    raw = "|".join([show_key, title, publish_date, source_url])
+    raw = "|".join([show_key, title, publish_date[:10]])
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
     return f"{show_key}:fallback:{digest}"
 
 
-def _daily_podcast_episode_state_keys(episode: dict[str, object]) -> list[str]:
+def _fixed_podcast_episode_content_key(episode: dict[str, object]) -> str | None:
+    show_key = str(episode.get("show_key") or "").strip()
+    title = _clean_plain_text(str(episode.get("title") or "")).strip().lower()
+    publish_day = str(episode.get("publish_date") or "").strip()[:10]
+    if not show_key or not title:
+        return None
+    raw = "|".join([show_key, title, publish_day])
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return f"{show_key}:content:{digest}"
+
+
+def _daily_podcast_episode_fallback_key(episode: dict[str, object]) -> str | None:
+    return _fixed_podcast_episode_fallback_key(episode)
+
+
+def _fixed_podcast_episode_state_keys(episode: dict[str, object]) -> list[str]:
     keys: list[str] = []
     show_key = str(episode.get("show_key") or "").strip()
     episode_id = str(episode.get("episode_id") or "").strip()
     if show_key and episode_id:
         keys.append(_daily_podcast_episode_state_key(show_key, episode_id))
-    fallback_key = _daily_podcast_episode_fallback_key(episode)
+    fallback_key = _fixed_podcast_episode_fallback_key(episode)
     if fallback_key:
         keys.append(fallback_key)
+    content_key = _fixed_podcast_episode_content_key(episode)
+    if content_key and content_key not in keys:
+        keys.append(content_key)
     return keys
+
+
+def _daily_podcast_episode_state_keys(episode: dict[str, object]) -> list[str]:
+    return _fixed_podcast_episode_state_keys(episode)
 
 
 def _daily_podcast_state_path_exists(state_value: str | None) -> bool:
@@ -1660,18 +1987,152 @@ def _daily_podcast_state_path_exists(state_value: str | None) -> bool:
         return False
 
 
-def _is_daily_podcast_episode_processed(episode: dict[str, object]) -> bool:
-    for key in _daily_podcast_episode_state_keys(episode):
-        state_value = get_sync_state("daily_podcast_episode", key)
-        if state_value and _daily_podcast_state_path_exists(state_value):
+def _extract_markdown_metadata(path: Path) -> dict[str, str]:
+    meta: dict[str, str] = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for idx, line in enumerate(fh):
+                if idx > 80:
+                    break
+                stripped = line.strip()
+                if stripped == "---" and idx > 0:
+                    break
+                if stripped.startswith("# ") and "title" not in meta:
+                    meta["title"] = stripped[2:].strip()
+                    continue
+                m = re.match(r"^-\s+\*\*(.+?):\*\*\s*(.*)$", stripped)
+                if m:
+                    meta[m.group(1).strip().lower()] = m.group(2).strip()
+    except OSError:
+        return {}
+    return meta
+
+
+def _normalize_episode_title_for_match(text: str) -> str:
+    return _clean_plain_text(str(text or "")).strip().lower()
+
+
+def _fixed_podcast_title_matches(saved_title: str, episode: dict[str, object]) -> bool:
+    episode_title = _normalize_episode_title_for_match(str(episode.get("title") or ""))
+    if not episode_title:
+        return False
+    saved = _normalize_episode_title_for_match(saved_title)
+    if saved == episode_title:
+        return True
+    for prefix in (
+        str(episode.get("show_name") or ""),
+        str(episode.get("show_label") or ""),
+    ):
+        normalized_prefix = _normalize_episode_title_for_match(prefix)
+        if normalized_prefix and saved.startswith(normalized_prefix):
+            remainder = saved[len(normalized_prefix) :].strip(" -:|")
+            if remainder == episode_title:
+                return True
+    return saved.endswith(episode_title) and len(episode_title) >= 16
+
+
+def _find_existing_fixed_podcast_transcript(episode: dict[str, object], output_dir: Path) -> Path | None:
+    try:
+        if not output_dir.exists():
+            return None
+    except OSError:
+        return None
+    show_key = str(episode.get("show_key") or "").strip()
+    episode_id = str(episode.get("episode_id") or "").strip()
+    publish_day = str(episode.get("publish_date") or "").strip()[:10]
+    source_url = str(episode.get("source_url") or "").strip()
+    try:
+        candidates = sorted(
+            output_dir.rglob("*.md"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for path in candidates:
+        meta = _extract_markdown_metadata(path)
+        if not meta:
+            continue
+        saved_show_key = meta.get("show key", "")
+        saved_episode_id = meta.get("episode id", "")
+        if show_key and episode_id and saved_show_key == show_key and saved_episode_id == episode_id:
+            return path
+        saved_publish_day = meta.get("publish date", "")[:10]
+        saved_source = meta.get("source", "")
+        title_candidates = [meta.get("title", ""), path.stem]
+        title_matches = any(_fixed_podcast_title_matches(title, episode) for title in title_candidates)
+        if not title_matches:
+            continue
+        if show_key and saved_show_key and saved_show_key != show_key:
+            continue
+        if publish_day and saved_publish_day and publish_day != saved_publish_day:
+            continue
+        if source_url and saved_source and saved_source != source_url and episode_id and not saved_episode_id:
+            continue
+        return path
+    return None
+
+
+def _is_fixed_podcast_episode_processed(
+    provider: str,
+    episode: dict[str, object],
+    *,
+    path_exists_checker: Callable[[str | None], bool] | None = None,
+    output_dir: Path | None = None,
+) -> bool:
+    exists_fn = path_exists_checker or _daily_podcast_state_path_exists
+    for key in _fixed_podcast_episode_state_keys(episode):
+        state_value = get_sync_state(provider, key)
+        if state_value and exists_fn(state_value):
             return True
+    if output_dir and _find_existing_fixed_podcast_transcript(episode, output_dir):
+        return True
     return False
 
 
-def _mark_daily_podcast_episode_processed(episode: dict[str, object], transcript_path: Path) -> None:
+def _is_daily_podcast_episode_processed(episode: dict[str, object]) -> bool:
+    return _is_fixed_podcast_episode_processed(
+        "daily_podcast_episode",
+        episode,
+        path_exists_checker=_daily_podcast_state_path_exists,
+        output_dir=DAILY_PODCAST_DIR,
+    )
+
+
+def _is_china_podcast_episode_processed(episode: dict[str, object]) -> bool:
+    return _is_fixed_podcast_episode_processed(
+        "china_podcast_episode",
+        episode,
+        path_exists_checker=_daily_podcast_state_path_exists,
+        output_dir=CHINA_PODCAST_DIR,
+    )
+
+
+def _is_house_podcast_episode_processed(episode: dict[str, object]) -> bool:
+    return _is_fixed_podcast_episode_processed(
+        "house_podcast_episode",
+        episode,
+        path_exists_checker=_daily_podcast_state_path_exists,
+        output_dir=HOUSE_PODCAST_DIR,
+    )
+
+
+def _mark_fixed_podcast_episode_processed(provider: str, episode: dict[str, object], transcript_path: Path) -> None:
     transcript_value = str(transcript_path)
-    for key in _daily_podcast_episode_state_keys(episode):
-        upsert_sync_state("daily_podcast_episode", key, transcript_value)
+    for key in _fixed_podcast_episode_state_keys(episode):
+        upsert_sync_state(provider, key, transcript_value)
+
+
+def _mark_daily_podcast_episode_processed(episode: dict[str, object], transcript_path: Path) -> None:
+    _mark_fixed_podcast_episode_processed("daily_podcast_episode", episode, transcript_path)
+
+
+def _mark_china_podcast_episode_processed(episode: dict[str, object], transcript_path: Path) -> None:
+    _mark_fixed_podcast_episode_processed("china_podcast_episode", episode, transcript_path)
+
+
+def _mark_house_podcast_episode_processed(episode: dict[str, object], transcript_path: Path) -> None:
+    _mark_fixed_podcast_episode_processed("house_podcast_episode", episode, transcript_path)
 
 
 def _build_transcript_ai_summary(transcript_path: Path, title: str) -> str | None:
@@ -1850,6 +2311,8 @@ def _localize_transcribe_status(status: str) -> str:
     if not s:
         return ""
     lower = s.lower()
+    if lower.startswith("warning: cannot detect duration"):
+        return ""
     if lower.startswith("checking video info"):
         return "正在取得媒體資訊..."
     if lower.startswith("downloading"):
@@ -2043,7 +2506,7 @@ async def _postprocess_transcript_output(
             await send_message(chat_id, chunk)
 
 
-def _fetch_latest_daily_podcast_episode(tx, show: dict[str, str]) -> dict[str, object]:
+def _fetch_latest_fixed_podcast_episode(tx, show: dict[str, str]) -> dict[str, object]:
     episodes = tx.fetch_apple_podcast_episodes(show["url"])
     if not episodes:
         raise ValueError(f"找不到最新集數：{show['label']}")
@@ -2054,19 +2517,40 @@ def _fetch_latest_daily_podcast_episode(tx, show: dict[str, str]) -> dict[str, o
     return episode
 
 
-async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
+def _format_fixed_podcast_failure(label: str, error: Exception | str) -> str:
+    message = str(error or "").strip()
+    if message.startswith("Transcription appears stalled at 0%"):
+        return f"{label}：轉錄逾時，長時間停在 0%；建議改用較小模型或縮短音訊"
+    return f"{label}：{message}" if message else f"{label}：失敗"
+
+
+async def _handle_fixed_podcast_command(
+    chat_id: int,
+    text: str,
+    *,
+    command_name: str,
+    shows: tuple[dict[str, str], ...],
+    usage_text: str,
+    resolve_selection: Callable[[str], tuple[list[dict[str, str]], str | None]],
+    fetch_latest_episode,
+    is_episode_processed: Callable[[dict[str, object]], bool],
+    mark_episode_processed,
+    output_dir: Path,
+    summary_label: str,
+    cancel_label: str,
+) -> bool:
     if not FEATURE_TRANSCRIBE_ENABLED:
         return False
-    raw_args = _extract_daily_podcast_args(text)
+    raw_args = _extract_fixed_podcast_args(text, command_name)
     if raw_args is None:
         return False
-    if not raw_args or raw_args.lower() == "list":
-        await send_message(chat_id, _build_daily_podcast_usage())
+    if raw_args.lower() == "list":
+        await send_message(chat_id, usage_text)
         return True
 
-    selected, error = _resolve_daily_podcast_selection(raw_args)
+    selected, error = resolve_selection(raw_args)
     if error:
-        await send_message(chat_id, f"{error}\n\n{_build_daily_podcast_usage()}")
+        await send_message(chat_id, f"{error}\n\n{usage_text}")
         return True
     try:
         tx = _load_transcription_module()
@@ -2094,7 +2578,7 @@ async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
             if cancel_event.is_set():
                 raise TranscribeJobCancelled("Cancelled by user.")
             planning_percent = int((idx - 1) * 15 / max(1, len(selected)))
-            status = _build_daily_podcast_progress_message(
+            status = _build_fixed_podcast_progress_message(
                 planning_percent,
                 f"批次進度：0/{len(selected)}",
                 show["label"],
@@ -2104,15 +2588,13 @@ async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
             if progress_message_id:
                 await edit_message(chat_id, progress_message_id, status)
             try:
-                episode = await asyncio.to_thread(_fetch_latest_daily_podcast_episode, tx, show)
-                episode_id = str(episode.get("episode_id") or "").strip()
-                if _is_daily_podcast_episode_processed(episode):
-                    reason = f"episode_id={episode_id}" if episode_id else "fallback key matched"
-                    skipped.append(f"{show['label']}：已處理過最新一集（{reason}）")
+                episode = await asyncio.to_thread(fetch_latest_episode, tx, show)
+                if is_episode_processed(episode):
+                    skipped.append(f"{show['label']}：已處理過最新一集")
                     continue
                 episodes.append(episode)
             except Exception as e:
-                failures.append(f"{show['label']}：{e}")
+                failures.append(_format_fixed_podcast_failure(show["label"], e))
 
         if not episodes:
             lines = ["沒有可轉錄的 podcast 集數。"]
@@ -2121,12 +2603,9 @@ async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
             await send_message(chat_id, "\n".join(lines))
             return True
 
-        whisper_model = getattr(tx, "WHISPER_MODEL", "small")
-        total_estimate_seconds = _estimate_daily_podcast_total_seconds(episodes, whisper_model)
         intro_lines = [
             f"即將開始批次轉錄 {len(episodes)} 個節目",
-            f"輸出資料夾：{DAILY_PODCAST_DIR / datetime.now(tz=get_local_tz()).date().isoformat()}",
-            f"估計總耗時：約 {_format_seconds_rough(total_estimate_seconds)}",
+            f"輸出資料夾：{output_dir / datetime.now(tz=get_local_tz()).date().isoformat()}",
         ]
         if failures:
             intro_lines.append(f"略過 {len(failures)} 個節目，原因見下方。")
@@ -2148,17 +2627,16 @@ async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
             await edit_message(
                 chat_id,
                 progress_message_id,
-                _build_daily_podcast_progress_message(
+                _build_fixed_podcast_progress_message(
                     15,
                     f"批次進度：0/{len(episodes)}",
                     "待開始",
                     "待開始",
                     start_text,
-                    total_estimate_seconds=total_estimate_seconds,
                 ),
             )
 
-        successes: list[str] = []
+        successes: list[tuple[str, str]] = []
         for idx, episode in enumerate(episodes, start=1):
             if cancel_event.is_set():
                 raise TranscribeJobCancelled("Cancelled by user.")
@@ -2169,29 +2647,36 @@ async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
             def _build_episode_status_text(status_text: str, raw_status: str | None = None) -> str:
                 stage_progress = _estimate_transcribe_stage_progress(raw_status or "", status_text)
                 overall_percent = 15 + int((((idx - 1) + stage_progress) / episode_count) * 80)
-                return _build_daily_podcast_progress_message(
+                return _build_fixed_podcast_progress_message(
                     overall_percent,
                     f"批次進度：{idx}/{len(episodes)}",
                     show_label,
                     episode_title,
                     status_text,
-                    total_estimate_seconds=total_estimate_seconds,
                 )
 
-            intro_text = _build_daily_podcast_progress_message(
+            intro_text = _build_fixed_podcast_progress_message(
                 15 + int(((idx - 1) / episode_count) * 80),
                 f"批次進度：{idx}/{len(episodes)}",
                 show_label,
                 episode_title,
                 "準備開始轉錄",
-                total_estimate_seconds=total_estimate_seconds,
             )
             try:
+                transcribe_episode = getattr(tx, "transcribe_podcast_episode_to_markdown", None)
+                if transcribe_episode is None:
+                    transcribe_episode = lambda ep, out_dir, tmp_dir, on_status=None, cancel_event=None: tx.transcribe_url_to_markdown(
+                        str(ep["source_url"]),
+                        out_dir,
+                        tmp_dir,
+                        on_status=on_status,
+                        cancel_event=cancel_event,
+                    )
                 (_title, out_path), progress_message_id = await _run_transcribe_job_with_progress(
                     chat_id,
-                    lambda on_status, source_url=str(episode["source_url"]): tx.transcribe_url_to_markdown(
-                        source_url,
-                        DAILY_PODCAST_DIR,
+                    lambda on_status, ep=dict(episode): transcribe_episode(
+                        ep,
+                        output_dir,
                         TRANSCRIPTS_TMP_DIR,
                         on_status=on_status,
                         cancel_event=cancel_event,
@@ -2202,19 +2687,18 @@ async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
                     progress_message_id=progress_message_id,
                     status_text_builder=_build_episode_status_text,
                 )
-                successes.append(f"{show_label} -> {out_path.name}")
+                successes.append((f"{show_label}: {out_path.name}", _local_file_uri(out_path)))
                 await asyncio.to_thread(
-                    _mark_daily_podcast_episode_processed,
+                    mark_episode_processed,
                     episode,
                     out_path,
                 )
-                done_text = _build_daily_podcast_progress_message(
+                done_text = _build_fixed_podcast_progress_message(
                     15 + int((idx / episode_count) * 80),
                     f"批次進度：{idx}/{len(episodes)}",
                     show_label,
                     episode_title,
                     f"已完成並存檔：{out_path.name}",
-                    total_estimate_seconds=total_estimate_seconds,
                 )
                 if progress_message_id:
                     await edit_message(chat_id, progress_message_id, done_text)
@@ -2224,45 +2708,50 @@ async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
                 )
                 if is_cancelled:
                     raise
-                failures.append(f"{show_label}：{e}")
-                err_text = _build_daily_podcast_progress_message(
+                failures.append(_format_fixed_podcast_failure(show_label, e))
+                err_text = _build_fixed_podcast_progress_message(
                     15 + int((idx / episode_count) * 80),
                     f"批次進度：{idx}/{len(episodes)}",
                     show_label,
                     episode_title,
                     f"此節目轉錄失敗：{e}",
-                    total_estimate_seconds=total_estimate_seconds,
                 )
                 if progress_message_id:
                     await edit_message(chat_id, progress_message_id, err_text)
 
         summary_lines = [
-            f"daily podcast 批次完成：成功 {len(successes)}，失敗 {len(failures)}",
-            f"輸出資料夾：{DAILY_PODCAST_DIR / datetime.now(tz=get_local_tz()).date().isoformat()}",
+            escape(f"完成：成功 {len(successes)}，失敗 {len(failures)}，跳過 {len(skipped)}"),
+            escape(f"輸出：{output_dir / datetime.now(tz=get_local_tz()).date().isoformat()}"),
         ]
-        if skipped:
-            summary_lines.append(f"已跳過 {len(skipped)} 個已處理節目")
         if successes:
-            summary_lines.extend(f"- {item}" for item in successes)
+            summary_lines.append("成功：")
+            summary_lines.extend(
+                f'- <a href="{escape(uri, quote=True)}">{escape(label)}</a>'
+                for label, uri in successes
+            )
         if failures:
-            summary_lines.extend(f"- {item}" for item in failures)
+            summary_lines.append("失敗：")
+            summary_lines.extend(f"- {escape(item)}" for item in failures)
         if skipped:
-            summary_lines.extend(f"- {item}" for item in skipped)
+            summary_lines.append("跳過：")
+            summary_lines.extend(f"- {escape(item)}" for item in skipped)
+        summary_text = "\n".join(summary_lines)
         if progress_message_id:
             await edit_message(
                 chat_id,
                 progress_message_id,
-                _build_daily_podcast_progress_message(
+                _build_fixed_podcast_progress_message(
                     100,
                     f"批次進度：{len(episodes)}/{len(episodes)}",
                     "全部完成",
                     "全部完成",
-                    "\n".join(summary_lines),
-                    total_estimate_seconds=total_estimate_seconds,
+                    summary_text,
                 ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
             )
         else:
-            await send_message(chat_id, "\n".join(summary_lines))
+            await send_message(chat_id, summary_text, parse_mode="HTML", disable_web_page_preview=True)
         return True
     except Exception as e:
         is_cancelled = isinstance(e, TranscribeJobCancelled) or (
@@ -2271,7 +2760,7 @@ async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
         if is_cancelled:
             cancel_text = _build_transcribe_status_message(
                 "",
-                "已取消 daily podcast 批次轉錄",
+                cancel_label,
             )
             if progress_message_id:
                 await edit_message(chat_id, progress_message_id, cancel_text)
@@ -2282,6 +2771,57 @@ async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
     finally:
         _clear_transcribe_job(chat_id, job_id)
         await _dismiss_transcribe_busy_notices(chat_id)
+
+
+async def handle_daily_podcast_command(chat_id: int, text: str) -> bool:
+    return await _handle_fixed_podcast_command(
+        chat_id,
+        text,
+        command_name="/daily_podcast",
+        shows=DAILY_PODCAST_SHOWS,
+        usage_text=_build_daily_podcast_usage(),
+        resolve_selection=_resolve_daily_podcast_selection,
+        fetch_latest_episode=_fetch_latest_fixed_podcast_episode,
+        is_episode_processed=_is_daily_podcast_episode_processed,
+        mark_episode_processed=_mark_daily_podcast_episode_processed,
+        output_dir=DAILY_PODCAST_DIR,
+        summary_label="daily podcast",
+        cancel_label="已取消 daily podcast 批次轉錄",
+    )
+
+
+async def handle_china_podcast_command(chat_id: int, text: str) -> bool:
+    return await _handle_fixed_podcast_command(
+        chat_id,
+        text,
+        command_name="/china_podcast",
+        shows=CHINA_PODCAST_SHOWS,
+        usage_text=_build_china_podcast_usage(),
+        resolve_selection=_resolve_china_podcast_selection,
+        fetch_latest_episode=_fetch_latest_fixed_podcast_episode,
+        is_episode_processed=_is_china_podcast_episode_processed,
+        mark_episode_processed=_mark_china_podcast_episode_processed,
+        output_dir=CHINA_PODCAST_DIR,
+        summary_label="china podcast",
+        cancel_label="已取消 china podcast 批次轉錄",
+    )
+
+
+async def handle_house_podcast_command(chat_id: int, text: str) -> bool:
+    return await _handle_fixed_podcast_command(
+        chat_id,
+        text,
+        command_name="/house_podcast",
+        shows=HOUSE_PODCAST_SHOWS,
+        usage_text=_build_house_podcast_usage(),
+        resolve_selection=_resolve_house_podcast_selection,
+        fetch_latest_episode=_fetch_latest_fixed_podcast_episode,
+        is_episode_processed=_is_house_podcast_episode_processed,
+        mark_episode_processed=_mark_house_podcast_episode_processed,
+        output_dir=HOUSE_PODCAST_DIR,
+        summary_label="house podcast",
+        cancel_label="已取消 house podcast 批次轉錄",
+    )
 
 
 async def _dismiss_transcribe_busy_notices(chat_id: int) -> None:
@@ -2393,6 +2933,53 @@ def _extract_audio_attachment(message: dict) -> tuple[str, str] | None:
     return None
 
 
+def _extract_audio_attachment_file_size(message: dict) -> int | None:
+    for key in ("audio", "voice", "document"):
+        item = message.get(key) or {}
+        raw_size = item.get("file_size")
+        if raw_size is None:
+            continue
+        try:
+            size = int(raw_size)
+        except Exception:
+            continue
+        if size >= 0:
+            return size
+    return None
+
+
+def _format_bytes_rough(size: int | float | None) -> str:
+    if size is None:
+        return "未知大小"
+    try:
+        value = float(size)
+    except Exception:
+        return "未知大小"
+    units = ("B", "KiB", "MiB", "GiB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GiB"
+
+
+def _is_telegram_getfile_too_large(file_size: int | None) -> bool:
+    return bool(TELEGRAM_GETFILE_MAX_BYTES and file_size and file_size > TELEGRAM_GETFILE_MAX_BYTES)
+
+
+def _build_telegram_file_too_large_message(file_size: int | None = None) -> str:
+    limit_text = _format_bytes_rough(TELEGRAM_GETFILE_MAX_BYTES) if TELEGRAM_GETFILE_MAX_BYTES else "目前設定"
+    size_line = f"檔案大小：{_format_bytes_rough(file_size)}\n" if file_size else ""
+    return (
+        f"{size_line}"
+        f"無法直接轉錄這個 Telegram 上傳檔：檔案超過 Bot API getFile 可下載大小限制（{limit_text}）。\n"
+        "這不是 Whisper 轉錄限制，而是 bot 無法從 Telegram 取回原檔。\n"
+        "請改用 /transcribe <可下載的音訊 URL>，或先把音訊壓縮/切成較小檔案後再上傳。"
+    )
+
+
 def _download_telegram_file(file_id: str, dest_path: Path) -> None:
     file_url, _file_path = telegram_get_file_info(file_id)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2487,6 +3074,10 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
             f"不支援的檔案格式：{ext}\n支援：{', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}",
         )
         return True
+    file_size = _extract_audio_attachment_file_size(message)
+    if _is_telegram_getfile_too_large(file_size):
+        await send_message(chat_id, _build_telegram_file_too_large_message(file_size))
+        return True
 
     temp_input = TRANSCRIPTS_TMP_DIR / f"{uuid.uuid4()}{ext}"
     job_id = str(uuid.uuid4())
@@ -2545,6 +3136,15 @@ async def handle_transcribe_audio_message(chat_id: int, message: dict, message_t
             else:
                 await send_message(chat_id, cancel_text)
             await _dismiss_transcribe_busy_notices(chat_id)
+            return True
+        if isinstance(e, TelegramFileTooLargeError):
+            err_text = str(e)
+            if progress_msg_id:
+                ok = await edit_message(chat_id, progress_msg_id, err_text)
+                if not ok:
+                    await send_message(chat_id, err_text)
+            else:
+                await send_message(chat_id, err_text)
             return True
         err_text = _build_transcribe_status_message(intro_text, f"轉錄失敗：{e}")
         if progress_msg_id:
@@ -2619,22 +3219,26 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
     if text_lower.startswith("/notion_test"):
         return "請在私訊中使用 /notion_test。"
 
-    if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_latest"):
+    if FEATURE_NEWS_ENABLED and _get_slash_command_name(text) == "/news_latest":
         suffix = text.strip()[len("/news_latest") :].strip()
         if suffix:
             return "\n".join(handle_news_command(f"/news {suffix}".strip(), ""))
         return "\n".join(handle_news_command("/news", ""))
-    if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_sources"):
-        return "\n".join(handle_news_command("/news sources", ""))
-    if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_debug"):
+    if FEATURE_NEWS_ENABLED and _get_slash_command_name(text) == "/house_news":
+        return "\n".join(handle_news_command(text, "", user_id=user_id, user_name=user_name))
+    if FEATURE_NEWS_ENABLED and _get_slash_command_name(text) == "/news_source":
+        return "\n".join(handle_news_command("/news_source", ""))
+    if FEATURE_NEWS_ENABLED and _get_slash_command_name(text) == "/news_sources":
+        return "\n".join(handle_news_command("/news_sources", ""))
+    if FEATURE_NEWS_ENABLED and _get_slash_command_name(text) == "/news_debug":
         return "\n".join(handle_news_command("/news debug", ""))
-    if FEATURE_NEWS_ENABLED and text_lower.startswith("/news_help"):
+    if FEATURE_NEWS_ENABLED and _get_slash_command_name(text) == "/news_help":
         return "\n".join(handle_news_command("/news help", ""))
 
-    if text_lower.startswith("/news"):
+    if _get_slash_command_name(text) == "/news":
         if not FEATURE_NEWS_ENABLED:
             return "新聞功能已關閉。"
-        return "用法：/news | /news search <keywords> | /news sources | /news add <url> | /news remove <id> | /news enable <id> | /news disable <id> | /news help"
+        return "用法：/news | /house_news | /news_source | /news search <keywords> | /news add <url> | /news remove <id> | /news enable <id> | /news disable <id> | /news help"
 
     if text_lower.startswith("open "):
         if not _is_allowed_control_user(user_id, user_name):
@@ -2675,7 +3279,7 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
         if APP_PROFILE == "chitchat":
             cmds.append("/notion_test")
         if FEATURE_NEWS_ENABLED:
-            cmds.extend(["/news", "/news sources"])
+            cmds.extend(["/news", "/house_news", "/news_source"])
         if FEATURE_TRANSCRIBE_ENABLED:
             cmds.append("/transcribe <url>")
             cmds.append("/cancel")
@@ -2695,11 +3299,11 @@ def route_user_text_command(
     cmd_text = (text or "").strip()
     lower = cmd_text.lower()
 
-    if FEATURE_NEWS_ENABLED and lower.startswith("/news"):
+    if FEATURE_NEWS_ENABLED and _is_news_command_text(cmd_text):
         replies = handle_news_command(cmd_text, chat_id, user_id=user_id, user_name=user_name)
-        tokens = cmd_text.split()
-        sub = tokens[1].lower() if len(tokens) > 1 else ""
-        parse_mode = "HTML" if sub in {"", "latest"} else None
+        command = _get_slash_command_name(cmd_text)
+        sub = _get_news_command_subcommand(cmd_text)
+        parse_mode = "HTML" if command in {"/news", "/news_latest", "/house_news"} and sub in {"", "latest"} else None
         disable_preview = True if parse_mode == "HTML" else None
         return replies, parse_mode, disable_preview
 
@@ -6105,15 +6709,36 @@ def _parse_news_markdown_entries(text: str) -> list[dict[str, str]]:
     return entries
 
 
-def _load_recent_news_entries_from_local(now: datetime | None = None) -> list[dict[str, str]]:
+def _is_house_news_source(source: str | None) -> bool:
+    normalized = (source or "").strip()
+    return normalized in HOUSE_NEWS_SOURCE_NAMES or normalized.startswith("信義")
+
+
+def _is_house_news_url(url: str | None) -> bool:
+    normalized = (url or "").strip().rstrip("/")
+    return normalized in {u.rstrip("/") for u in HOUSE_NEWS_FEED_URLS}
+
+
+def _filter_news_entries_by_scope(items: list[dict[str, str]], scope: str) -> list[dict[str, str]]:
+    normalized_scope = (scope or "news").strip().lower()
+    if normalized_scope == "house":
+        return [item for item in items if _is_house_news_source(item.get("source"))]
+    return [item for item in items if not _is_house_news_source(item.get("source"))]
+
+
+def _load_recent_news_entries_from_local(
+    now: datetime | None = None,
+    *,
+    scope: str = "news",
+    lookback_hours: int = 24,
+) -> list[dict[str, str]]:
     current = now or datetime.now(tz=get_local_tz())
-    cutoff = current - timedelta(hours=24)
-    day_keys = {
-        current.strftime("%Y-%m-%d"),
-        current.strftime("%Y%m%d"),
-        cutoff.strftime("%Y-%m-%d"),
-        cutoff.strftime("%Y%m%d"),
-    }
+    cutoff = current - timedelta(hours=lookback_hours)
+    day_keys: set[str] = set()
+    for days_back in range((lookback_hours // 24) + 2):
+        day = current - timedelta(days=days_back)
+        day_keys.add(day.strftime("%Y-%m-%d"))
+        day_keys.add(day.strftime("%Y%m%d"))
     candidates = sorted(
         [
             fp
@@ -6136,6 +6761,7 @@ def _load_recent_news_entries_from_local(now: datetime | None = None) -> list[di
                 continue
             item["published_at"] = ts_local.isoformat()
             items.append(item)
+    items = _filter_news_entries_by_scope(items, scope)
     items.sort(key=lambda row: row.get("published_at", ""), reverse=True)
     return items
 
@@ -6170,27 +6796,38 @@ def _render_news_entries_html(items: list[dict[str, str]], *, header: str) -> st
     return "\n".join(lines).rstrip()
 
 
-def build_recent_news_links_html(now: datetime | None = None) -> str:
+def build_recent_news_links_html(now: datetime | None = None, *, scope: str = "news") -> str:
     current = now or datetime.now(tz=get_local_tz())
-    items = _load_recent_news_entries_from_local(now=current)
+    lookback = 72 if scope == "house" else 24
+    items = _load_recent_news_entries_from_local(now=current, scope=scope, lookback_hours=lookback)
     if not items and DROPBOX_SYNC_ENABLED:
         sync_dropbox_news_to_local(full_scan=True)
-        items = _load_recent_news_entries_from_local(now=current)
-    return _render_news_entries_html(items, header="最近 24 小時新聞")
+        items = _load_recent_news_entries_from_local(now=current, scope=scope, lookback_hours=lookback)
+    header = "最近 72 小時房市新聞" if scope == "house" else "最近 24 小時新聞"
+    return _render_news_entries_html(items, header=header)
 
 
 def _is_recent_news_command(text: str) -> bool:
     tokens = (text or "").strip().split()
-    if not tokens or tokens[0].lower() != "/news":
+    if not tokens:
+        return False
+    command = tokens[0].lower().split("@", 1)[0]
+    if command not in {"/news", "/house_news"}:
         return False
     return len(tokens) == 1 or tokens[1].lower() == "latest"
 
 
-def _build_recent_news_email_subject(now: datetime | None = None) -> str:
+def _get_news_email_scope(text: str) -> str:
+    command = _get_slash_command_name(text)
+    return "house" if command == "/house_news" else "news"
+
+
+def _build_recent_news_email_subject(now: datetime | None = None, *, scope: str = "news") -> str:
     current = now or datetime.now(tz=get_local_tz())
-    ts = current.strftime("%Y-%m-%d %H:%M")
-    prefix = NEWS_EMAIL_SUBJECT_PREFIX or "[JAT News]"
-    return f"{prefix} 最近 24 小時新聞 {ts}"
+    ts = current.strftime("%Y-%m-%d")
+    prefix = HOUSE_NEWS_EMAIL_SUBJECT_PREFIX if scope == "house" else NEWS_EMAIL_SUBJECT_PREFIX
+    prefix = prefix or ("[HOUSE News]" if scope == "house" else "[JAT News]")
+    return f"{prefix} {ts}"
 
 
 def _news_html_to_plain_text(html: str) -> str:
@@ -6222,14 +6859,51 @@ def _get_recent_news_email_status() -> tuple[bool, str]:
     return True, f"新聞 email 已啟用，將寄送至: {', '.join(NEWS_EMAIL_TO)}"
 
 
-def _send_recent_news_email(html: str, *, now: datetime | None = None) -> bool:
+def _get_recent_news_drive_export_status() -> tuple[bool, str]:
+    if not NEWS_EXPORT_WEBHOOK_URL:
+        return False, "Drive 匯出未觸發：請設定 NEWS_EXPORT_WEBHOOK_URL。"
+    if not NEWS_EXPORT_WEBHOOK_SECRET:
+        return False, "Drive 匯出未觸發：請設定 NEWS_EXPORT_WEBHOOK_SECRET。"
+    return True, "Drive 匯出 webhook 已啟用。"
+
+
+def _trigger_recent_news_drive_export(*, scope: str = "news") -> tuple[bool, str]:
+    export_ready, export_status = _get_recent_news_drive_export_status()
+    if not export_ready:
+        if export_status:
+            logger.info("skip news drive export: %s", export_status)
+        return False, export_status
+
+    action = "export_house_news" if scope == "house" else "export_jat_news"
+    payload = {
+        "secret": NEWS_EXPORT_WEBHOOK_SECRET,
+        "action": action,
+    }
+    try:
+        resp = requests.post(
+            NEWS_EXPORT_WEBHOOK_URL,
+            json=payload,
+            timeout=NEWS_EXPORT_WEBHOOK_TIMEOUT_SECONDS,
+        )
+        body = resp.text[:500]
+        if 200 <= resp.status_code < 300:
+            logger.info("news drive export webhook accepted action=%s: %s", action, body)
+            return True, "已觸發 Google Drive 匯出"
+        logger.warning("news drive export webhook failed: status=%s body=%s", resp.status_code, body)
+        return False, f"Drive 匯出觸發失敗：HTTP {resp.status_code}"
+    except Exception as exc:
+        logger.warning("news drive export webhook error: %s: %s", type(exc).__name__, exc)
+        return False, f"Drive 匯出觸發失敗：{type(exc).__name__}"
+
+
+def _send_recent_news_email(html: str, *, now: datetime | None = None, scope: str = "news") -> bool:
     email_ready, email_status = _get_recent_news_email_status()
     if not email_ready:
         logger.info("skip news email: %s", email_status)
         return False
 
     message = EmailMessage()
-    message["Subject"] = _build_recent_news_email_subject(now=now)
+    message["Subject"] = _build_recent_news_email_subject(now=now, scope=scope)
     message["From"] = NEWS_EMAIL_FROM
     message["To"] = ", ".join(NEWS_EMAIL_TO)
     plain_text = _news_html_to_plain_text(html)
@@ -7335,10 +8009,25 @@ def get_default_news_feeds() -> list[tuple[str, str]]:
         ("SemiAnalysis", "https://semianalysis.com/feed/"),
         ("Nikkei Asia", "https://asia.nikkei.com/rss/feed/nar"),
         ("Nikkei Asia Technology", "https://asia.nikkei.com/rss/feed/technology"),
+        ("信義房屋每日新聞", SINYI_DAILYNEWS_URL),
+        ("台灣房屋新聞", TWHG_NEWS_URL),
+        ("經濟日報房市", UDN_HOUSE_RSS_URL),
+        ("工商時報房市(GNews)", CTEE_HOUSE_GNEWS_URL),
+        ("好房網News(GNews)", HOUSEFUN_GNEWS_URL),
+        ("Caixin Global(GNews)", CAIXIN_GLOBAL_GNEWS_URL),
+        ("紐約時報中文網", "https://cn.nytimes.com/rss/"),
+        ("Reuters China(GNews)", REUTERS_CHINA_GNEWS_URL),
+        ("SCMP China", "https://www.scmp.com/rss/4/feed"),
+        ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+        ("MIT Technology Review", "https://www.technologyreview.com/feed/"),
+        ("IEEE Spectrum", "https://spectrum.ieee.org/rss/fulltext"),
+        ("VentureBeat AI", "https://venturebeat.com/category/ai/feed/"),
+        ("The Decoder", "https://the-decoder.com/feed/"),
+        *[(name, url) for url, name in RER_NCCU_LIST_URLS.items()],
     ]
 
 
-def list_news_feeds() -> list[tuple[int, str, str, int]]:
+def list_news_feeds(*, scope: str | None = None) -> list[tuple[int, str, str, int]]:
     with _connect_db() as conn:
         try:
             rows = conn.execute(
@@ -7349,27 +8038,39 @@ def list_news_feeds() -> list[tuple[int, str, str, int]]:
                 """
             ).fetchall()
             conn.commit()
-            return [(int(feed_id), str(name), str(url), int(enabled)) for feed_id, name, url, enabled in rows]
+            result = [(int(feed_id), str(name), str(url), int(enabled)) for feed_id, name, url, enabled in rows]
+            if scope:
+                urls = set(_filter_feed_urls_by_scope([url for _feed_id, _name, url, _enabled in result], scope))
+                result = [row for row in result if row[2] in urls]
+            return result
         except sqlite3.OperationalError:
             return []
 
 
-def get_news_rss_urls() -> list[str]:
+def _filter_feed_urls_by_scope(urls: list[str], scope: str) -> list[str]:
+    normalized_scope = (scope or "news").strip().lower()
+    if normalized_scope == "house":
+        return [url for url in urls if _is_house_news_url(url)]
+    return [url for url in urls if not _is_house_news_url(url)]
+
+
+def get_news_rss_urls(*, scope: str = "news") -> list[str]:
     if NEWS_RSS_URLS_FILE:
         path = Path(NEWS_RSS_URLS_FILE)
         if path.exists():
             raw = path.read_text(encoding="utf-8").splitlines()
-            return [u.strip() for u in raw if u.strip()]
+            return _filter_feed_urls_by_scope([u.strip() for u in raw if u.strip()], scope)
 
     if NEWS_RSS_URLS_ENV:
         raw = NEWS_RSS_URLS_ENV.splitlines()
-        return [u.strip() for u in raw if u.strip()]
+        return _filter_feed_urls_by_scope([u.strip() for u in raw if u.strip()], scope)
 
     db_feeds = list_news_feeds()
     if db_feeds or FEATURE_NEWS_ENABLED:
-        return [url for _feed_id, _name, url, enabled in db_feeds if enabled]
+        urls = [url for _feed_id, _name, url, enabled in db_feeds if enabled]
+        return _filter_feed_urls_by_scope(urls, scope)
 
-    return [url for _name, url in get_default_news_feeds()]
+    return _filter_feed_urls_by_scope([url for _name, url in get_default_news_feeds()], scope)
 
 
 def _validate_news_feed_url(url: str) -> str:
@@ -7520,7 +8221,386 @@ def parse_entry_datetime(entry) -> datetime | None:
     return datetime.fromtimestamp(ts, tz=get_local_tz())
 
 
+class _SinyiDailyNewsHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.texts: list[str] = []
+        self.links: list[dict[str, object]] = []
+        self._link_href: str | None = None
+        self._link_text: list[str] = []
+        self._link_text_pos = 0
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._skip_depth += 1
+            return
+        if tag != "a":
+            return
+        href = dict(attrs).get("href") or ""
+        if "/dailynews/newsct/" not in href:
+            return
+        self._link_href = href
+        self._link_text = []
+        self._link_text_pos = len(self.texts)
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        text = re.sub(r"\s+", " ", data or "").strip()
+        if not text:
+            return
+        self.texts.append(text)
+        if self._link_href:
+            self._link_text.append(text)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if tag != "a" or not self._link_href:
+            return
+        title = re.sub(r"\s+", " ", " ".join(self._link_text)).strip()
+        if title and title.lower() not in {"image", "read more +"}:
+            self.links.append(
+                {
+                    "href": self._link_href,
+                    "title": title,
+                    "text_pos": self._link_text_pos,
+                }
+            )
+        self._link_href = None
+        self._link_text = []
+
+
+class _AnchorLinkHTMLParser(HTMLParser):
+    """Collect <a> links whose href contains `href_substring`, with collapsed link text.
+
+    Shared by the 政大不動產 listing and 台灣房屋 listing scrapers, which differ only by
+    the href filter.
+    """
+
+    def __init__(self, href_substring: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self._href_substring = href_substring
+        self.links: list[dict[str, str]] = []
+        self._link_href: str | None = None
+        self._link_text: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._skip_depth += 1
+            return
+        if tag != "a" or self._skip_depth:
+            return
+        href = dict(attrs).get("href") or ""
+        if self._href_substring not in href:
+            return
+        self._link_href = href
+        self._link_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth or not self._link_href:
+            return
+        text = re.sub(r"\s+", " ", data or "").strip()
+        if text:
+            self._link_text.append(text)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if tag != "a" or not self._link_href:
+            return
+        text = re.sub(r"\s+", " ", " ".join(self._link_text)).strip()
+        if text:
+            self.links.append({"href": self._link_href, "text": text})
+        self._link_href = None
+        self._link_text = []
+
+
+def _is_sinyi_dailynews_url(url: str) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").rstrip("/")
+    return host in {"www.sinyinews.com.tw", "sinyinews.com.tw"} and (
+        path == "/dailynews" or path.startswith("/dailynews/")
+    )
+
+
+def _is_twhg_news_url(url: str) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").rstrip("/")
+    return host == "news.twhg.com.tw" and path == "/re_news_list.php"
+
+
+def _is_rer_nccu_list_url(url: str) -> bool:
+    normalized = (url or "").rstrip("/")
+    return normalized in {u.rstrip("/") for u in RER_NCCU_LIST_URLS}
+
+
+def _absolute_sinyi_url(href: str) -> str:
+    return urljoin("https://www.sinyinews.com.tw/", href or "")
+
+
+def _absolute_twhg_url(href: str) -> str:
+    return urljoin("https://news.twhg.com.tw/", href or "")
+
+
+def _absolute_rer_nccu_url(href: str) -> str:
+    return urljoin("https://rer.nccu.edu.tw/", href or "")
+
+
+def _parse_sinyi_date(text: str) -> datetime | None:
+    m = re.search(r"\b(20\d{2})[./-](\d{1,2})[./-](\d{1,2})\b", text or "")
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=get_local_tz())
+    except ValueError:
+        return None
+
+
+def _parse_twhg_news_text(text: str) -> tuple[datetime | None, str]:
+    parts = [part.strip() for part in re.split(r"\s+", text or "") if part.strip()]
+    published_at = None
+    title_parts: list[str] = []
+    for part in parts:
+        parsed = _parse_sinyi_date(part)
+        if parsed:
+            published_at = parsed
+            continue
+        title_parts.append(part)
+    return published_at, " ".join(title_parts).strip()
+
+
+def _parse_rer_nccu_list_text(text: str) -> tuple[datetime | None, str, str]:
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    m = re.match(r"^(20\d{2})[./-](\d{1,2})[./-](\d{1,2})\s+(.+?)\s+(.+)$", clean)
+    if not m:
+        return None, "", clean
+    try:
+        published_at = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=get_local_tz())
+    except ValueError:
+        published_at = None
+    category = m.group(4).strip()
+    title = m.group(5).strip()
+    return published_at, category, title
+
+
+def _extract_sinyi_source(window: list[str]) -> str:
+    for idx, part in enumerate(window):
+        if "新聞來源" not in part:
+            continue
+        after = re.split(r"新聞來源[:：]?", part, maxsplit=1)[-1]
+        candidate = re.sub(r"[|｜].*$", "", after).strip()
+        if candidate:
+            return candidate
+        if idx + 1 < len(window):
+            nxt = re.sub(r"[|｜].*$", "", window[idx + 1]).strip()
+            if nxt and not _parse_sinyi_date(nxt):
+                return nxt
+    return "信義房屋每日新聞"
+
+
+def _extract_sinyi_published_at(texts: list[str], text_pos: int, next_pos: int | None) -> datetime | None:
+    if text_pos - 1 >= 0:
+        parsed = _parse_sinyi_date(texts[text_pos - 1])
+        if parsed:
+            return parsed
+    if text_pos - 2 >= 0 and ("新聞來源" in texts[text_pos - 1] or re.search(r"\d+\s*(分鐘|小時|天)前", texts[text_pos - 1])):
+        parsed = _parse_sinyi_date(texts[text_pos - 2])
+        if parsed:
+            return parsed
+    before_start = max(0, text_pos - 8)
+    after_end = min(next_pos if next_pos is not None else len(texts), text_pos + 8)
+    candidates: list[tuple[int, int, datetime]] = []
+    for idx, part in enumerate(texts[before_start:after_end], start=before_start):
+        parsed = _parse_sinyi_date(part)
+        if parsed:
+            side_bias = 0 if idx <= text_pos else 1
+            candidates.append((abs(idx - text_pos), side_bias, parsed))
+    if candidates:
+        candidates.sort(key=lambda row: (row[0], row[1]))
+        return candidates[0][2]
+    return None
+
+
+def _extract_sinyi_summary(texts: list[str], start_pos: int, next_pos: int | None, title: str) -> str:
+    end_pos = min(next_pos if next_pos is not None else len(texts), start_pos + 12)
+    skipped = {"最新新聞", "今日最新新聞", "更多今日新聞", "新聞來源", "Loading...", "展開看更多新聞"}
+    for part in texts[start_pos + 1 : end_pos]:
+        clean = part.strip()
+        if not clean or clean == title or clean in skipped:
+            continue
+        if _parse_sinyi_date(clean) or "新聞來源" in clean or re.search(r"\d+\s*(分鐘|小時|天)前", clean):
+            continue
+        if len(clean) >= 20:
+            return clean
+    return ""
+
+
+def parse_sinyi_dailynews_html(html: str, *, source_url: str = SINYI_DAILYNEWS_URL) -> list[dict]:
+    parser = _SinyiDailyNewsHTMLParser()
+    parser.feed(html or "")
+    seen_by_url: dict[str, dict] = {}
+    items: list[dict] = []
+    link_positions = [int(link["text_pos"]) for link in parser.links]
+    for idx, link in enumerate(parser.links):
+        title = str(link.get("title") or "").strip()
+        href = str(link.get("href") or "").strip()
+        text_pos = int(link.get("text_pos") or 0)
+        if not title or not href:
+            continue
+        url = canonicalize_article_url(_absolute_sinyi_url(href))
+        next_pos = link_positions[idx + 1] if idx + 1 < len(link_positions) else None
+        window = parser.texts[max(0, text_pos - 8) : min(len(parser.texts), text_pos + 8)]
+        published_at = _extract_sinyi_published_at(parser.texts, text_pos, next_pos)
+        item = {
+            "source": _extract_sinyi_source(window),
+            "title": title,
+            "url": url,
+            "summary": _extract_sinyi_summary(parser.texts, text_pos, next_pos, title),
+            "published_at": published_at,
+        }
+        existing = seen_by_url.get(url)
+        if existing:
+            if not existing.get("published_at") and item.get("published_at"):
+                existing["published_at"] = item["published_at"]
+            if not existing.get("summary") and item.get("summary"):
+                existing["summary"] = item["summary"]
+            if existing.get("source") == "信義房屋每日新聞" and item.get("source"):
+                existing["source"] = item["source"]
+            continue
+        seen_by_url[url] = item
+        items.append(item)
+    return items
+
+
+def fetch_sinyi_dailynews_entries(url: str = SINYI_DAILYNEWS_URL) -> list[dict]:
+    urls_to_fetch = SINYI_CATEGORY_URLS if url.rstrip("/") == SINYI_DAILYNEWS_URL.rstrip("/") else [url]
+    seen_urls: set[str] = set()
+    all_items: list[dict] = []
+    for fetch_url in urls_to_fetch:
+        try:
+            resp = requests.get(
+                fetch_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; JATNewsBot/1.0)"},
+                timeout=(10, 30),
+            )
+            if hasattr(resp, "raise_for_status"):
+                resp.raise_for_status()
+            html = getattr(resp, "text", "") or ""
+            for item in parse_sinyi_dailynews_html(html, source_url=fetch_url):
+                item_url = item.get("url", "")
+                if item_url and item_url not in seen_urls:
+                    seen_urls.add(item_url)
+                    all_items.append(item)
+        except Exception:
+            continue
+    return all_items
+
+
+def parse_twhg_news_html(html: str) -> list[dict]:
+    parser = _AnchorLinkHTMLParser("re_news_details.php")
+    parser.feed(html or "")
+    seen_urls: set[str] = set()
+    items: list[dict] = []
+    for link in parser.links:
+        href = (link.get("href") or "").strip()
+        raw_text = (link.get("text") or "").strip()
+        if not href or not raw_text:
+            continue
+        published_at, title = _parse_twhg_news_text(raw_text)
+        if not title:
+            continue
+        url = canonicalize_article_url(_absolute_twhg_url(href))
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        items.append(
+            {
+                "source": "台灣房屋新聞",
+                "title": title,
+                "url": url,
+                "summary": "",
+                "published_at": published_at,
+            }
+        )
+    return items
+
+
+def fetch_twhg_news_entries(url: str = TWHG_NEWS_URL) -> list[dict]:
+    resp = requests.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; JATNewsBot/1.0)"},
+        timeout=(10, 30),
+    )
+    if hasattr(resp, "raise_for_status"):
+        resp.raise_for_status()
+    html = getattr(resp, "content", b"").decode("utf-8", errors="ignore")
+    return parse_twhg_news_html(html)
+
+
+def parse_rer_nccu_list_html(html: str, *, source_url: str) -> list[dict]:
+    parser = _AnchorLinkHTMLParser("/article/detail/")
+    parser.feed(html or "")
+    source_name = RER_NCCU_LIST_URLS.get((source_url or "").rstrip("/"), "政大不動產研究中心")
+    seen_urls: set[str] = set()
+    items: list[dict] = []
+    for link in parser.links:
+        href = (link.get("href") or "").strip()
+        raw_text = (link.get("text") or "").strip()
+        if not href or not raw_text:
+            continue
+        published_at, category, title = _parse_rer_nccu_list_text(raw_text)
+        if not title:
+            continue
+        url = canonicalize_article_url(_absolute_rer_nccu_url(href))
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        items.append(
+            {
+                "source": source_name,
+                "title": title,
+                "url": url,
+                "summary": category,
+                "published_at": published_at,
+            }
+        )
+    return items
+
+
+def fetch_rer_nccu_list_entries(url: str) -> list[dict]:
+    resp = requests.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; JATNewsBot/1.0)"},
+        timeout=(10, 30),
+    )
+    if hasattr(resp, "raise_for_status"):
+        resp.raise_for_status()
+    html = getattr(resp, "text", "") or ""
+    return parse_rer_nccu_list_html(html, source_url=url)
+
+
 def get_news_source_name(feed, url: str) -> str:
+    if (url or "").rstrip("/") == UDN_HOUSE_RSS_URL.rstrip("/"):
+        return "經濟日報房市"
+    if (url or "").rstrip("/") == CTEE_HOUSE_GNEWS_URL.rstrip("/"):
+        return "工商時報房市(GNews)"
+    if (url or "").rstrip("/") == HOUSEFUN_GNEWS_URL.rstrip("/"):
+        return "好房網News(GNews)"
+    if (url or "").rstrip("/") == CAIXIN_GLOBAL_GNEWS_URL.rstrip("/"):
+        return "Caixin Global(GNews)"
+    if (url or "").rstrip("/") == REUTERS_CHINA_GNEWS_URL.rstrip("/"):
+        return "Reuters China(GNews)"
     if "news.google.com/rss/search" in (url or "") and "reuters" in NEWS_GNEWS_QUERY.lower():
         return "Reuters(GNews)"
     title = getattr(feed, "feed", {}).get("title") if feed else None
@@ -7544,12 +8624,24 @@ def get_source_weight(source: str | None) -> int:
 
 def fetch_news_entries(
     status_callback: Callable[[int, str, str | None], None] | None = None,
+    *,
+    scope: str = "news",
 ) -> list[dict]:
     items = []
-    urls = get_news_rss_urls()
+    urls = get_news_rss_urls(scope=scope)
     total_urls = max(1, len(urls))
     if status_callback:
         status_callback(10, "正在讀取新聞來源", f"來源數量：{len(urls)}")
+    # Scraped (non-RSS) sources, dispatched by URL predicate: (matches, fetcher, name).
+    special_sources = (
+        (_is_sinyi_dailynews_url, fetch_sinyi_dailynews_entries, lambda _url: "信義房屋每日新聞"),
+        (_is_twhg_news_url, fetch_twhg_news_entries, lambda _url: "台灣房屋新聞"),
+        (
+            _is_rer_nccu_list_url,
+            fetch_rer_nccu_list_entries,
+            lambda url: RER_NCCU_LIST_URLS.get(url.rstrip("/"), "政大不動產研究中心"),
+        ),
+    )
     for idx, url in enumerate(urls, start=1):
         if status_callback:
             status_callback(
@@ -7557,6 +8649,17 @@ def fetch_news_entries(
                 "正在抓取 RSS",
                 f"第 {idx}/{len(urls)} 個來源",
             )
+        special = next(((fetcher, name_of) for matches, fetcher, name_of in special_sources if matches(url)), None)
+        if special is not None:
+            fetcher, name_of = special
+            items.extend(fetcher(url))
+            if status_callback:
+                status_callback(
+                    10 + int(idx * 35 / total_urls),
+                    "正在抓取 RSS",
+                    f"已完成 {idx}/{len(urls)} 個來源：{name_of(url)}",
+                )
+            continue
         feed = feedparser.parse(url)
         source_name = get_news_source_name(feed, url)
         for entry in getattr(feed, "entries", []):
@@ -7717,11 +8820,12 @@ def fetch_and_store_news(
     *,
     lookback_hours: int | None = None,
     status_callback: Callable[[int, str, str | None], None] | None = None,
+    scope: str = "news",
 ) -> set[str]:
     changed_dates: set[str] = set()
     if status_callback:
         status_callback(5, "正在準備抓取新聞", None)
-    entries = fetch_news_entries(status_callback=status_callback)
+    entries = fetch_news_entries(status_callback=status_callback, scope=scope)
     if not entries:
         if status_callback:
             status_callback(100, "新聞抓取完成", "沒有新的 RSS 內容")
@@ -7964,20 +9068,16 @@ def handle_news_command(
     if not FEATURE_NEWS_ENABLED:
         return ["新聞功能已關閉。"]
 
-    tokens = text.strip().split()
-    sub = tokens[1].lower() if len(tokens) > 1 else ""
-    if sub in {"", "latest"}:
-        if status_callback:
-            status_callback(20, "正在讀取本地新聞資料", None)
-        if status_callback:
-            status_callback(75, "正在整理最新新聞輸出", None)
-        return [build_recent_news_links_html()]
-    if sub == "sources":
+    command = _get_slash_command_name(text)
+    sub = _get_news_command_subcommand(text)
+    tokens = (text or "").strip().split()
+    scope = "house" if command == "/house_news" else "news"
+    if command in {"/news_source", "/news_sources"} or (command == "/house_news" and sub in {"source", "sources"}):
         if status_callback:
             status_callback(35, "正在整理新聞來源", None)
-        rows = list_news_feeds()
+        rows = list_news_feeds(scope=scope)
         if rows:
-            lines = ["News sources:"]
+            lines = ["House news sources:" if scope == "house" else "News sources:"]
             for feed_id, name, url, enabled in rows:
                 label = name or url
                 status = "enabled" if enabled else "disabled"
@@ -7986,10 +9086,18 @@ def handle_news_command(
             if status_callback:
                 status_callback(100, "新聞來源整理完成", f"來源數量：{len(rows)}")
             return ["\n".join(lines)]
-        srcs = get_news_rss_urls()
+        srcs = get_news_rss_urls(scope=scope)
         if status_callback:
             status_callback(100, "新聞來源整理完成", f"來源數量：{len(srcs)}")
         return ["News sources:\n" + "\n".join(srcs)]
+    if sub in {"", "latest"}:
+        if status_callback:
+            status_callback(20, "正在讀取本地新聞資料", None)
+        if scope == "house":
+            fetch_and_store_news(status_callback=status_callback, scope=scope, lookback_hours=72)
+        if status_callback:
+            status_callback(75, "正在整理最新新聞輸出", None)
+        return [build_recent_news_links_html(scope=scope)]
     if sub == "add":
         if status_callback:
             status_callback(30, "正在新增新聞來源", None)
@@ -8052,7 +9160,7 @@ def handle_news_command(
     if sub == "search":
         if len(tokens) < 3:
             return ["Usage: /news search <keywords>"]
-        fetch_and_store_news(status_callback=status_callback)
+        fetch_and_store_news(status_callback=status_callback, scope=scope)
         if status_callback:
             status_callback(92, "正在搜尋新聞資料庫", "關鍵字搜尋中")
         rows = search_clusters(" ".join(tokens[2:]), 10)
@@ -8060,7 +9168,7 @@ def handle_news_command(
             status_callback(100, "新聞搜尋完成", f"找到 {len(rows)} 筆結果")
         return [format_cluster_list(rows)]
     if sub == "debug":
-        fetch_and_store_news(status_callback=status_callback)
+        fetch_and_store_news(status_callback=status_callback, scope=scope)
         if status_callback:
             status_callback(92, "正在檢查新聞來源狀態", None)
         now = datetime.now(tz=get_local_tz())
@@ -8076,16 +9184,31 @@ def handle_news_command(
                 """,
                 (cutoff_iso,),
             ).fetchall()
+        rows = [(source, cnt) for source, cnt in rows if _is_house_news_source(source) == (scope == "house")]
         if not rows:
             email_ready, email_status = _get_recent_news_email_status()
+            drive_ready, drive_status = _get_recent_news_drive_export_status()
             if status_callback:
                 status_callback(100, "新聞偵錯完成", "最近 12 小時沒有 ingest 資料")
-            return [f"No news items ingested in the last 12 hours.\nEmail: {'ready' if email_ready else 'not ready'}\n{email_status}"]
-        lines = ["News items by source (last 12 hours):"]
+            return [
+                "No news items ingested in the last 12 hours.\n"
+                f"Email: {'ready' if email_ready else 'not ready'}\n{email_status}\n"
+                f"Drive export: {'ready' if drive_ready else 'not ready'}\n{drive_status}"
+            ]
+        lines = ["House news items by source (last 12 hours):" if scope == "house" else "News items by source (last 12 hours):"]
         for source, cnt in rows:
             lines.append(f"- {source}: {cnt}")
         email_ready, email_status = _get_recent_news_email_status()
-        lines.extend(["", f"Email: {'ready' if email_ready else 'not ready'}", email_status])
+        drive_ready, drive_status = _get_recent_news_drive_export_status()
+        lines.extend(
+            [
+                "",
+                f"Email: {'ready' if email_ready else 'not ready'}",
+                email_status,
+                f"Drive export: {'ready' if drive_ready else 'not ready'}",
+                drive_status,
+            ]
+        )
         if status_callback:
             status_callback(100, "新聞偵錯完成", f"來源數量：{len(rows)}")
         return ["\n".join(lines)]
@@ -8093,7 +9216,7 @@ def handle_news_command(
         if status_callback:
             status_callback(100, "新聞說明整理完成", None)
         return [
-            "News commands: /news, /news search <keywords>, /news sources, /news add <url> | <name>, /news remove <id>, /news enable <id>, /news disable <id>, /news debug"
+            "News commands: /news, /house_news, /news_source, /house_news sources, /news search <keywords>, /news add <url> | <name>, /news remove <id>, /news enable <id>, /news disable <id>, /news debug"
         ]
     return ["Unknown /news subcommand. Use /news help."]
 
@@ -8121,7 +9244,8 @@ def set_telegram_commands() -> None:
         commands.extend(
             [
                 {"command": "news", "description": "News commands and feed management"},
-                {"command": "news_sources", "description": "List news sources"},
+                {"command": "house_news", "description": "House market news"},
+                {"command": "news_source", "description": "List news sources"},
                 {"command": "news_debug", "description": "Debug ingestion"},
                 {"command": "news_help", "description": "News command help"},
             ]
@@ -8129,6 +9253,8 @@ def set_telegram_commands() -> None:
     if FEATURE_TRANSCRIBE_ENABLED:
         commands.append({"command": "transcribe", "description": "Transcribe url/audio to markdown"})
         commands.append({"command": "daily_podcast", "description": "Batch transcribe fixed podcasts"})
+        commands.append({"command": "china_podcast", "description": "Batch transcribe China-focused podcasts"})
+        commands.append({"command": "house_podcast", "description": "Batch transcribe housing podcasts"})
         commands.append({"command": "cancel", "description": "Cancel active transcription"})
     commands.append({"command": "status", "description": "Bot health status"})
     resp = None
@@ -8142,13 +9268,13 @@ def set_telegram_commands() -> None:
         if resp.status_code != 200:
             print(f"setMyCommands failed: {resp.text}")
     except requests.Timeout as e:
-        print(f"setMyCommands timeout: {e}")
+        print(f"setMyCommands timeout: {_redact_telegram_secrets(e)}")
     except requests.RequestException as e:
-        print(f"setMyCommands request error: {e}")
+        print(f"setMyCommands request error: {_redact_telegram_secrets(e)}")
         if resp is not None:
             print(f"setMyCommands status={resp.status_code} body={resp.text}")
     except Exception as e:
-        print(f"setMyCommands error: {e}")
+        print(f"setMyCommands error: {_redact_telegram_secrets(e)}")
 
 
 def send_message_sync(chat_id: str, text: str, parse_mode: str | None = None) -> None:
@@ -8887,6 +10013,8 @@ def telegram_get_file_info(file_id: str) -> tuple[str, str]:
                     if preview:
                         preview = preview[:160]
                     last_detail = f"HTTP {status} {preview}".strip()
+                    if status == 400 and "file is too big" in preview.lower():
+                        raise TelegramFileTooLargeError(_build_telegram_file_too_large_message())
                     if status == 429:
                         retry_after = 0.0
                         try:
@@ -8911,6 +10039,8 @@ def telegram_get_file_info(file_id: str) -> tuple[str, str]:
                     continue
                 file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
                 return file_url, file_path
+            except TelegramFileTooLargeError:
+                raise
             except Exception as e:
                 last_err = e
                 last_detail = f"{type(e).__name__}: {e}"
@@ -8987,8 +10117,8 @@ def telegram_polling_loop() -> None:
         except Exception as e:
             _telegram_poll_loop_last_seen_at = time.time()
             consecutive_errors += 1
-            _telegram_poll_last_error = f"{type(e).__name__}: {e}"
-            print(f"[ERROR] Telegram polling error: {e}")
+            _telegram_poll_last_error = f"{type(e).__name__}: {_redact_telegram_secrets(e)}"
+            print(f"[ERROR] Telegram polling error: {_redact_telegram_secrets(e)}")
             sleep_s = min(
                 TELEGRAM_POLL_ERROR_BACKOFF_MAX_SECONDS,
                 TELEGRAM_POLL_ERROR_BACKOFF_BASE_SECONDS * (2 ** min(4, consecutive_errors - 1)),
@@ -9163,6 +10293,12 @@ async def process_telegram_update(update: dict) -> None:
             if await handle_daily_podcast_command(chat_id, cmd_text):
                 print(f"[ROUTE][HANDLED] chat_id={chat_id} by=daily_podcast")
                 return
+            if await handle_china_podcast_command(chat_id, cmd_text):
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=china_podcast")
+                return
+            if await handle_house_podcast_command(chat_id, cmd_text):
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=house_podcast")
+                return
             if await handle_news_command_with_progress(
                 chat_id,
                 cmd_text,
@@ -9207,7 +10343,7 @@ async def process_telegram_update(update: dict) -> None:
                 user_name=sender.get("username") or user_name,
             )
             if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
-                await _handle_recent_news_email_delivery(chat_id, replies[0])
+                await _handle_recent_news_email_delivery(chat_id, replies[0], scope=_get_news_email_scope(cmd_text))
                 return
             for reply in replies:
                 for chunk in _chunk_text_for_telegram(reply):
@@ -9243,7 +10379,7 @@ async def process_telegram_update(update: dict) -> None:
                 user_name=sender.get("username") or user_name,
             )
             if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
-                await _handle_recent_news_email_delivery(chat_id, replies[0])
+                await _handle_recent_news_email_delivery(chat_id, replies[0], scope=_get_news_email_scope(cmd_text))
                 return
             for reply in replies:
                 for chunk in _chunk_text_for_telegram(reply):

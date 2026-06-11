@@ -17,3 +17,5 @@ logs/
 read/_runtime/
 read/messages.sqlite
 
+tests_runtime*/
+
