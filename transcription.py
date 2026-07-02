@@ -42,7 +42,7 @@ except Exception:
     whisper = None  # type: ignore
 
 MAX_DURATION_SECONDS = int(os.getenv("TRANSCRIBE_MAX_DURATION_SECONDS", "10800"))
-CHUNK_MINUTES = int(os.getenv("TRANSCRIBE_CHUNK_MINUTES", "25"))
+CHUNK_MINUTES = int(os.getenv("TRANSCRIBE_CHUNK_MINUTES", "10"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small").strip() or "small"
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "auto").strip() or "auto"
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
@@ -443,6 +443,7 @@ def fetch_apple_podcast_episodes(url: str) -> list[dict]:
                 "episode_id": str(entry.get("trackId") or ""),
                 "title": entry.get("trackName", "Unknown Episode"),
                 "audio_url": episode_url,
+                "episode_url": entry.get("trackViewUrl", ""),
                 "show_name": entry.get("collectionName", ""),
                 "publish_date": entry.get("releaseDate", ""),
                 "duration_seconds": int((entry.get("trackTimeMillis") or 0) // 1000),
@@ -768,6 +769,7 @@ def save_transcript_md(
     source_type: str,
     duration_seconds: int | None,
     text: str,
+    extra_metadata: dict[str, object] | None = None,
 ) -> Path:
     transcript_dir = _transcript_output_dir(transcript_dir)
     transcript_dir.mkdir(parents=True, exist_ok=True)
@@ -783,12 +785,22 @@ def save_transcript_md(
         f"{duration_seconds // 60}:{duration_seconds % 60:02d}" if duration_seconds else "Unknown"
     )
     date_str = datetime.date.today().isoformat()
+    metadata_lines = [
+        f"- **Source:** {source_url}",
+        f"- **Type:** {source_type}",
+        f"- **Date transcribed:** {date_str}",
+        f"- **Duration:** {duration_str}",
+    ]
+    for key, value in (extra_metadata or {}).items():
+        clean_key = re.sub(r"[^A-Za-z0-9 _-]+", "", str(key or "")).strip()
+        clean_value = str(value or "").strip()
+        if clean_key and clean_value:
+            metadata_lines.append(f"- **{clean_key}:** {clean_value}")
+
     content = (
         f"# {title}\n\n"
-        f"- **Source:** {source_url}\n"
-        f"- **Type:** {source_type}\n"
-        f"- **Date transcribed:** {date_str}\n"
-        f"- **Duration:** {duration_str}\n\n"
+        + "\n".join(metadata_lines)
+        + "\n\n"
         f"---\n\n"
         f"{text}\n"
     )
@@ -893,6 +905,8 @@ def _pipeline_podcast(
     job_id: str,
     on_status: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
+    duration_seconds: int | None = None,
+    extra_metadata: dict[str, object] | None = None,
 ) -> tuple[str, Path]:
     try:
         _raise_if_cancelled(cancel_event)
@@ -981,7 +995,15 @@ def _pipeline_podcast(
             source_info={"source_type": source_type, "title": title, "source_url": source_url},
             fingerprint_path=original_audio,
         )
-        out_path = save_transcript_md(transcript_dir, title, source_url, source_type, None, text)
+        out_path = save_transcript_md(
+            transcript_dir,
+            title,
+            source_url,
+            source_type,
+            duration_seconds,
+            text,
+            extra_metadata=extra_metadata,
+        )
         return title, out_path
     finally:
         cleanup_files(temp_dir, job_id)
@@ -1030,6 +1052,12 @@ def transcribe_url_to_markdown(
             job_id=job_id,
             on_status=on_status,
             cancel_event=cancel_event,
+            duration_seconds=episode.get("duration_seconds") or None,
+            extra_metadata={
+                "Episode ID": episode.get("episode_id", ""),
+                "Episode URL": episode.get("episode_url", ""),
+                "Publish Date": episode.get("publish_date", ""),
+            },
         )
 
     if url_type == "direct":
@@ -1049,6 +1077,50 @@ def transcribe_url_to_markdown(
 
     raise ValueError("Unsupported URL type.")
 
+
+def transcribe_podcast_episode_to_markdown(
+    episode: dict,
+    transcript_dir: Path,
+    temp_dir: Path,
+    on_status: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[str, Path]:
+    """Transcribe an already-resolved Apple podcast episode without re-querying latest."""
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_old_checkpoints(temp_dir)
+    _raise_if_cancelled(cancel_event)
+    audio_url = str(episode.get("audio_url") or "").strip()
+    if not audio_url:
+        raise ValueError("Podcast episode is missing audio_url.")
+    job_id = str(uuid.uuid4())
+    raw_title = str(episode.get("title") or "Unknown Episode")
+    show_name = str(episode.get("show_name") or episode.get("show_label") or "").strip()
+    title = f"{show_name} - {raw_title}" if show_name else raw_title
+    source_url = (
+        str(episode.get("episode_url") or "").strip()
+        or str(episode.get("source_url") or "").strip()
+        or audio_url
+    )
+    duration = int(episode.get("duration_seconds") or 0) or None
+    return _pipeline_podcast(
+        audio_url,
+        title,
+        source_url=source_url,
+        source_type="podcast",
+        transcript_dir=transcript_dir,
+        temp_dir=temp_dir,
+        job_id=job_id,
+        on_status=on_status,
+        cancel_event=cancel_event,
+        duration_seconds=duration,
+        extra_metadata={
+            "Show Key": episode.get("show_key", ""),
+            "Show Label": episode.get("show_label", ""),
+            "Episode ID": episode.get("episode_id", ""),
+            "Episode URL": episode.get("episode_url", ""),
+            "Publish Date": episode.get("publish_date", ""),
+        },
+    )
 
 def transcribe_upload_to_markdown(
     audio_path: Path,

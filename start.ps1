@@ -5,21 +5,32 @@ param(
   [switch]$ShowWindow,
   [string]$LogFile = "",
   [switch]$SkipDepsInstall,
-  [int]$StorageWaitTimeoutSeconds = 45
+  [int]$StorageWaitTimeoutSeconds = 45,
+  [int]$HealthWaitTimeoutSeconds = 90
 )
 
  $ErrorActionPreference = 'Stop'
 
+  function Format-LogMessage($msg) {
+    if ($null -eq $msg) {
+      return ""
+    }
+    if (($msg -is [System.Collections.IEnumerable]) -and ($msg -isnot [string])) {
+      return (@($msg) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+    }
+    return [string]$msg
+  }
+
   function Write-Info($msg) {
-    Write-Host "[INFO] $msg"
+    Write-Host ("[INFO] {0}" -f (Format-LogMessage $msg))
   }
 
   function Write-Err($msg) {
-    Write-Host "[ERROR] $msg" -ForegroundColor Red
+    Write-Host ("[ERROR] {0}" -f (Format-LogMessage $msg)) -ForegroundColor Red
   }
 
   function Write-Warn($msg) {
-    Write-Host "[WARN] $msg" -ForegroundColor Yellow
+    Write-Host ("[WARN] {0}" -f (Format-LogMessage $msg)) -ForegroundColor Yellow
   }
 
   function Get-EnvValueFromFile($path, $key) {
@@ -143,12 +154,13 @@ param(
 
   function Format-HealthFailureMessage(
     [int]$targetPort,
+    [int]$timeoutSeconds,
     [string]$lastDetail,
     $proc,
     [string]$stdoutLog,
     [string]$stderrLog
   ) {
-    $parts = @("Health check did not become ready at http://127.0.0.1:$targetPort/healthz within 30s.")
+    $parts = @("Health check did not become ready at http://127.0.0.1:$targetPort/healthz within ${timeoutSeconds}s.")
     if ($lastDetail) {
       $parts += "Last detail: $lastDetail"
     }
@@ -180,10 +192,10 @@ param(
     [bool]$expectLongPolling,
     $proc = $null,
     [string]$stdoutLog = "",
-    [string]$stderrLog = ""
+    [string]$stderrLog = "",
+    [int]$timeoutSeconds = 90
   ) {
     $healthUrl = "http://127.0.0.1:$targetPort/healthz"
-    $timeoutSeconds = 30
     $deadline = (Get-Date).AddSeconds($timeoutSeconds)
     $lastDetail = ""
     $activity = "Waiting for health ($targetPort)"
@@ -192,7 +204,7 @@ param(
         try { $proc.Refresh() } catch {}
         if ($proc.HasExited) {
           Write-Progress -Activity $activity -Completed
-          throw (Format-HealthFailureMessage -targetPort $targetPort -lastDetail "uvicorn process exited before health became ready" -proc $proc -stdoutLog $stdoutLog -stderrLog $stderrLog)
+          throw (Format-HealthFailureMessage -targetPort $targetPort -timeoutSeconds $timeoutSeconds -lastDetail "uvicorn process exited before health became ready" -proc $proc -stdoutLog $stdoutLog -stderrLog $stderrLog)
         }
       }
       try {
@@ -224,7 +236,7 @@ param(
       Start-Sleep -Milliseconds 800
     }
     Write-Progress -Activity $activity -Completed
-    throw (Format-HealthFailureMessage -targetPort $targetPort -lastDetail $lastDetail -proc $proc -stdoutLog $stdoutLog -stderrLog $stderrLog)
+    throw (Format-HealthFailureMessage -targetPort $targetPort -timeoutSeconds $timeoutSeconds -lastDetail $lastDetail -proc $proc -stdoutLog $stdoutLog -stderrLog $stderrLog)
   }
 
   function Get-StorageEnvValue([string]$key, [string]$defaultValue) {
@@ -635,7 +647,7 @@ param(
       throw "Failed to start uvicorn process."
     }
     Write-Info "uvicorn pid: $($proc.Id)"
-    $health = Wait-HttpHealth -targetPort $Port -expectLongPolling $isLongPollingMode -proc $proc -stdoutLog $stdoutLog -stderrLog $stderrLog
+    $health = Wait-HttpHealth -targetPort $Port -expectLongPolling $isLongPollingMode -proc $proc -stdoutLog $stdoutLog -stderrLog $stderrLog -timeoutSeconds $HealthWaitTimeoutSeconds
     if ($health -and $health.telegram_mode) {
       Write-Info "Health ready: mode=$($health.telegram_mode) ok=$($health.ok)"
     } else {

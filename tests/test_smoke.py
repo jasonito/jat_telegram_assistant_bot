@@ -211,6 +211,34 @@ class SmokeTests(unittest.TestCase):
         app._recent_update_ids.clear()
         app._recent_transcribe_request_fingerprints.clear()
 
+    def test_trigger_recent_news_drive_export_skips_when_unconfigured(self):
+        with mock.patch.object(app, "NEWS_EXPORT_WEBHOOK_URL", ""):
+            with mock.patch.object(app.requests, "post") as mocked_post:
+                ok, status = app._trigger_recent_news_drive_export()
+
+        self.assertFalse(ok)
+        self.assertIn("NEWS_EXPORT_WEBHOOK_URL", status)
+        mocked_post.assert_not_called()
+
+    def test_trigger_recent_news_drive_export_posts_secret_payload(self):
+        class _Resp:
+            status_code = 200
+            text = '{"ok":true}'
+
+        with mock.patch.object(app, "NEWS_EXPORT_WEBHOOK_URL", "https://script.google.com/macros/s/example/exec"):
+            with mock.patch.object(app, "NEWS_EXPORT_WEBHOOK_SECRET", "shared-secret"):
+                with mock.patch.object(app, "NEWS_EXPORT_WEBHOOK_TIMEOUT_SECONDS", 7):
+                    with mock.patch.object(app.requests, "post", return_value=_Resp()) as mocked_post:
+                        ok, status = app._trigger_recent_news_drive_export()
+
+        self.assertTrue(ok)
+        self.assertEqual("已觸發 Google Drive 匯出", status)
+        mocked_post.assert_called_once_with(
+            "https://script.google.com/macros/s/example/exec",
+            json={"secret": "shared-secret", "action": "export_jat_news"},
+            timeout=7,
+        )
+
     def test_private_plain_text_records_and_sends_ack(self):
         update = {
             "update_id": 3,
@@ -476,6 +504,11 @@ class SmokeTests(unittest.TestCase):
         )
 
     def test_resolve_daily_podcast_selection_defaults_to_all(self):
+        selected, error = app._resolve_daily_podcast_selection("")
+        self.assertIsNone(error)
+        self.assertEqual(len(selected), len(app.DAILY_PODCAST_SHOWS))
+
+    def test_resolve_daily_podcast_selection_run_all_defaults_to_all(self):
         selected, error = app._resolve_daily_podcast_selection("run all")
         self.assertIsNone(error)
         self.assertEqual(len(selected), len(app.DAILY_PODCAST_SHOWS))
@@ -493,6 +526,46 @@ class SmokeTests(unittest.TestCase):
             ["tech_orange", "nyt_daily"],
         )
 
+    def test_resolve_china_podcast_selection_defaults_to_all(self):
+        selected, error = app._resolve_china_podcast_selection("")
+        self.assertIsNone(error)
+        self.assertEqual(len(selected), len(app.CHINA_PODCAST_SHOWS))
+
+    def test_resolve_china_podcast_selection_supports_multiple_keys(self):
+        selected, error = app._resolve_china_podcast_selection("chinatalk china_update")
+        self.assertIsNone(error)
+        self.assertEqual(
+            [item["key"] for item in selected],
+            ["chinatalk", "china_update"],
+        )
+
+    def test_build_china_podcast_usage_mentions_command_and_keys(self):
+        usage = app._build_china_podcast_usage()
+        self.assertIn("/china_podcast", usage)
+        self.assertIn("hudson_china_insider", usage)
+        self.assertIn("china_desk", usage)
+        self.assertNotIn("/china_podcast run all", usage)
+
+    def test_resolve_house_podcast_selection_defaults_to_all(self):
+        selected, error = app._resolve_house_podcast_selection("")
+        self.assertIsNone(error)
+        self.assertEqual(len(selected), len(app.HOUSE_PODCAST_SHOWS))
+
+    def test_resolve_house_podcast_selection_supports_multiple_keys(self):
+        selected, error = app._resolve_house_podcast_selection("estate_learning_voice real_estate_jango")
+        self.assertIsNone(error)
+        self.assertEqual(
+            [item["key"] for item in selected],
+            ["estate_learning_voice", "real_estate_jango"],
+        )
+
+    def test_build_house_podcast_usage_mentions_command_and_keys(self):
+        usage = app._build_house_podcast_usage()
+        self.assertIn("/house_podcast", usage)
+        self.assertIn("estate_learning_voice", usage)
+        self.assertIn("find_place_live_real_estate", usage)
+        self.assertNotIn("/house_podcast run all", usage)
+
     def test_estimate_daily_podcast_total_seconds_uses_duration_and_model(self):
         estimate = app._estimate_daily_podcast_total_seconds(
             [
@@ -502,6 +575,29 @@ class SmokeTests(unittest.TestCase):
             "small",
         )
         self.assertEqual(estimate, int((1800 + 900) * 0.85 + 180))
+
+    def test_local_file_uri_formats_windows_drive_path(self):
+        uri = app._local_file_uri(Path("H:/我的雲端硬碟/Obsidian/Resource/daily-podcast/out.md"))
+
+        self.assertTrue(uri.startswith("file:///H:/"))
+        self.assertIn("Obsidian/Resource/daily-podcast/out.md", uri)
+        self.assertIn("%E6%88%91", uri)
+
+    def test_local_file_uri_can_be_embedded_in_html_anchor(self):
+        uri = app._local_file_uri(Path("H:/我的雲端硬碟/Obsidian/Resource/daily-podcast/a & b.md"))
+        label = "Lex <Fridman>: a & b.md"
+        anchor = f'- <a href="{app.escape(uri, quote=True)}">{app.escape(label)}</a>'
+
+        self.assertIn('href="file:///H:/', anchor)
+        self.assertIn("Lex &lt;Fridman&gt;: a &amp; b.md", anchor)
+
+    def test_localize_transcribe_status_ignores_duration_warning(self):
+        self.assertEqual(
+            app._localize_transcribe_status(
+                "Warning: cannot detect duration, continuing without progress percentage."
+            ),
+            "",
+        )
 
     def test_daily_podcast_episode_state_key(self):
         self.assertEqual(
@@ -547,6 +643,53 @@ class SmokeTests(unittest.TestCase):
         called_key = mocked_get.call_args[0][1]
         self.assertTrue(called_key.startswith("nyt_daily:fallback:"))
 
+    def test_is_china_podcast_episode_processed_checks_existing_markdown_dir(self):
+        episode = {
+            "show_key": "chinatalk",
+            "episode_id": "123456",
+            "title": "ChinaTalk Example",
+            "publish_date": "2026-05-18T00:00:00Z",
+            "source_url": "https://podcasts.apple.com/us/podcast/chinatalk/id1289062927",
+        }
+        with mock.patch.object(app, "get_sync_state", return_value=None):
+            with mock.patch.object(
+                app,
+                "_find_existing_fixed_podcast_transcript",
+                return_value=Path("existing.md"),
+            ) as mocked_find:
+                self.assertTrue(app._is_china_podcast_episode_processed(episode))
+
+        mocked_find.assert_called_once_with(episode, app.CHINA_PODCAST_DIR)
+
+    def test_is_house_podcast_episode_processed_checks_existing_markdown_dir(self):
+        episode = {
+            "show_key": "estate_learning_voice",
+            "episode_id": "123456",
+            "title": "House Podcast Example",
+            "publish_date": "2026-05-18T00:00:00Z",
+            "source_url": "https://podcasts.apple.com/tw/podcast/example/id123456789",
+        }
+        with mock.patch.object(app, "get_sync_state", return_value=None):
+            with mock.patch.object(
+                app,
+                "_find_existing_fixed_podcast_transcript",
+                return_value=Path("existing.md"),
+            ) as mocked_find:
+                self.assertTrue(app._is_house_podcast_episode_processed(episode))
+
+        mocked_find.assert_called_once_with(episode, app.HOUSE_PODCAST_DIR)
+
+    def test_format_fixed_podcast_failure_compacts_stalled_transcription(self):
+        message = app._format_fixed_podcast_failure(
+            "Lex Fridman Podcast",
+            "Transcription appears stalled at 0% for 50m 20s. Please retry with a shorter clip or a smaller Whisper model.",
+        )
+
+        self.assertEqual(
+            message,
+            "Lex Fridman Podcast：轉錄逾時，長時間停在 0%；建議改用較小模型或縮短音訊",
+        )
+
     def test_mark_daily_podcast_episode_processed_uses_all_state_keys(self):
         episode = {
             "show_key": "nyt_daily",
@@ -557,11 +700,80 @@ class SmokeTests(unittest.TestCase):
         }
         with mock.patch.object(app, "upsert_sync_state") as mocked_upsert:
             app._mark_daily_podcast_episode_processed(episode, Path("out.md"))
-        self.assertEqual(mocked_upsert.call_count, 2)
+        self.assertEqual(mocked_upsert.call_count, 3)
         first_key = mocked_upsert.call_args_list[0][0][1]
         second_key = mocked_upsert.call_args_list[1][0][1]
+        third_key = mocked_upsert.call_args_list[2][0][1]
         self.assertEqual(first_key, "nyt_daily:123456")
         self.assertTrue(second_key.startswith("nyt_daily:fallback:"))
+        self.assertTrue(third_key.startswith("nyt_daily:content:"))
+
+    def test_find_existing_fixed_podcast_transcript_matches_legacy_markdown(self):
+        tmpdir = Path("tests_runtime_transcribe") / "unit_daily_podcast_existing"
+        if tmpdir.exists():
+            shutil.rmtree(tmpdir)
+        try:
+            day_dir = tmpdir / "2026-05-18"
+            day_dir.mkdir(parents=True, exist_ok=True)
+            transcript_path = day_dir / "The Daily - Big Markets, Big Moves.md"
+            transcript_path.write_text(
+                "# The Daily - Big Markets, Big Moves\n\n"
+                "- **Source:** https://podcasts.apple.com/us/podcast/the-daily/id1200361736\n"
+                "- **Type:** podcast\n"
+                "- **Date transcribed:** 2026-05-18\n"
+                "- **Duration:** Unknown\n\n"
+                "---\n\nsample",
+                encoding="utf-8",
+            )
+            episode = {
+                "show_key": "nyt_daily",
+                "show_label": "The Daily",
+                "episode_id": "123456",
+                "title": "Big Markets, Big Moves",
+                "publish_date": "2026-05-18T00:00:00Z",
+                "source_url": "https://podcasts.apple.com/us/podcast/the-daily/id1200361736",
+            }
+            self.assertEqual(
+                app._find_existing_fixed_podcast_transcript(episode, tmpdir),
+                transcript_path,
+            )
+        finally:
+            if tmpdir.exists():
+                shutil.rmtree(tmpdir)
+
+    def test_transcribe_podcast_episode_to_markdown_uses_resolved_episode_audio(self):
+        tmpdir = Path("tests_runtime_transcribe") / "unit_resolved_episode"
+        if tmpdir.exists():
+            shutil.rmtree(tmpdir)
+        episode = {
+            "show_key": "lex_fridman",
+            "show_label": "Lex Fridman Podcast",
+            "show_name": "Lex Fridman Podcast",
+            "episode_id": "987",
+            "episode_url": "https://podcasts.apple.com/tw/podcast/example/id1434243584?i=987",
+            "source_url": "https://podcasts.apple.com/tw/podcast/lex-fridman-podcast/id1434243584",
+            "audio_url": "https://cdn.example.com/lex.mp3",
+            "title": "AI and Physics",
+            "publish_date": "2026-05-18T00:00:00Z",
+            "duration_seconds": 7200,
+        }
+        try:
+            with mock.patch.object(transcription, "_pipeline_podcast", return_value=("title", Path("out.md"))) as mocked:
+                result = transcription.transcribe_podcast_episode_to_markdown(
+                    episode,
+                    tmpdir / "out",
+                    tmpdir / "tmp",
+                )
+            self.assertEqual(result, ("title", Path("out.md")))
+            args, kwargs = mocked.call_args
+            self.assertEqual(args[0], "https://cdn.example.com/lex.mp3")
+            self.assertEqual(args[1], "Lex Fridman Podcast - AI and Physics")
+            self.assertEqual(kwargs["source_url"], "https://podcasts.apple.com/tw/podcast/example/id1434243584?i=987")
+            self.assertEqual(kwargs["duration_seconds"], 7200)
+            self.assertEqual(kwargs["extra_metadata"]["Show Key"], "lex_fridman")
+        finally:
+            if tmpdir.exists():
+                shutil.rmtree(tmpdir)
 
     def test_local_datetime_from_unix_uses_local_tz(self):
         dt = app._local_datetime_from_unix(0)
@@ -738,6 +950,41 @@ class SmokeTests(unittest.TestCase):
                 out.unlink()
             if tmpdir.exists():
                 tmpdir.rmdir()
+
+    def test_telegram_get_file_info_maps_too_large_error(self):
+        class FakeResponse:
+            status_code = 400
+            text = '{"ok":false,"error_code":400,"description":"Bad Request: file is too big"}'
+
+        with mock.patch.object(app.requests, "request", return_value=FakeResponse(), create=True):
+            with self.assertRaises(app.TelegramFileTooLargeError) as ctx:
+                app.telegram_get_file_info("file-id")
+
+        self.assertIn("Bot API getFile", str(ctx.exception))
+        self.assertIn("/transcribe <可下載的音訊 URL>", str(ctx.exception))
+
+    def test_handle_transcribe_audio_message_rejects_oversized_upload_before_getfile(self):
+        message = {
+            "audio": {
+                "file_id": "file-id",
+                "file_unique_id": "uniq",
+                "file_name": "large.m4a",
+                "file_size": 75 * 1024 * 1024,
+            }
+        }
+
+        with mock.patch.object(app, "FEATURE_TRANSCRIBE_ENABLED", True):
+            with mock.patch.object(app, "TELEGRAM_GETFILE_MAX_BYTES", 20 * 1024 * 1024):
+                with mock.patch.object(app, "send_message", new=mock.AsyncMock()) as mocked_send:
+                    with mock.patch.object(app, "_register_transcribe_job") as mocked_register:
+                        handled = asyncio.run(app.handle_transcribe_audio_message(123, message))
+
+        self.assertTrue(handled)
+        mocked_register.assert_not_called()
+        mocked_send.assert_awaited_once()
+        sent_text = mocked_send.await_args.args[1]
+        self.assertIn("75.0 MiB", sent_text)
+        self.assertIn("20.0 MiB", sent_text)
 
     def test_private_youtube_url_does_not_block_on_notion_sync(self):
         update = {
@@ -960,6 +1207,14 @@ class SmokeTests(unittest.TestCase):
             with mock.patch.object(app.requests, "RequestException", Exception, create=True):
                 with mock.patch.object(app.requests, "post", side_effect=Exception("boom")):
                     app.set_telegram_commands()
+
+    def test_send_message_last_error_redacts_bot_token(self):
+        token_error = Exception(f"failed https://api.telegram.org/bot{app.BOT_TOKEN}/sendMessage")
+        with mock.patch.object(app.requests, "post", side_effect=token_error):
+            asyncio.run(app.send_message(123, "hello"))
+
+        self.assertNotIn(app.BOT_TOKEN, app._telegram_send_last_error)
+        self.assertIn("bot<redacted>", app._telegram_send_last_error)
 
     def test_estimate_weekly_topic_count_scales_to_ten(self):
         self.assertEqual(app._estimate_weekly_topic_count("短摘要", 3), 2)
@@ -1285,6 +1540,168 @@ class SmokeTests(unittest.TestCase):
                 for fp in sorted(tmp_news.rglob("*"), reverse=True):
                     if fp.is_dir():
                         fp.rmdir()
+
+    def test_news_and_house_news_filter_local_entries_by_source(self):
+        tmp_news = Path("tests_runtime_house_news_links")
+        now = datetime.now(tz=app.get_local_tz())
+        current_iso = (now - timedelta(hours=1)).isoformat()
+        current_name = now.strftime("%Y%m%d_news.md")
+        try:
+            if tmp_news.exists():
+                for fp in tmp_news.rglob("*"):
+                    if fp.is_file():
+                        fp.unlink()
+                for fp in sorted(tmp_news.rglob("*"), reverse=True):
+                    if fp.is_dir():
+                        fp.rmdir()
+            tmp_news.mkdir(exist_ok=True)
+            (tmp_news / current_name).write_text(
+                "---\n"
+                f'published_at: "{current_iso}"\n'
+                "canonical:\n"
+                '  source: "Reuters"\n'
+                '  url: "https://example.com/general"\n'
+                'title: "General title"\n'
+                "---\n"
+                "Summary\n"
+                "---\n"
+                f'published_at: "{current_iso}"\n'
+                "canonical:\n"
+                '  source: "房市動態 | 住展雜誌"\n'
+                '  url: "https://example.com/house"\n'
+                'title: "House title"\n'
+                "---\n"
+                "Summary\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(app, "NEWS_MD_DIR", tmp_news):
+                with mock.patch.object(app, "_translate_news_titles_to_zh", return_value={}):
+                    news_html = app.build_recent_news_links_html(now=now)
+                    house_html = app.build_recent_news_links_html(now=now, scope="house")
+
+            self.assertIn("https://example.com/general", news_html)
+            self.assertNotIn("https://example.com/house", news_html)
+            self.assertIn("https://example.com/house", house_html)
+            self.assertNotIn("https://example.com/general", house_html)
+        finally:
+            if tmp_news.exists():
+                for fp in tmp_news.rglob("*"):
+                    if fp.is_file():
+                        fp.unlink()
+                for fp in sorted(tmp_news.rglob("*"), reverse=True):
+                    if fp.is_dir():
+                        fp.rmdir()
+
+    def test_news_email_subject_uses_date_only_for_news_and_house_news(self):
+        now = datetime(2026, 5, 12, 9, 30, tzinfo=app.get_local_tz())
+
+        self.assertEqual(app._build_recent_news_email_subject(now=now), "[JAT News] 2026-05-12")
+        self.assertEqual(
+            app._build_recent_news_email_subject(now=now, scope="house"),
+            "[HOUSE News] 2026-05-12",
+        )
+
+    def test_news_source_command_lists_sources(self):
+        rows = [(1, "Reuters", "https://example.com/rss", 1)]
+        with mock.patch.object(app, "FEATURE_NEWS_ENABLED", True):
+            with mock.patch.object(app, "list_news_feeds", return_value=rows):
+                replies = app.handle_news_command("/news_source", "")
+
+        self.assertEqual(len(replies), 1)
+        self.assertIn("News sources:", replies[0])
+        self.assertIn("#1 [enabled] Reuters", replies[0])
+        self.assertIn("https://example.com/rss", replies[0])
+
+    def test_news_sources_subcommand_is_still_rejected(self):
+        with mock.patch.object(app, "FEATURE_NEWS_ENABLED", True):
+            with mock.patch.object(app, "list_news_feeds") as mocked_list:
+                replies = app.handle_news_command("/news sources", "")
+
+        mocked_list.assert_not_called()
+        self.assertEqual(replies, ["Unknown /news subcommand. Use /news help."])
+
+    def test_news_sources_plural_alias_lists_sources(self):
+        rows = [(1, "Reuters", "https://example.com/rss", 1)]
+        with mock.patch.object(app, "FEATURE_NEWS_ENABLED", True):
+            with mock.patch.object(app, "list_news_feeds", return_value=rows):
+                replies = app.handle_news_command("/news_sources", "")
+
+        self.assertTrue(app._is_news_command_text("/news_sources"))
+        self.assertIn("News sources:", replies[0])
+        self.assertIn("#1 [enabled] Reuters", replies[0])
+
+    def test_news_search_uses_tokens_after_command_parser_refactor(self):
+        rows = [(1, "Title", "https://example.com/news", "Reuters", "2026-04-27T00:00:00+08:00", "2026-04-27", 1)]
+        with mock.patch.object(app, "FEATURE_NEWS_ENABLED", True):
+            with mock.patch.object(app, "fetch_and_store_news") as mocked_fetch:
+                with mock.patch.object(app, "search_clusters", return_value=rows) as mocked_search:
+                    replies = app.handle_news_command("/news search china ai", "")
+
+        mocked_fetch.assert_called_once()
+        mocked_search.assert_called_once_with("china ai", 10)
+        self.assertIn("Title", replies[0])
+
+    def test_parse_sinyi_dailynews_html_extracts_news_items(self):
+        html = """
+        <section>
+          <span>2026.05.07 新聞來源：信義房屋</span>
+          <a href="/dailynews/newsct/17278">連19年不缺席！信義房屋《遠見》ESG雙料得獎</a>
+          <p>連續19年獲《遠見》ESG企業永續大獎肯定，信義房屋今年一舉奪得雙料肯定。</p>
+          <span>2026.04.24 新聞來源：信義房屋</span>
+          <a href="https://www.sinyinews.com.tw/dailynews/newsct/17211">圓環走入歷史、綠園道即將動工</a>
+          <p>台南車站周邊正迎來全面蛻變，長期而言可望成為商圈復甦的關鍵契機。</p>
+        </section>
+        """
+
+        items = app.parse_sinyi_dailynews_html(html)
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["source"], "信義房屋")
+        self.assertEqual(items[0]["published_at"].strftime("%Y%m%d"), "20260507")
+        self.assertEqual(items[0]["url"], "https://sinyinews.com.tw/dailynews/newsct/17278")
+        self.assertIn("ESG", items[0]["title"])
+        self.assertIn("永續大獎", items[0]["summary"])
+
+    def test_parse_rer_nccu_list_html_extracts_news_items(self):
+        html = """
+        <div>
+          <a href="/article/detail/2604307211111">2026.04.30 美洲 〖美國〗抵押貸款利率再度下滑，購屋族重返市場</a>
+          <a href="https://rer.nccu.edu.tw/article/detail/2510217111111">2025.10.21 (亞洲)海外新知 〖日本〗日本土地價格連續四年上漲</a>
+        </div>
+        """
+
+        items = app.parse_rer_nccu_list_html(
+            html,
+            source_url="https://rer.nccu.edu.tw/article/list/72",
+        )
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["source"], "政大不動產研究中心 - 美洲")
+        self.assertEqual(items[0]["published_at"].strftime("%Y%m%d"), "20260430")
+        self.assertEqual(items[0]["summary"], "美洲")
+        self.assertEqual(items[0]["url"], "https://rer.nccu.edu.tw/article/detail/2604307211111")
+        self.assertIn("抵押貸款利率", items[0]["title"])
+        self.assertEqual(items[1]["summary"], "(亞洲)海外新知")
+
+    def test_parse_twhg_news_html_extracts_news_items(self):
+        html = """
+        <ul>
+          <li>
+            <a href="re_news_details.php?ojb=60062" target="_blank">
+              <div class="wtnews-name">雙重好康 年明遺贈稅免稅額上調</div>
+              <div class="wtnews-date">2026-05-03</div>
+            </a>
+          </li>
+        </ul>
+        """
+
+        items = app.parse_twhg_news_html(html)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["source"], "台灣房屋新聞")
+        self.assertEqual(items[0]["published_at"].strftime("%Y%m%d"), "20260503")
+        self.assertEqual(items[0]["url"], "https://news.twhg.com.tw/re_news_details.php?ojb=60062")
+        self.assertIn("遺贈稅", items[0]["title"])
 
     def test_sync_dropbox_notes_range_to_local_downloads_missing_remote_md(self):
         class FakeEntry:

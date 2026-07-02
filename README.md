@@ -53,6 +53,7 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 - OCR 選擇行為：`OCR_CHOICE_SCOPE`、`OCR_CHOICE_TIMEOUT_SECONDS`、`OCR_CHOICE_TIMEOUT_DEFAULT`。
 
 ### Segment D: Transcription Engine
+Default transcription baseline: `WHISPER_MODEL=small`, `TRANSCRIBE_CHUNK_MINUTES=10`. The shorter chunk size helps long podcast episodes produce progress and checkpoints sooner on CPU-only hosts.
 - 用途：控制 Whisper 的品質、速度、記憶體使用與分段策略。
 - 主要參數：`TRANSCRIBE_MAX_DURATION_SECONDS`、`TRANSCRIBE_CHUNK_MINUTES`、`TRANSCRIBE_CHECKPOINT_FLUSH_SECONDS`、`WHISPER_MODEL`、`WHISPER_LANGUAGE`、`WHISPER_BEAM_SIZE`、`WHISPER_COMPUTE_TYPE`、`WHISPER_CPU_THREADS`、`WHISPER_BATCH_SIZE`、`FFMPEG_LOCATION`、`TRANSCRIBE_PROGRESS_HEARTBEAT_SECONDS`。
 - 目前預設：`WHISPER_MODEL=small`。
@@ -68,8 +69,10 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 - 主要參數：`NEWS_ENABLED`、`NEWS_FETCH_INTERVAL_MINUTES`、`NEWS_LOOKBACK_HOURS`、`NEWS_STARTUP_FETCH_ENABLED`、`NEWS_STARTUP_NOTIFY_ENABLED`、`NEWS_PUSH_ENABLED`、`NEWS_PUSH_MAX_ITEMS`、`NEWS_GNEWS_*`、`NEWS_RSS_URLS`、`NEWS_RSS_URLS_FILE`、`NEWS_URL_FETCH_*`、`NEWS_DIGEST_*`、`NEWS_CLASSIFY_BATCH_SIZE`、`NOTE_DIGEST_MAX_ITEMS`。
 - `main` profile 目前預設：`NEWS_FETCH_INTERVAL_MINUTES=360`、`NEWS_LOOKBACK_HOURS=24`、`NEWS_STARTUP_FETCH_ENABLED=1`、`NEWS_STARTUP_NOTIFY_ENABLED=1`。
 - 目前行為：bot 啟動時會先立即執行一次新聞 ingest，通知已啟用的 `news_subscriptions`，之後每 6 小時固定跑一次。抓取視窗是 24 小時，因此電腦關機後下次啟動仍可補抓。
-- `/news` 會讀取 `DATA_DIR\news` 下的本地 markdown，依 `Asia/Taipei` 時區篩選最近 24 小時的 `published_at`，再用 LLM 批次分類加上關鍵字 fallback，分成 7 類後輸出可點擊的 HTML 連結。
+- `/news` 會讀取 `DATA_DIR\news` 下的本地 markdown，依 `Asia/Taipei` 時區篩選最近 24 小時的 `published_at`，排除房市來源後，再用 LLM 批次分類加上關鍵字 fallback，分成 7 類後輸出可點擊的 HTML 連結。
+- `/house_news` 會抓取並顯示最近 24 小時房市新聞，來源包含信義房屋每日新聞、政大不動產研究中心美洲、住展雜誌房市動態、經濟日報房市、工商時報房市、好房網 News。
 - `/news` 只使用 `DATA_DIR\news`。不會寫入 Obsidian `note`，也不會寫入 Notion。
+- `/news_source` 會列出目前啟用/停用的新聞 RSS 來源。
 - 當 `AI_SUMMARY_ENABLED=1` 時，新聞分類會使用 LLM；否則退回關鍵字分類。批次大小可用 `NEWS_CLASSIFY_BATCH_SIZE` 調整，預設為 40。
 - 若近期區間的本地 `news` markdown 缺失，bot 會先嘗試從 Dropbox 同步回本地，再重試讀取。
 - note/transcript 的 AI 輸入上限由 `NOTE_AI_INPUT_MAX_CHARS` 控制，目前預設 `28000`。
@@ -273,7 +276,7 @@ python -m unittest discover -s tests -p "test_*.py"
 
 `/news` 與 `/transcribe` 是否可用，取決於 `FEATURE_NEWS_ENABLED` 與 `FEATURE_TRANSCRIBE_ENABLED`。
 
-`/summary_news_daily` 與 `/news_latest` 目前仍保留為相容別名，但主要入口是 `/news`。
+`/summary_news_daily` 與 `/news_latest` 目前仍保留為相容別名，但主要入口是 `/news`。新聞來源列表入口是 `/news_source`。
 
 本地控制白名單：
 - 將 `TELEGRAM_ALLOWED_CONTROL_USERS` 設為以逗號分隔的 Telegram `user_id` 與／或 `username`。
@@ -347,6 +350,23 @@ ffprobe -version
 - `/daily_podcast` transcript 檔案：`H:\我的雲端硬碟\Obsidian\Resource\daily-podcast`
 - SQLite 資料庫：`DATA_DIR\messages.sqlite`
 - Telegram images：`DATA_DIR\images\YYYY-MM-DD\`
+
+## News Email To Drive Export
+
+`/news` on the main profile can trigger a Google Apps Script Web App after the
+JAT News email is sent. Configure:
+
+- `NEWS_EXPORT_WEBHOOK_URL`: Apps Script Web App `/exec` URL.
+- `NEWS_EXPORT_WEBHOOK_SECRET`: shared secret sent in the JSON body.
+- `NEWS_EXPORT_WEBHOOK_TIMEOUT_SECONDS`: request timeout, default `30`.
+
+The Apps Script Web App must expose `doPost(e)` and call `exportEmailsToDrive()`
+when it receives `{ "action": "export_jat_news", "secret": "..." }`. A ready-to-
+paste script is available at `docs/jat_news_gmail_to_drive.gs`.
+
+If `NEWS_EXPORT_WEBHOOK_URL` is empty, `/news` still sends email but reports that
+Drive export was not triggered. Use `/news debug` to check both email and Drive
+export readiness.
 
 ## Markdown Cleanup Maintenance
 

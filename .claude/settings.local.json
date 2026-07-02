@@ -7,7 +7,31 @@
       "Bash(git status:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Read(//c/Users/tsaiy/.claude/projects/**)",
+      "Read(//c/Users/tsaiy/.claude/projects//**)",
+      "PowerShell(Get-ScheduledTask *)",
+      "WebFetch(domain:www.sinyinews.com.tw)",
+      "WebFetch(domain:news.housefun.com.tw)",
+      "PowerShell(Get-Process *)",
+      "Bash(.venv/Scripts/python -c ' *)",
+      "Skill(code-review)",
+      "Bash(git diff *)",
+      "Read(//tmp/**)",
+      "Bash(PYTHONUTF8=1 .venv/Scripts/python.exe -c ' *)",
+      "Bash(FEATURE_NEWS_ENABLED=1 PYTHONUTF8=1 .venv/Scripts/python.exe -c ' *)",
+      "Bash(FEATURE_NEWS_ENABLED=1 PYTHONUTF8=1 .venv/Scripts/python.exe -c \"import app; print\\('IMPORT OK', app.FEATURE_NEWS_ENABLED\\)\")",
+      "Bash(DATA_DIR='C:\\\\Users\\\\tsaiy\\\\jat_telegram_assistant_bot\\\\read' FEATURE_NEWS_ENABLED=1 PYTHONUTF8=1 .venv/Scripts/python.exe -c ' *)",
+      "Bash(DATA_DIR='C:\\\\Users\\\\tsaiy\\\\jat_telegram_assistant_bot\\\\read' FEATURE_NEWS_ENABLED=1 PYTHONUTF8=1 .venv/Scripts/python.exe -m pytest tests/test_smoke.py -k \"news or house or source\" -q)",
+      "Bash(ollama list *)",
+      "Bash(ollama show *)",
+      "WebSearch",
+      "Bash(ollama pull *)",
+      "Bash(ollama run *)",
+      "Bash(git check-ignore *)",
+      "Bash(DATA_DIR='C:\\\\Users\\\\tsaiy\\\\jat_telegram_assistant_bot\\\\read' FEATURE_NEWS_ENABLED=1 PYTHONUTF8=1 .venv/Scripts/python.exe -m pytest tests/test_smoke.py -q)",
+      "Bash(DATA_DIR='C:\\\\Users\\\\tsaiy\\\\jat_telegram_assistant_bot\\\\read' FEATURE_NEWS_ENABLED=1 PYTHONUTF8=1 .venv/Scripts/python.exe -m pytest tests/test_smoke.py -q -k \"news_email_subject or postprocess_transcript or duplicate_edited\")",
+      "Bash(git stash *)"
     ]
   }
 }

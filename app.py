@@ -409,6 +409,21 @@ HOUSEFUN_GNEWS_URL = (
     f"{quote('site:news.housefun.com.tw')}"
     "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
 )
+CNYES_HOUSE_GNEWS_URL = (
+    "https://news.google.com/rss/search?q="
+    f"{quote('site:cnyes.com 房市')}"
+    "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+)
+UDN_HOUSE_GNEWS_URL = (
+    "https://news.google.com/rss/search?q="
+    f"{quote('site:udn.com 房市')}"
+    "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+)
+N591_HOUSE_GNEWS_URL = (
+    "https://news.google.com/rss/search?q="
+    f"{quote('site:news.591.com.tw')}"
+    "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+)
 CAIXIN_GLOBAL_GNEWS_URL = (
     "https://news.google.com/rss/search?q="
     f"{quote('site:caixinglobal.com China OR business')}"
@@ -436,6 +451,9 @@ HOUSE_NEWS_FEEDS: dict[str, str | None] = {
     UDN_HOUSE_RSS_URL: "經濟日報房市",
     CTEE_HOUSE_GNEWS_URL: "工商時報房市(GNews)",
     HOUSEFUN_GNEWS_URL: "好房網News(GNews)",
+    CNYES_HOUSE_GNEWS_URL: "鉅亨房市(GNews)",
+    UDN_HOUSE_GNEWS_URL: "聯合報房市(GNews)",
+    N591_HOUSE_GNEWS_URL: "591房屋(GNews)",
     MYHOUSING_FEED_URL: "房市動態 | 住展雜誌",
     **RER_NCCU_LIST_URLS,
 }
@@ -557,6 +575,11 @@ DAILY_PODCAST_SHOWS: tuple[dict[str, str], ...] = (
         "key": "in_the_know",
         "label": "In the Know",
         "url": "https://podcasts.apple.com/tw/podcast/in-the-know/id1691164140",
+    },
+    {
+        "key": "data_and_dimensions",
+        "label": "Data and Dimensions",
+        "url": "https://podcasts.apple.com/us/podcast/data-and-dimensions/id1856572783",
     },
 )
 
@@ -8014,6 +8037,9 @@ def get_default_news_feeds() -> list[tuple[str, str]]:
         ("經濟日報房市", UDN_HOUSE_RSS_URL),
         ("工商時報房市(GNews)", CTEE_HOUSE_GNEWS_URL),
         ("好房網News(GNews)", HOUSEFUN_GNEWS_URL),
+        ("鉅亨房市(GNews)", CNYES_HOUSE_GNEWS_URL),
+        ("聯合報房市(GNews)", UDN_HOUSE_GNEWS_URL),
+        ("591房屋(GNews)", N591_HOUSE_GNEWS_URL),
         ("Caixin Global(GNews)", CAIXIN_GLOBAL_GNEWS_URL),
         ("紐約時報中文網", "https://cn.nytimes.com/rss/"),
         ("Reuters China(GNews)", REUTERS_CHINA_GNEWS_URL),
@@ -8591,12 +8617,11 @@ def fetch_rer_nccu_list_entries(url: str) -> list[dict]:
 
 
 def get_news_source_name(feed, url: str) -> str:
-    if (url or "").rstrip("/") == UDN_HOUSE_RSS_URL.rstrip("/"):
-        return "經濟日報房市"
-    if (url or "").rstrip("/") == CTEE_HOUSE_GNEWS_URL.rstrip("/"):
-        return "工商時報房市(GNews)"
-    if (url or "").rstrip("/") == HOUSEFUN_GNEWS_URL.rstrip("/"):
-        return "好房網News(GNews)"
+    # House feeds carry a fixed source name from the HOUSE_NEWS_FEEDS registry; honoring it
+    # here keeps the emitted source in HOUSE_NEWS_SOURCE_NAMES so /house_news scoping matches.
+    house_name = HOUSE_NEWS_FEEDS.get(url or "") or HOUSE_NEWS_FEEDS.get((url or "").rstrip("/"))
+    if house_name:
+        return house_name
     if (url or "").rstrip("/") == CAIXIN_GLOBAL_GNEWS_URL.rstrip("/"):
         return "Caixin Global(GNews)"
     if (url or "").rstrip("/") == REUTERS_CHINA_GNEWS_URL.rstrip("/"):
