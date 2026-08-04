@@ -619,6 +619,11 @@ CHINA_PODCAST_SHOWS: tuple[dict[str, str], ...] = (
         "label": "這樣看中國 - 蔡明芳時間",
         "url": "https://podcasts.apple.com/tw/podcast/%E9%80%99%E6%A8%A3%E7%9C%8B%E4%B8%AD%E5%9C%8B-%E8%94%A1%E6%98%8E%E8%8A%B3%E6%99%82%E9%96%93/id1521629204",
     },
+    {
+        "key": "china_business_insider",
+        "label": "China Business Insider - News from Caixin Global",
+        "url": "https://podcasts.apple.com/us/podcast/china-business-insider-news-from-caixin-global/id1442752363",
+    },
 )
 
 HOUSE_PODCAST_SHOWS: tuple[dict[str, str], ...] = (
@@ -1273,6 +1278,17 @@ def _build_news_progress_message(percent: int | float | None, status: str, detai
     return "\n".join(lines)
 
 
+async def _edit_progress_message(chat_id: int, message_id: int, text: str) -> int:
+    """Edit the news progress message; if the edit fails, resend it as a new
+    message so the user isn't left staring at a stale percentage. Returns the
+    message_id that should be targeted for subsequent edits."""
+    if await edit_message(chat_id, message_id, text):
+        return message_id
+    print(f"[WARN] news progress edit failed chat_id={chat_id} message_id={message_id}; resending")
+    resent_id = await send_message(chat_id, text)
+    return resent_id or message_id
+
+
 def _estimate_transcribe_stage_progress(raw_status: str, localized_status: str) -> float:
     raw = (raw_status or "").strip().lower()
     localized = (localized_status or "").strip()
@@ -1393,20 +1409,26 @@ async def handle_news_command_with_progress(
         except asyncio.TimeoutError:
             continue
         if progress_message_id:
-            await edit_message(chat_id, progress_message_id, _build_news_progress_message(percent, status, detail))
+            progress_message_id = await _edit_progress_message(
+                chat_id, progress_message_id, _build_news_progress_message(percent, status, detail)
+            )
 
     replies = await task
     parse_mode, disable_preview = _get_news_command_render_options(cmd_text)
 
     if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
         if progress_message_id:
-            await edit_message(chat_id, progress_message_id, _build_news_progress_message(100, "新聞整理完成，正在寄送 email..."))
+            progress_message_id = await _edit_progress_message(
+                chat_id, progress_message_id, _build_news_progress_message(100, "新聞整理完成，正在寄送 email...")
+            )
         await _handle_recent_news_email_delivery(chat_id, replies[0], scope=_get_news_email_scope(cmd_text))
         return True
 
     if not replies:
         if progress_message_id:
-            await edit_message(chat_id, progress_message_id, _build_news_progress_message(100, "新聞指令執行完成，沒有可顯示的結果。"))
+            await _edit_progress_message(
+                chat_id, progress_message_id, _build_news_progress_message(100, "新聞指令執行完成，沒有可顯示的結果。")
+            )
         return True
 
     used_progress_message = False
@@ -1433,7 +1455,7 @@ async def handle_news_command_with_progress(
                 print(f"[WARN] news reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
 
     if progress_message_id and not used_progress_message:
-        await edit_message(chat_id, progress_message_id, _build_news_progress_message(100, "新聞指令執行完成。"))
+        await _edit_progress_message(chat_id, progress_message_id, _build_news_progress_message(100, "新聞指令執行完成。"))
     return True
 
 
@@ -6795,27 +6817,13 @@ def _render_news_entries_html(items: list[dict[str, str]], *, header: str) -> st
 
     all_titles = [item.get("title", "").strip() for item in items]
     translations = _translate_news_titles_to_zh(all_titles)
-    title_categories = _classify_news_titles_batch(all_titles)
-
-    # Group items by category
-    grouped: dict[str, list[dict[str, str]]] = {letter: [] for letter in NEWS_CATEGORIES}
-    for item in items:
-        title = item.get("title", "").strip()
-        cat = title_categories.get(title, _classify_news_title(title))
-        grouped[cat].append(item)
 
     lines = [f"<b>{escape(header)}</b>", ""]
-    for letter, display_name in NEWS_CATEGORIES.items():
-        rows = grouped.get(letter, [])
-        if not rows:
-            continue
-        lines.append(f"<b>{escape(display_name)}</b>")
-        for item in rows:
-            title = item.get("title", "").strip()
-            display_title = translations.get(title, "").strip() or title or "Untitled"
-            url = item.get("url", "").strip()
-            lines.append(f'• <a href="{escape(url, quote=True)}">{escape(display_title)}</a>')
-        lines.append("")
+    for item in items:
+        title = item.get("title", "").strip()
+        display_title = translations.get(title, "").strip() or title or "Untitled"
+        url = item.get("url", "").strip()
+        lines.append(f'• <a href="{escape(url, quote=True)}">{escape(display_title)}</a>')
     return "\n".join(lines).rstrip()
 
 
