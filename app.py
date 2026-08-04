@@ -1278,15 +1278,36 @@ def _build_news_progress_message(percent: int | float | None, status: str, detai
     return "\n".join(lines)
 
 
-async def _edit_progress_message(chat_id: int, message_id: int, text: str) -> int:
+NEWS_PROGRESS_RESEND_LIMIT = 2
+
+
+async def _edit_progress_message(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    resends_left: int = NEWS_PROGRESS_RESEND_LIMIT,
+) -> tuple[int, int]:
     """Edit the news progress message; if the edit fails, resend it as a new
-    message so the user isn't left staring at a stale percentage. Returns the
-    message_id that should be targeted for subsequent edits."""
+    message so the user isn't left staring at a stale percentage.
+
+    A long news command emits dozens of progress ticks, and edit_message reports
+    every transient failure (network blip, 429, deleted message) the same way,
+    so resending unconditionally can fan out dozens of messages. Give the whole
+    command a small resend budget and go quiet once it is spent.
+
+    Returns the message_id to target for subsequent edits and the remaining
+    resend budget."""
     if await edit_message(chat_id, message_id, text):
-        return message_id
-    print(f"[WARN] news progress edit failed chat_id={chat_id} message_id={message_id}; resending")
+        return message_id, resends_left
+    if resends_left <= 0:
+        return message_id, 0
+    resends_left -= 1
+    print(
+        f"[WARN] news progress edit failed chat_id={chat_id} message_id={message_id}; "
+        f"resending ({resends_left} resends left)"
+    )
     resent_id = await send_message(chat_id, text)
-    return resent_id or message_id
+    return resent_id or message_id, resends_left
 
 
 def _estimate_transcribe_stage_progress(raw_status: str, localized_status: str) -> float:
@@ -1392,6 +1413,7 @@ async def handle_news_command_with_progress(
         loop.call_soon_threadsafe(queue.put_nowait, (_clamp_progress_percent(percent), status, detail))
 
     progress_message_id = await send_message(chat_id, _build_news_progress_message(0, "正在準備新聞指令"))
+    progress_resends_left = NEWS_PROGRESS_RESEND_LIMIT
     task = asyncio.create_task(
         asyncio.to_thread(
             handle_news_command,
@@ -1409,8 +1431,11 @@ async def handle_news_command_with_progress(
         except asyncio.TimeoutError:
             continue
         if progress_message_id:
-            progress_message_id = await _edit_progress_message(
-                chat_id, progress_message_id, _build_news_progress_message(percent, status, detail)
+            progress_message_id, progress_resends_left = await _edit_progress_message(
+                chat_id,
+                progress_message_id,
+                _build_news_progress_message(percent, status, detail),
+                progress_resends_left,
             )
 
     replies = await task
@@ -1418,8 +1443,11 @@ async def handle_news_command_with_progress(
 
     if APP_PROFILE == "main" and _is_recent_news_command(cmd_text) and replies:
         if progress_message_id:
-            progress_message_id = await _edit_progress_message(
-                chat_id, progress_message_id, _build_news_progress_message(100, "新聞整理完成，正在寄送 email...")
+            progress_message_id, progress_resends_left = await _edit_progress_message(
+                chat_id,
+                progress_message_id,
+                _build_news_progress_message(100, "新聞整理完成，正在寄送 email..."),
+                progress_resends_left,
             )
         await _handle_recent_news_email_delivery(chat_id, replies[0], scope=_get_news_email_scope(cmd_text))
         return True
@@ -1427,7 +1455,10 @@ async def handle_news_command_with_progress(
     if not replies:
         if progress_message_id:
             await _edit_progress_message(
-                chat_id, progress_message_id, _build_news_progress_message(100, "新聞指令執行完成，沒有可顯示的結果。")
+                chat_id,
+                progress_message_id,
+                _build_news_progress_message(100, "新聞指令執行完成，沒有可顯示的結果。"),
+                progress_resends_left,
             )
         return True
 
@@ -1455,7 +1486,12 @@ async def handle_news_command_with_progress(
                 print(f"[WARN] news reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
 
     if progress_message_id and not used_progress_message:
-        await _edit_progress_message(chat_id, progress_message_id, _build_news_progress_message(100, "新聞指令執行完成。"))
+        await _edit_progress_message(
+            chat_id,
+            progress_message_id,
+            _build_news_progress_message(100, "新聞指令執行完成。"),
+            progress_resends_left,
+        )
     return True
 
 

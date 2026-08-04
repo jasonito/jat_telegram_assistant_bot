@@ -364,6 +364,47 @@ class SmokeTests(unittest.TestCase):
         )
         mocked_send.assert_awaited_once_with(123, "偵測到 3 個可轉錄網址，將依序排隊處理。")
 
+    def test_edit_progress_message_resends_once_then_stops_fanning_out(self):
+        async def _run():
+            with mock.patch.object(
+                app, "edit_message", new=mock.AsyncMock(return_value=False)
+            ) as mocked_edit, mock.patch.object(
+                app, "send_message", new=mock.AsyncMock(side_effect=[201, 202, 203, 204])
+            ) as mocked_send:
+                message_id = 100
+                resends_left = app.NEWS_PROGRESS_RESEND_LIMIT
+                seen: list[int] = []
+                for _ in range(6):
+                    message_id, resends_left = await app._edit_progress_message(
+                        123, message_id, "progress", resends_left
+                    )
+                    seen.append(message_id)
+            return seen, resends_left, mocked_edit, mocked_send
+
+        seen, resends_left, mocked_edit, mocked_send = asyncio.run(_run())
+
+        # Every tick still attempts an edit, but resends stop once the budget is spent.
+        self.assertEqual(mocked_edit.await_count, 6)
+        self.assertEqual(mocked_send.await_count, app.NEWS_PROGRESS_RESEND_LIMIT)
+        self.assertEqual(resends_left, 0)
+        self.assertEqual(seen, [201, 202, 202, 202, 202, 202])
+
+    def test_edit_progress_message_keeps_budget_when_edit_succeeds(self):
+        async def _run():
+            with mock.patch.object(
+                app, "edit_message", new=mock.AsyncMock(return_value=True)
+            ), mock.patch.object(app, "send_message", new=mock.AsyncMock(return_value=999)) as mocked_send:
+                message_id, resends_left = await app._edit_progress_message(
+                    123, 100, "progress", app.NEWS_PROGRESS_RESEND_LIMIT
+                )
+            return message_id, resends_left, mocked_send
+
+        message_id, resends_left, mocked_send = asyncio.run(_run())
+
+        self.assertEqual(message_id, 100)
+        self.assertEqual(resends_left, app.NEWS_PROGRESS_RESEND_LIMIT)
+        mocked_send.assert_not_awaited()
+
     def test_handle_transcribe_auto_url_message_ignores_unsupported_url(self):
         text = "https://example.com/not-supported"
 
