@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from email.message import EmailMessage
 from html.parser import HTMLParser
 
-from typing import Callable, Iterator
+from typing import Awaitable, Callable, Iterator
 from urllib.parse import parse_qsl
 from urllib.parse import quote
 from urllib.parse import urlencode
@@ -254,6 +254,7 @@ NEWS_TITLE_TRANSLATION_PROVIDER = (
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
@@ -267,6 +268,20 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 DEEPLX_API_URL = os.getenv("DEEPLX_API_URL", "http://127.0.0.1:1188/translate").strip()
 DEEPLX_AUTH_KEY = os.getenv("DEEPLX_AUTH_KEY", "").strip()
+
+# Podcast transcript polishing (/daily_podcast, /china_podcast, /house_podcast).
+# Runs after a transcript is saved: cleans up the raw speech-to-text wall of text
+# and, when the source is not Traditional Chinese, translates it in full.
+PODCAST_POLISH_ENABLED = _env_flag("PODCAST_POLISH_ENABLED", False)
+PODCAST_POLISH_CHUNK_CHARS = int(os.getenv("PODCAST_POLISH_CHUNK_CHARS", "3000"))
+PODCAST_POLISH_TIMEOUT_SECONDS = int(os.getenv("PODCAST_POLISH_TIMEOUT_SECONDS", "180"))
+PODCAST_POLISH_TEMPERATURE = _env_float("PODCAST_POLISH_TEMPERATURE", 0.2)
+PODCAST_POLISH_KEEP_RAW = _env_flag("PODCAST_POLISH_KEEP_RAW", True)
+# A polish pass should return text of comparable length. Much shorter output means
+# the model summarised or the response was truncated, so the chunk is retried.
+PODCAST_POLISH_MIN_RATIO = _env_float("PODCAST_POLISH_MIN_RATIO", 0.5)
+# Translation legitimately compresses (English -> Chinese), so it gets a looser bound.
+PODCAST_POLISH_MIN_RATIO_TRANSLATE = _env_float("PODCAST_POLISH_MIN_RATIO_TRANSLATE", 0.15)
 NEWS_URL_FETCH_MAX_ARTICLES = int(os.getenv("NEWS_URL_FETCH_MAX_ARTICLES", "3"))
 NEWS_URL_FETCH_MAX_CHARS = int(os.getenv("NEWS_URL_FETCH_MAX_CHARS", "3000"))
 NEWS_URL_FETCH_TIMEOUT_SECONDS = int(os.getenv("NEWS_URL_FETCH_TIMEOUT_SECONDS", "6"))
@@ -513,6 +528,16 @@ DAILY_PODCAST_SHOWS: tuple[dict[str, str], ...] = (
         "key": "data_and_dimensions",
         "label": "Data and Dimensions",
         "url": "https://podcasts.apple.com/us/podcast/data-and-dimensions/id1856572783",
+    },
+    {
+        "key": "zhaohua_guhuozai",
+        "label": "兆華與股惑仔",
+        "url": "https://podcasts.apple.com/tw/podcast/%E5%85%86%E8%8F%AF%E8%88%87%E8%82%A1%E6%83%91%E4%BB%94/id1590806478",
+    },
+    {
+        "key": "youtinghao_haojiao",
+        "label": "游庭皓的財經皓角",
+        "url": "https://podcasts.apple.com/tw/podcast/%E6%B8%B8%E5%BA%AD%E7%9A%93%E7%9A%84%E8%B2%A1%E7%B6%93%E7%9A%93%E8%A7%92/id1488295306",
     },
 )
 
@@ -1077,7 +1102,10 @@ def init_storage() -> None:
         conn.commit()
 
 
-init_storage()
+# init_storage() is invoked at the bottom of this module, not here: seeding the
+# default news feeds on a fresh database calls get_default_news_feeds(), which is
+# defined much further down. Calling it here raised NameError on a first run with
+# an empty news_feeds table.
 
 
 def open_notepad() -> None:
@@ -1273,6 +1301,15 @@ def _estimate_transcribe_stage_progress(raw_status: str, localized_status: str) 
         if match:
             return 0.45 + (min(100, int(match.group(1))) / 100.0) * 0.5
         return 0.6
+    if "潤飾" in localized:
+        # Polishing runs after transcription, so it has to start at or above the
+        # 0.95 ceiling of the transcribing stage or the bar would move backwards.
+        match = re.search(r"(\d+)/(\d+)", localized)
+        if match:
+            current = max(1, int(match.group(1)))
+            total = max(current, int(match.group(2)))
+            return 0.95 + (current / total) * 0.05
+        return 0.95
     return 0.1
 
 
@@ -1912,21 +1949,29 @@ def _build_fixed_podcast_usage(
     *,
     include_run_all_example: bool = True,
 ) -> str:
-    lines = [
-        f"用法：{command_name}",
-        f"或：{command_name} run [all|節目 key]",
-        f"或：{command_name} list",
-        f"例如：{command_name}",
-        "可用節目：",
-    ]
+    lines = [f"{command_name}　跑全部"]
     if include_run_all_example:
-        lines.insert(4, f"例如：{command_name} run all")
+        lines.append(f"{command_name} run all")
+    lines.append(f"{command_name} run <key> [key ...]")
+    lines.append(f"{command_name} list　看節目 key")
     sample_keys = " ".join(item["key"] for item in list(shows)[:2])
     if sample_keys:
-        insert_at = 5 if include_run_all_example else 4
-        lines.insert(insert_at, f"例如：{command_name} run {sample_keys}")
-    for item in shows:
-        lines.append(f"- {item['key']}: {item['label']}")
+        lines.append("")
+        lines.append(f"例：{command_name} run {sample_keys}")
+    return "\n".join(lines)
+
+
+def _build_fixed_podcast_show_list(
+    shows: tuple[dict[str, str], ...] | list[dict[str, str]],
+) -> str:
+    """The full key/label table, shown only by the `list` subcommand.
+
+    Usage text is kept short so a typo does not bury the error message under
+    twenty lines of show names.
+    """
+    items = list(shows)
+    lines = [f"可用節目（{len(items)}）"]
+    lines.extend(f"{item['key']}　{item['label']}" for item in items)
     return "\n".join(lines)
 
 
@@ -2538,11 +2583,337 @@ def _fetch_latest_fixed_podcast_episode(tx, show: dict[str, str]) -> dict[str, o
     return episode
 
 
+def _build_fixed_podcast_summary(
+    successes: list[tuple[str, str]],
+    failures: list[str],
+    skipped: list[str],
+    polish_notes: list[str],
+    output_dir: Path,
+) -> str:
+    """Plain-text batch summary.
+
+    No links, so no HTML parse mode and no escaping: episode titles routinely
+    contain characters (&, <) that would otherwise have to be escaped, and a
+    single bad title would break the whole message.
+    """
+    parts = list(Path(output_dir).parts)
+    short_dir = "\\".join(parts[-2:]) if len(parts) > 2 else str(output_dir)
+    lines = [f"✅ {len(successes)}　❌ {len(failures)}　☑️ {len(skipped)}　📁 {short_dir}"]
+
+    if successes:
+        lines += ["", "✅ 成功"]
+        lines += [f"• {label} — {title}" for label, title in successes]
+    if failures:
+        lines += ["", "❌ 失敗"]
+        lines += [f"• {item}" for item in failures]
+    if skipped:
+        lines += ["", f"☑️ 已處理過最新一集（{len(skipped)}）", "　" + "、".join(skipped)]
+    if polish_notes:
+        lines += ["", "📝 潤飾"]
+        lines += [f"• {item}" for item in polish_notes]
+    if any("逾時" in item for item in failures):
+        lines += ["", "※ 逾時可改用較小的 WHISPER_MODEL 或縮短音訊"]
+    return "\n".join(lines)
+
+
+def _shorten_transcript_title(path: Path) -> str:
+    """Episode title for the summary, without the show prefix the filename repeats.
+
+    save_transcript_md() names files "<show name> - <episode title>.md", and the
+    summary bullet already carries the show label, so the prefix is dropped.
+    """
+    stem = path.stem
+    parts = re.split(r"\s+-\s+", stem, maxsplit=1)
+    if len(parts) == 2 and parts[1].strip() and len(parts[0]) <= 40:
+        stem = parts[1]
+    return stem.strip() or path.stem
+
+
 def _format_fixed_podcast_failure(label: str, error: Exception | str) -> str:
-    message = str(error or "").strip()
+    message = _condense_fixed_podcast_failure(label, str(error or "").strip())
+    return f"{label} — {message}"
+
+
+def _condense_fixed_podcast_failure(label: str, message: str) -> str:
+    """Shorten the raw error into something that reads well in a batch summary.
+
+    The advice for a stalled transcription is appended once at the end of the
+    summary instead of being repeated on every failing line.
+    """
+    if not message:
+        return "失敗"
     if message.startswith("Transcription appears stalled at 0%"):
-        return f"{label}：轉錄逾時，長時間停在 0%；建議改用較小模型或縮短音訊"
-    return f"{label}：{message}" if message else f"{label}：失敗"
+        return "轉錄逾時（卡在 0%）"
+    if message == "Failed to download audio.":
+        return "音訊下載失敗"
+    # "找不到最新集數：a16z" already names the show the bullet is labelled with.
+    suffix = f"：{label}"
+    if message.endswith(suffix):
+        message = message[: -len(suffix)]
+    return message or "失敗"
+
+
+# ==============================================================================
+# Transcript polishing
+#
+# Raw Whisper output for a podcast is one long unpunctuated run-on blob
+# (transcription.py joins segments with spaces). This turns it into readable
+# prose, and translates it into Traditional Chinese when the source is not
+# already Traditional Chinese. It is a rewrite, never a summary, so the text is
+# processed in chunks and the pieces are concatenated back together.
+# ==============================================================================
+
+POLISH_CHUNK_FAILED_MARK = "【本段潤飾失敗，保留原始逐字稿】"
+POLISH_METADATA_KEY = "Polished"
+
+# Characters that exist only in Simplified Chinese. Any hit means the transcript
+# needs conversion, not just polishing. This is a heuristic, not a full table.
+_SIMPLIFIED_ONLY_CHARS = frozenset(
+    "们这来对时会说国学现实发经过还应该样长门问间关开无与书见觉让认识语请话讲论记计读写"
+    "产从传价儿党军农决准减击别动务医单卖卫厂历压参双变号吗员团园图场坏块执扩扫护报担择"
+    "换据损数断旧显术机杀杂权条极构桥检楼标树欢气汉汇汤洁测济满灭灯灵灾炉热爱现环电画"
+    "监盘码确礼离种积称稳穷笔简类紧线练组细终经结给络绝统续维绿编网罗联节营补装规许设"
+    "访证评诉词译试询该详误调谈谢贝负责货质购贵贷费资赏赔赚赞车转轮软轻载输边达过运连"
+    "适选递邮针钟钢钱铁铜银锁错闪闭闲闻队阶阵阳阴陆陈险随难静页顶项顺预领题颜风飞饭饮"
+    "馆马验鱼鲜鸟鸡鸭麦黄黑齐齿龙龟"
+)
+
+
+def _detect_transcript_script(text: str) -> str:
+    """Classify transcript text as 'zh-hant', 'zh-hans' or 'other'."""
+    sample = text[:8000]
+    cjk = sum(1 for ch in sample if "一" <= ch <= "鿿")
+    latin = sum(1 for ch in sample if ch.isascii() and ch.isalpha())
+    if cjk < 20 and latin > cjk:
+        return "other"
+    if any(ch in _SIMPLIFIED_ONLY_CHARS for ch in sample):
+        return "zh-hans"
+    return "zh-hant"
+
+
+def _split_transcript_md(content: str) -> tuple[str, str]:
+    """Split a saved transcript markdown file into (header, body).
+
+    save_transcript_md() writes '# title', metadata bullets, '---', then the text.
+    The header is preserved verbatim so polishing never loses source metadata.
+    """
+    marker = "\n---\n"
+    idx = content.find(marker)
+    if idx == -1:
+        return "", content
+    return content[: idx + len(marker)], content[idx + len(marker) :]
+
+
+def _transcript_already_polished(header: str) -> bool:
+    return f"- **{POLISH_METADATA_KEY}:**" in header
+
+
+def _split_text_for_polish(text: str, chunk_chars: int) -> list[str]:
+    """Chunk text, preferring sentence boundaries over hard cuts."""
+    text = text.strip()
+    if not text:
+        return []
+    if chunk_chars <= 0 or len(text) <= chunk_chars:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+    total = len(text)
+    while start < total:
+        end = start + chunk_chars
+        if end >= total:
+            chunks.append(text[start:total])
+            break
+        # Only look for a break in the back 40% so chunks stay reasonably full.
+        window_start = start + int(chunk_chars * 0.6)
+        cut = -1
+        for punct in ("。", "！", "？", "\n", "；", ".", "!", "?", " "):
+            found = text.rfind(punct, window_start, end)
+            if found > cut:
+                cut = found
+        if cut <= start:
+            cut = end - 1
+        chunks.append(text[start : cut + 1])
+        start = cut + 1
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+
+def _build_polish_system_prompt(mode: str) -> str:
+    base = (
+        "你是逐字稿校訂員。你的工作是把語音轉錄的流水稿整理成可讀的文字，"
+        "但絕對不可以改變內容本身。\n\n"
+        "整理規則：\n"
+        "1. 斷句：把流水句依語意切成正常的句子與段落。\n"
+        "2. 刪贅字與口頭禪（呃、那個、就是、然後、其實…），"
+        "但帶語意的詞不刪，例如用於回應的「對」。\n"
+        "3. 刪明顯口誤重複，例如「我覺得我覺得」。\n"
+        "4. 同音錯字：有把握才修正；沒把握就保留原文並標註「（推測：⋯，待覆核）」。\n"
+        "5. 補標點、分段。必要時可加小標題或項目符號，那屬於排版，不是內容修改。\n"
+        "6. 人名與專有名詞依上下文判斷；無法確定時標註「（名稱待覆核）」。\n"
+        "7. 轉錄品質太差、難以還原的段落標註"
+        "「【轉錄不確定，建議覆核原始錄音】」，不要自行編造聽起來合理的版本。\n\n"
+        "嚴格禁止：\n"
+        "- 不可摘要、濃縮，或改寫成評論、報告。\n"
+        "- 不可增刪事實、數據、順序、語氣或說話者。\n"
+        "- 不可加入「附註」「資料正確性說明」「來源查核表」等額外章節。\n"
+        "- 不可加入任何開場白或結語，例如「以下是整理後的內容」。\n"
+        "- 只輸出處理後的逐字稿文字本身。\n"
+    )
+    if mode == "translate":
+        return base + (
+            "\n這份輸入不是台灣繁體中文。請完整翻譯成台灣用語的繁體中文，"
+            "同時套用上述整理規則。翻譯必須完整：保留原有的內容、順序、數據、語氣、"
+            "說話者與不確定之處。翻譯不是摘要，不可以只翻重點。\n"
+        )
+    return base + "\n輸入已經是繁體中文，只做上述整理，不要翻譯。\n"
+
+
+def _polish_one_chunk(chunk: str, mode: str, index: int, total: int) -> str | None:
+    """Polish a single chunk, retrying once. Returns None if it could not be done."""
+    system_prompt = _build_polish_system_prompt(mode)
+    user_prompt = (
+        f"這是一份長逐字稿的第 {index}/{total} 段，"
+        "請直接接續處理這一段，不要加開場白或結語。\n\n"
+        "-----\n"
+        f"{chunk}\n"
+        "-----"
+    )
+    ratio = PODCAST_POLISH_MIN_RATIO if mode == "polish" else PODCAST_POLISH_MIN_RATIO_TRANSLATE
+    min_length = max(1, int(len(chunk) * ratio))
+    for attempt in (1, 2):
+        out = _normalize_text_value(
+            _run_ai_chat(
+                system_prompt,
+                user_prompt,
+                temperature=PODCAST_POLISH_TEMPERATURE,
+                timeout_seconds=PODCAST_POLISH_TIMEOUT_SECONDS,
+            )
+        ).strip()
+        if not out:
+            print(f"[WARN] polish chunk {index}/{total} attempt {attempt}: empty response")
+            continue
+        if len(out) < min_length:
+            print(
+                f"[WARN] polish chunk {index}/{total} attempt {attempt}: "
+                f"output too short ({len(out)} < {min_length}); likely summarised or truncated"
+            )
+            continue
+        return out
+    return None
+
+
+def _prepare_transcript_polish(path: Path) -> dict[str, object] | None:
+    """Read a transcript and plan the polish pass. None means nothing to do."""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"[WARN] polish: cannot read {path}: {e}")
+        return None
+    header, body = _split_transcript_md(content)
+    body = body.strip()
+    if not body:
+        return None
+    if _transcript_already_polished(header):
+        print(f"[INFO] polish: {path.name} already polished; skipping")
+        return None
+    script = _detect_transcript_script(body)
+    mode = "polish" if script == "zh-hant" else "translate"
+    chunks = _split_text_for_polish(body, PODCAST_POLISH_CHUNK_CHARS)
+    if not chunks:
+        return None
+    return {
+        "content": content,
+        "header": header,
+        "chunks": chunks,
+        "mode": mode,
+        "script": script,
+    }
+
+
+def _finalize_transcript_polish(
+    path: Path,
+    original_content: str,
+    header: str,
+    parts: list[str],
+    mode: str,
+    script: str,
+    failed: int,
+) -> None:
+    """Back up the raw transcript, then overwrite the .md with the polished text."""
+    if PODCAST_POLISH_KEEP_RAW:
+        try:
+            backup_dir = DATA_DIR / "_runtime" / "raw_transcripts"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(tz=get_local_tz()).strftime("%Y%m%d-%H%M%S")
+            (backup_dir / f"{path.stem}-{stamp}.md").write_text(
+                original_content, encoding="utf-8"
+            )
+        except Exception as e:
+            # A failed backup must not cost us the polished result.
+            print(f"[WARN] polish: raw backup failed for {path.name}: {e}")
+
+    stamp = datetime.now(tz=get_local_tz()).strftime("%Y-%m-%d %H:%M")
+    note = f"{stamp} / {mode} / detected {script}"
+    if failed:
+        note += f" / {failed} chunk(s) kept raw"
+    header_text = header.rstrip("\n")
+    if header_text.endswith("---"):
+        header_text = header_text[: -len("---")].rstrip("\n")
+        header_text = f"{header_text}\n- **{POLISH_METADATA_KEY}:** {note}\n\n---"
+    body_text = "\n\n".join(part.strip() for part in parts if part.strip())
+    path.write_text(f"{header_text}\n\n{body_text}\n", encoding="utf-8")
+
+
+async def _polish_transcript_file(
+    path: Path,
+    on_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, object]:
+    """Polish a saved transcript in place. Never raises; reports status instead."""
+    plan = await asyncio.to_thread(_prepare_transcript_polish, path)
+    if not plan:
+        return {"status": "skipped"}
+
+    chunks = list(plan["chunks"])
+    mode = str(plan["mode"])
+    total = len(chunks)
+    parts: list[str] = []
+    failed = 0
+
+    for index, chunk in enumerate(chunks, start=1):
+        if should_cancel and should_cancel():
+            # Cancelled mid-pass: leave the transcript exactly as transcribed.
+            print(f"[INFO] polish: cancelled at chunk {index}/{total} for {path.name}")
+            return {"status": "cancelled", "chunks": total, "failed": failed, "mode": mode}
+        if on_progress:
+            try:
+                await on_progress(index, total, mode)
+            except Exception:
+                pass
+        polished = await asyncio.to_thread(_polish_one_chunk, chunk, mode, index, total)
+        if polished is None:
+            # Keep the raw text so nothing is lost, and flag it for review.
+            failed += 1
+            parts.append(f"{POLISH_CHUNK_FAILED_MARK}\n{chunk}")
+        else:
+            parts.append(polished)
+
+    if failed == total:
+        # Every chunk failed: the provider is down. Leave the file untouched.
+        print(f"[WARN] polish: all {total} chunk(s) failed for {path.name}; file left unchanged")
+        return {"status": "failed", "chunks": total, "failed": failed, "mode": mode}
+
+    await asyncio.to_thread(
+        _finalize_transcript_polish,
+        path,
+        str(plan["content"]),
+        str(plan["header"]),
+        parts,
+        mode,
+        str(plan["script"]),
+        failed,
+    )
+    return {"status": "ok", "chunks": total, "failed": failed, "mode": mode}
 
 
 async def _handle_fixed_podcast_command(
@@ -2566,7 +2937,7 @@ async def _handle_fixed_podcast_command(
     if raw_args is None:
         return False
     if raw_args.lower() == "list":
-        await send_message(chat_id, usage_text)
+        await send_message(chat_id, _build_fixed_podcast_show_list(shows))
         return True
 
     selected, error = resolve_selection(raw_args)
@@ -2611,7 +2982,7 @@ async def _handle_fixed_podcast_command(
             try:
                 episode = await asyncio.to_thread(fetch_latest_episode, tx, show)
                 if is_episode_processed(episode):
-                    skipped.append(f"{show['label']}：已處理過最新一集")
+                    skipped.append(str(show["label"]))
                     continue
                 episodes.append(episode)
             except Exception as e:
@@ -2619,31 +2990,33 @@ async def _handle_fixed_podcast_command(
 
         if not episodes:
             lines = ["沒有可轉錄的 podcast 集數。"]
-            lines.extend(f"- 跳過 {item}" for item in skipped)
-            lines.extend(f"- {item}" for item in failures)
+            if skipped:
+                lines += ["", f"☑️ 已處理過最新一集（{len(skipped)}）", "　" + "、".join(skipped)]
+            if failures:
+                lines += ["", "❌ 失敗"]
+                lines += [f"• {item}" for item in failures]
             await send_message(chat_id, "\n".join(lines))
             return True
 
+        out_day = output_dir / datetime.now(tz=get_local_tz()).date().isoformat()
+        out_parts = list(out_day.parts)
         intro_lines = [
-            f"即將開始批次轉錄 {len(episodes)} 個節目",
-            f"輸出資料夾：{output_dir / datetime.now(tz=get_local_tz()).date().isoformat()}",
+            f"即將轉錄 {len(episodes)} 個節目　📁 "
+            + ("\\".join(out_parts[-2:]) if len(out_parts) > 2 else str(out_day)),
+            "",
         ]
-        if failures:
-            intro_lines.append(f"略過 {len(failures)} 個節目，原因見下方。")
-        if skipped:
-            intro_lines.append(f"已跳過 {len(skipped)} 個已處理節目。")
-        detail_lines = []
         for episode in episodes:
             duration_text = _format_seconds_rough(int(episode.get("duration_seconds") or 0))
-            detail_lines.append(
-                f"- {episode['show_label']}: {episode.get('title') or 'Unknown Episode'}"
-                f"（長度：約 {duration_text}）"
+            intro_lines.append(
+                f"• {episode['show_label']} — {episode.get('title') or 'Unknown Episode'}"
+                f"（約 {duration_text}）"
             )
         if failures:
-            detail_lines.extend(f"- 略過 {item}" for item in failures)
+            intro_lines += ["", "❌ 失敗"]
+            intro_lines += [f"• {item}" for item in failures]
         if skipped:
-            detail_lines.extend(f"- 跳過 {item}" for item in skipped)
-        start_text = "\n".join(intro_lines + [""] + detail_lines)
+            intro_lines += ["", f"☑️ 已處理過最新一集（{len(skipped)}）", "　" + "、".join(skipped)]
+        start_text = "\n".join(intro_lines)
         if progress_message_id:
             await edit_message(
                 chat_id,
@@ -2658,6 +3031,7 @@ async def _handle_fixed_podcast_command(
             )
 
         successes: list[tuple[str, str]] = []
+        polish_notes: list[str] = []
         for idx, episode in enumerate(episodes, start=1):
             if cancel_event.is_set():
                 raise TranscribeJobCancelled("Cancelled by user.")
@@ -2708,7 +3082,41 @@ async def _handle_fixed_podcast_command(
                     progress_message_id=progress_message_id,
                     status_text_builder=_build_episode_status_text,
                 )
-                successes.append((f"{show_label}: {out_path.name}", _local_file_uri(out_path)))
+                successes.append((show_label, _shorten_transcript_title(out_path)))
+
+                if PODCAST_POLISH_ENABLED and AI_SUMMARY_ENABLED:
+
+                    async def _on_polish_progress(
+                        chunk_index: int, chunk_total: int, polish_mode: str
+                    ) -> None:
+                        if not progress_message_id:
+                            return
+                        action = "潤飾" if polish_mode == "polish" else "翻譯並潤飾"
+                        await edit_message(
+                            chat_id,
+                            progress_message_id,
+                            _build_episode_status_text(
+                                f"正在{action}逐字稿（{chunk_index}/{chunk_total} 段）"
+                            ),
+                        )
+
+                    polish_result = await _polish_transcript_file(
+                        out_path,
+                        _on_polish_progress,
+                        cancel_event.is_set,
+                    )
+                    polish_status = str(polish_result.get("status") or "")
+                    if polish_status == "failed":
+                        polish_notes.append(f"{show_label}：潤飾失敗，已保留原始逐字稿")
+                    elif polish_status == "cancelled":
+                        polish_notes.append(f"{show_label}：潤飾已取消，已保留原始逐字稿")
+                    elif polish_status == "ok":
+                        polish_failed = int(polish_result.get("failed") or 0)
+                        if polish_failed:
+                            polish_notes.append(
+                                f"{show_label}：潤飾完成，但有 {polish_failed} 段失敗並保留原文"
+                            )
+
                 await asyncio.to_thread(
                     mark_episode_processed,
                     episode,
@@ -2740,23 +3148,13 @@ async def _handle_fixed_podcast_command(
                 if progress_message_id:
                     await edit_message(chat_id, progress_message_id, err_text)
 
-        summary_lines = [
-            escape(f"完成：成功 {len(successes)}，失敗 {len(failures)}，跳過 {len(skipped)}"),
-            escape(f"輸出：{output_dir / datetime.now(tz=get_local_tz()).date().isoformat()}"),
-        ]
-        if successes:
-            summary_lines.append("成功：")
-            summary_lines.extend(
-                f'- <a href="{escape(uri, quote=True)}">{escape(label)}</a>'
-                for label, uri in successes
-            )
-        if failures:
-            summary_lines.append("失敗：")
-            summary_lines.extend(f"- {escape(item)}" for item in failures)
-        if skipped:
-            summary_lines.append("跳過：")
-            summary_lines.extend(f"- {escape(item)}" for item in skipped)
-        summary_text = "\n".join(summary_lines)
+        summary_text = _build_fixed_podcast_summary(
+            successes,
+            failures,
+            skipped,
+            polish_notes,
+            output_dir / datetime.now(tz=get_local_tz()).date().isoformat(),
+        )
         if progress_message_id:
             await edit_message(
                 chat_id,
@@ -2768,11 +3166,10 @@ async def _handle_fixed_podcast_command(
                     "全部完成",
                     summary_text,
                 ),
-                parse_mode="HTML",
                 disable_web_page_preview=True,
             )
         else:
-            await send_message(chat_id, summary_text, parse_mode="HTML", disable_web_page_preview=True)
+            await send_message(chat_id, summary_text, disable_web_page_preview=True)
         return True
     except Exception as e:
         is_cancelled = isinstance(e, TranscribeJobCancelled) or (
@@ -5021,7 +5418,7 @@ def generate_ai_summary(
                 print("[WARN] AI summary enabled but OPENAI_API_KEY is empty; using fallback summary")
                 return None
             resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
+                f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
                     "Content-Type": "application/json",
@@ -5188,14 +5585,22 @@ def _resolve_ai_provider() -> str:
     return provider
 
 
-def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
+def _run_ai_chat(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    temperature: float | None = None,
+    timeout_seconds: int | None = None,
+) -> str | None:
     provider = _resolve_ai_provider()
+    chat_temperature = AI_SUMMARY_TEMPERATURE if temperature is None else temperature
+    chat_timeout = AI_SUMMARY_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     try:
         if provider == "openai":
             if not OPENAI_API_KEY:
                 return None
             resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
+                f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
                     "Content-Type": "application/json",
@@ -5206,9 +5611,9 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": AI_SUMMARY_TEMPERATURE,
+                    "temperature": chat_temperature,
                 },
-                timeout=AI_SUMMARY_TIMEOUT_SECONDS,
+                timeout=chat_timeout,
             )
             if resp.status_code >= 300:
                 return None
@@ -5224,9 +5629,9 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                 headers={"Content-Type": "application/json"},
                 json={
                     "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
-                    "generationConfig": {"temperature": AI_SUMMARY_TEMPERATURE},
+                    "generationConfig": {"temperature": chat_temperature},
                 },
-                timeout=AI_SUMMARY_TIMEOUT_SECONDS,
+                timeout=chat_timeout,
             )
             if resp.status_code >= 300:
                 return None
@@ -5250,11 +5655,11 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                 json={
                     "model": ANTHROPIC_MODEL,
                     "max_tokens": 800,
-                    "temperature": AI_SUMMARY_TEMPERATURE,
+                    "temperature": chat_temperature,
                     "system": system_prompt,
                     "messages": [{"role": "user", "content": user_prompt}],
                 },
-                timeout=AI_SUMMARY_TIMEOUT_SECONDS,
+                timeout=chat_timeout,
             )
             if resp.status_code >= 300:
                 return None
@@ -5277,9 +5682,9 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": AI_SUMMARY_TEMPERATURE,
+                    "temperature": chat_temperature,
                 },
-                timeout=AI_SUMMARY_TIMEOUT_SECONDS,
+                timeout=chat_timeout,
             )
             if resp.status_code >= 300:
                 return None
@@ -5297,9 +5702,9 @@ def _run_ai_chat(system_prompt: str, user_prompt: str) -> str | None:
                         {"role": "user", "content": user_prompt},
                     ],
                     "stream": False,
-                    "options": {"temperature": AI_SUMMARY_TEMPERATURE},
+                    "options": {"temperature": chat_temperature},
                 },
-                timeout=AI_SUMMARY_TIMEOUT_SECONDS,
+                timeout=chat_timeout,
             )
             if resp.status_code >= 300:
                 return None
@@ -10165,3 +10570,8 @@ def on_startup() -> None:
 @app.get("/healthz")
 def healthz() -> dict:
     return _app_health_snapshot()
+
+
+# Runs at import time, as before, but from here every helper it needs (notably
+# get_default_news_feeds) is already defined.
+init_storage()

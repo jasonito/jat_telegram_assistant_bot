@@ -545,9 +545,15 @@ class SmokeTests(unittest.TestCase):
     def test_build_china_podcast_usage_mentions_command_and_keys(self):
         usage = app._build_china_podcast_usage()
         self.assertIn("/china_podcast", usage)
-        self.assertIn("hudson_china_insider", usage)
-        self.assertIn("china_desk", usage)
         self.assertNotIn("/china_podcast run all", usage)
+        # Keys moved out of the usage blurb and into the `list` subcommand so a
+        # typo does not bury the error under the whole show table.
+        self.assertIn("/china_podcast list", usage)
+        # The first keys still show up in the "例：" line; the full table does not.
+        self.assertNotIn("china_desk", usage)
+        listing = app._build_fixed_podcast_show_list(app.CHINA_PODCAST_SHOWS)
+        self.assertIn("hudson_china_insider", listing)
+        self.assertIn("china_desk", listing)
 
     def test_resolve_house_podcast_selection_defaults_to_all(self):
         selected, error = app._resolve_house_podcast_selection("")
@@ -565,9 +571,13 @@ class SmokeTests(unittest.TestCase):
     def test_build_house_podcast_usage_mentions_command_and_keys(self):
         usage = app._build_house_podcast_usage()
         self.assertIn("/house_podcast", usage)
-        self.assertIn("estate_learning_voice", usage)
-        self.assertIn("find_place_live_real_estate", usage)
         self.assertNotIn("/house_podcast run all", usage)
+        self.assertIn("/house_podcast list", usage)
+        # The first keys still show up in the "例：" line; the full table does not.
+        self.assertNotIn("find_place_live_real_estate", usage)
+        listing = app._build_fixed_podcast_show_list(app.HOUSE_PODCAST_SHOWS)
+        self.assertIn("estate_learning_voice", listing)
+        self.assertIn("find_place_live_real_estate", listing)
 
     def test_estimate_daily_podcast_total_seconds_uses_duration_and_model(self):
         estimate = app._estimate_daily_podcast_total_seconds(
@@ -688,10 +698,9 @@ class SmokeTests(unittest.TestCase):
             "Transcription appears stalled at 0% for 50m 20s. Please retry with a shorter clip or a smaller Whisper model.",
         )
 
-        self.assertEqual(
-            message,
-            "Lex Fridman Podcast：轉錄逾時，長時間停在 0%；建議改用較小模型或縮短音訊",
-        )
+        # The "use a smaller model" advice is now printed once at the end of the
+        # batch summary instead of being repeated on every failing line.
+        self.assertEqual(message, "Lex Fridman Podcast — 轉錄逾時（卡在 0%）")
 
     def test_mark_daily_podcast_episode_processed_uses_all_state_keys(self):
         episode = {
