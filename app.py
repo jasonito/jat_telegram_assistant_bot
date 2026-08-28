@@ -2943,6 +2943,165 @@ async def _polish_transcript_file(
     return {"status": "ok", "chunks": total, "failed": failed, "mode": mode}
 
 
+def _transcript_search_roots() -> list[Path]:
+    """Directories that hold saved transcripts, de-duplicated and existing only."""
+    roots: list[Path] = []
+    for candidate in (
+        TRANSCRIPTS_DIR,
+        DAILY_PODCAST_DIR,
+        CHINA_PODCAST_DIR,
+        HOUSE_PODCAST_DIR,
+        DAILY_PODCAST_RESOURCE_DIR,
+        CHINA_PODCAST_RESOURCE_DIR,
+        HOUSE_PODCAST_RESOURCE_DIR,
+    ):
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if resolved not in roots and resolved.is_dir():
+            roots.append(resolved)
+    return roots
+
+
+def _find_transcripts(limit: int = 200, unpolished_only: bool = True) -> list[Path]:
+    """Newest-first transcripts across the transcript roots."""
+    found: dict[Path, float] = {}
+    for root in _transcript_search_roots():
+        try:
+            for path in root.rglob("*.md"):
+                if not path.is_file() or path in found:
+                    continue
+                if unpolished_only:
+                    try:
+                        header, _ = _split_transcript_md(path.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if _transcript_already_polished(header):
+                        continue
+                found[path] = path.stat().st_mtime
+        except Exception as e:
+            print(f"[WARN] polish: cannot scan {root}: {e}")
+    return [p for p, _ in sorted(found.items(), key=lambda kv: kv[1], reverse=True)][:limit]
+
+
+def _build_polish_usage() -> str:
+    return "\n".join(
+        [
+            "/polish list　列出未潤飾的逐字稿",
+            "/polish <編號>　潤飾該筆（編號取自 list）",
+            "/polish <檔名片段>　用檔名比對",
+            "",
+            "例：/polish 1",
+            "例：/polish 早晨財經",
+        ]
+    )
+
+
+def _resolve_polish_target(raw_args: str) -> tuple[Path | None, str | None]:
+    """Turn a /polish argument into one transcript path, or an error message."""
+    candidates = _find_transcripts()
+    if not candidates:
+        return None, "找不到未潤飾的逐字稿。"
+    if raw_args.isdigit():
+        index = int(raw_args)
+        if not 1 <= index <= len(candidates):
+            return None, f"編號超出範圍（1-{len(candidates)}）。"
+        return candidates[index - 1], None
+    needle = raw_args.casefold()
+    matches = [p for p in candidates if needle in p.name.casefold()]
+    if not matches:
+        return None, f"沒有檔名含「{raw_args}」的未潤飾逐字稿。"
+    if len(matches) > 1:
+        listing = "\n".join(f"• {p.name}" for p in matches[:8])
+        return None, f"符合的檔案不只一個（{len(matches)}），請再明確一點：\n{listing}"
+    return matches[0], None
+
+
+async def handle_polish_command(chat_id: int, text: str) -> bool:
+    if _get_slash_command_name(text) != "/polish":
+        return False
+    raw_args = text.strip()[len("/polish"):].strip()
+
+    if not AI_SUMMARY_ENABLED:
+        await send_message(chat_id, "AI 摘要未啟用（AI_SUMMARY_ENABLED=0），無法潤飾。")
+        return True
+
+    if not raw_args:
+        pending = _find_transcripts()
+        await send_message(
+            chat_id, f"待潤飾逐字稿：{len(pending)} 筆\n\n{_build_polish_usage()}"
+        )
+        return True
+
+    if raw_args.lower() == "list":
+        pending = _find_transcripts(limit=20)
+        if not pending:
+            await send_message(chat_id, "沒有未潤飾的逐字稿。")
+            return True
+        lines = [f"未潤飾逐字稿（顯示前 {len(pending)} 筆，新到舊）"]
+        lines += [f"{i}. {p.name[:70]}" for i, p in enumerate(pending, start=1)]
+        lines += ["", "用 /polish <編號> 開始"]
+        await send_message(chat_id, "\n".join(lines))
+        return True
+
+    target, error = _resolve_polish_target(raw_args)
+    if error:
+        await send_message(chat_id, f"{error}\n\n{_build_polish_usage()}")
+        return True
+    assert target is not None
+
+    job_id = str(uuid.uuid4())
+    cancel_event = Event()
+    if not _register_transcribe_job(chat_id, job_id, cancel_event):
+        await send_message(chat_id, "已有一筆轉錄或潤飾正在執行，請 /cancel 或等待完成")
+        return True
+
+    progress_message_id = await send_message(chat_id, f"準備潤飾：{target.name}")
+    try:
+        async def _on_progress(index: int, total: int, mode: str) -> None:
+            if not progress_message_id:
+                return
+            action = "潤飾" if mode == "polish" else "翻譯並潤飾"
+            percent = int((index - 1) / max(1, total) * 100)
+            await edit_message(
+                chat_id,
+                progress_message_id,
+                f"進度：{percent}% {_build_progress_bar(percent)}\n"
+                f"{target.name[:70]}\n"
+                f"正在{action}（{index}/{total} 段）",
+            )
+
+        result = await _polish_transcript_file(target, _on_progress, cancel_event.is_set)
+        status = str(result.get("status") or "")
+        total = int(result.get("chunks") or 0)
+        failed = int(result.get("failed") or 0)
+        mode_label = "翻譯並潤飾" if result.get("mode") == "translate" else "潤飾"
+
+        if status == "ok" and not failed:
+            body = f"✅ {mode_label}完成（{total} 段）\n{target.name}"
+        elif status == "ok":
+            body = (
+                f"⚠️ {mode_label}完成（{total} 段），其中 {failed} 段失敗並保留原文\n{target.name}"
+            )
+        elif status == "unreachable":
+            body = f"❌ AI 服務連不上，已保留原始逐字稿\n{target.name}"
+        elif status == "cancelled":
+            body = f"已取消，已保留原始逐字稿\n{target.name}"
+        elif status == "skipped":
+            body = f"跳過：已潤飾過或內容為空\n{target.name}"
+        else:
+            body = f"❌ 潤飾失敗，已保留原始逐字稿\n{target.name}"
+
+        if progress_message_id:
+            await edit_message(chat_id, progress_message_id, body)
+        else:
+            await send_message(chat_id, body)
+        return True
+    finally:
+        _clear_transcribe_job(chat_id, job_id)
+
+
 async def _handle_fixed_podcast_command(
     chat_id: int,
     text: str,
@@ -9581,6 +9740,10 @@ def set_telegram_commands() -> None:
         commands.append({"command": "china_podcast", "description": "Batch transcribe China-focused podcasts"})
         commands.append({"command": "house_podcast", "description": "Batch transcribe housing podcasts"})
         commands.append({"command": "cancel", "description": "Cancel active transcription"})
+        if PODCAST_POLISH_ENABLED:
+            commands.append(
+                {"command": "polish", "description": "Polish/translate a saved transcript"}
+            )
     commands.append({"command": "status", "description": "Bot health status"})
     resp = None
     try:
@@ -10402,6 +10565,9 @@ async def process_telegram_update(update: dict) -> None:
                 return
             if await handle_transcribe_cancel_command(chat_id, cmd_text):
                 print(f"[ROUTE][HANDLED] chat_id={chat_id} by=cancel")
+                return
+            if await handle_polish_command(chat_id, cmd_text):
+                print(f"[ROUTE][HANDLED] chat_id={chat_id} by=polish")
                 return
             if await handle_daily_podcast_command(chat_id, cmd_text):
                 print(f"[ROUTE][HANDLED] chat_id={chat_id} by=daily_podcast")
