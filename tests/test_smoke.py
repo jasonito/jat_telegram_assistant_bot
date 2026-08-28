@@ -1,7 +1,9 @@
-import importlib
+﻿import importlib
 import os
 import shutil
 import sys
+import threading
+import time
 import types
 import unittest
 import asyncio
@@ -162,41 +164,6 @@ def _install_test_stubs() -> None:
 
         responses_mod.JSONResponse = JSONResponse
         sys.modules["fastapi.responses"] = responses_mod
-
-    if "slack_bolt" not in sys.modules:
-        slack_bolt_mod = types.ModuleType("slack_bolt")
-
-        class App:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def command(self, *args, **kwargs):
-                def decorator(func):
-                    return func
-                return decorator
-
-            def event(self, *args, **kwargs):
-                def decorator(func):
-                    return func
-                return decorator
-
-            def message(self, *args, **kwargs):
-                def decorator(func):
-                    return func
-                return decorator
-
-        slack_bolt_mod.App = App
-        sys.modules["slack_bolt"] = slack_bolt_mod
-
-    if "slack_bolt.adapter.socket_mode" not in sys.modules:
-        socket_mode_mod = types.ModuleType("slack_bolt.adapter.socket_mode")
-
-        class SocketModeHandler:
-            def __init__(self, *args, **kwargs):
-                pass
-
-        socket_mode_mod.SocketModeHandler = SocketModeHandler
-        sys.modules["slack_bolt.adapter.socket_mode"] = socket_mode_mod
 
 
 _install_test_stubs()
@@ -505,14 +472,11 @@ class SmokeTests(unittest.TestCase):
         def _record_notion(**kwargs):
             calls.append("notion")
 
-        def _record_build_summary(path):
+        def _record_build_summary(path, title):
             calls.append("build_summary")
             return "summary text"
 
-        def _record_prepend(path, summary):
-            calls.append("prepend_summary")
-
-        def _record_append(chat_id, title, source, transcript_path, message_ts):
+        def _record_append(chat_id, title, source, transcript_path, message_ts, summary_text):
             calls.append("append_daily_note")
 
         def _record_sync(path):
@@ -522,9 +486,7 @@ class SmokeTests(unittest.TestCase):
             with mock.patch.object(app, "notion_append_chitchat_transcript", side_effect=_record_notion), mock.patch.object(
                 app, "_build_transcript_ai_summary", side_effect=_record_build_summary
             ), mock.patch.object(
-                app, "_prepend_summary_to_transcript", side_effect=_record_prepend
-            ), mock.patch.object(
-                app, "_append_transcript_to_telegram_markdown", side_effect=_record_append
+                app, "_append_transcript_summary_to_note_markdown", side_effect=_record_append
             ), mock.patch.object(
                 app, "_sync_single_transcript_file_to_dropbox", side_effect=_record_sync
             ), mock.patch.object(
@@ -541,7 +503,7 @@ class SmokeTests(unittest.TestCase):
         asyncio.run(_run())
         self.assertEqual(
             calls,
-            ["notion", "build_summary", "prepend_summary", "append_daily_note", "sync_transcript"],
+            ["notion", "build_summary", "append_daily_note", "sync_transcript"],
         )
 
     def test_resolve_daily_podcast_selection_defaults_to_all(self):
@@ -834,129 +796,6 @@ class SmokeTests(unittest.TestCase):
             self.assertTrue(app._is_allowed_control_user(None, "@alice"))
             self.assertFalse(app._is_allowed_control_user("999", "bob"))
 
-    def test_digest_watchlist_command_requires_authorization_for_mutation(self):
-        with mock.patch.object(app, "ALLOWED_CONTROL_USERS", set()):
-            msg = app.handle_command(
-                "/add_kol https://x.com/kol1 KOL One",
-                user_id="123",
-                user_name="alice",
-            )
-        self.assertIn("未授權", msg)
-
-    def test_digest_watchlist_list_and_add_route_through_helpers(self):
-        fake_item = types.SimpleNamespace(
-            kol_id="x-kol1",
-            enabled=True,
-            platform="x",
-            display_name="KOL One",
-            handle_or_url="https://x.com/kol1",
-        )
-        with mock.patch.object(app, "KOL_WATCHLIST_PATH", Path("data/kol_watchlist.json")):
-            with mock.patch.object(app, "list_watchlist_entries", return_value=[fake_item]):
-                listed = app.handle_command("/list_kol")
-                self.assertIn("x-kol1", listed)
-            with mock.patch.object(app, "ALLOWED_CONTROL_USERS", {"123"}):
-                with mock.patch.object(app, "add_watchlist_entry", return_value=(fake_item, True)):
-                    added = app.handle_command(
-                        "/add_kol https://x.com/kol1 KOL One",
-                        user_id="123",
-                        user_name="alice",
-                    )
-        self.assertIn("added: x-kol1", added)
-
-    def test_short_kol_commands_route_to_watchlist_handler(self):
-        with mock.patch.object(app, "_handle_digest_watchlist_slash_command", return_value="ok") as mocked:
-            result = app.handle_command("add kol https://x.com/kol1 KOL One", user_id="123", user_name="alice")
-        self.assertEqual("ok", result)
-        mocked.assert_called_once()
-
-    def test_add_kol_infers_x_from_handle(self):
-        fake_item = types.SimpleNamespace(
-            kol_id="x-elonmusk",
-            enabled=True,
-            platform="x",
-            display_name="Elon Musk",
-            handle_or_url="@elonmusk",
-        )
-        with mock.patch.object(app, "ALLOWED_CONTROL_USERS", {"123"}):
-            with mock.patch.object(app, "add_watchlist_entry", return_value=(fake_item, True)) as mocked_add:
-                msg = app.handle_command("/add_kol @elonmusk Elon Musk", user_id="123", user_name="alice")
-        self.assertIn("added: x-elonmusk", msg)
-        self.assertEqual("x", mocked_add.call_args.kwargs["platform"])
-
-    def test_kol_fetch_schedule_aligns_with_8am_digest(self):
-        tz = timezone(timedelta(hours=8))
-        aligned = datetime(2026, 3, 10, 8, 0, tzinfo=tz)
-        self.assertEqual(
-            app._kol_fetch_run_key(aligned, digest_hour=8, digest_minute=0, interval_hours=6),
-            "2026-03-10:08:00",
-        )
-        self.assertEqual(
-            app._kol_fetch_run_key(aligned.replace(hour=2), digest_hour=8, digest_minute=0, interval_hours=6),
-            "2026-03-10:02:00",
-        )
-        self.assertEqual(
-            app._kol_fetch_run_key(aligned.replace(hour=14), digest_hour=8, digest_minute=0, interval_hours=6),
-            "2026-03-10:14:00",
-        )
-        self.assertIsNone(
-            app._kol_fetch_run_key(aligned.replace(hour=6), digest_hour=8, digest_minute=0, interval_hours=6)
-        )
-
-    def test_kol_digest_run_key_matches_only_exact_time(self):
-        tz = timezone(timedelta(hours=8))
-        exact = datetime(2026, 3, 10, 8, 0, tzinfo=tz)
-        self.assertEqual(
-            app._kol_digest_run_key(exact, digest_hour=8, digest_minute=0),
-            "2026-03-10:08:00",
-        )
-        self.assertIsNone(app._kol_digest_run_key(exact.replace(minute=1), digest_hour=8, digest_minute=0))
-        self.assertIsNone(app._kol_digest_run_key(exact.replace(hour=7), digest_hour=8, digest_minute=0))
-
-    def test_kol_digest_day_string_supports_yesterday(self):
-        tz = timezone(timedelta(hours=8))
-        now = datetime(2026, 3, 10, 0, 5, tzinfo=tz)
-        self.assertEqual(app._kol_digest_day_string(0, now=now), "2026-03-10")
-        self.assertEqual(app._kol_digest_day_string(-1, now=now), "2026-03-09")
-
-    def test_kol_today_generates_digest_if_missing(self):
-        fake_path = Path("digest/20260310_kol_digest.md")
-        with mock.patch.object(app, "KOL_DIGEST_OUTPUT_DIR", Path("digest")):
-            with mock.patch.object(Path, "exists", return_value=False):
-                with mock.patch.object(app, "generate_kol_digest_for_day", return_value=fake_path) as mocked_generate:
-                    with mock.patch.object(app, "_read_kol_digest_preview", return_value="# KOL Daily Digest"):
-                        result = app.handle_command("/kol_today")
-        self.assertIn("KOL Daily Digest", result)
-        mocked_generate.assert_called_once()
-
-    def test_kol_yesterday_generates_previous_day_digest_if_missing(self):
-        fake_path = Path("digest/20260309_kol_digest.md")
-        with mock.patch.object(app, "KOL_DIGEST_OUTPUT_DIR", Path("digest")):
-            with mock.patch.object(app, "_kol_digest_day_string", return_value="2026-03-09"):
-                with mock.patch.object(Path, "exists", return_value=False):
-                    with mock.patch.object(app, "generate_kol_digest_for_day", return_value=fake_path) as mocked_generate:
-                        with mock.patch.object(app, "_read_kol_digest_preview", return_value="# KOL Daily Digest - 2026-03-09"):
-                            result = app.handle_command("/kol_yesterday")
-        self.assertIn("2026-03-09", result)
-        mocked_generate.assert_called_once_with("2026-03-09")
-
-    def test_kol_now_requires_authorization(self):
-        with mock.patch.object(app, "ALLOWED_CONTROL_USERS", set()):
-            result = app.handle_command("/kol_now", user_id="123", user_name="alice")
-        self.assertIn("未授權", result)
-
-    def test_kol_now_runs_fetch_and_generate_digest(self):
-        fake_path = Path("digest/20260310_kol_digest.md")
-        with mock.patch.object(app, "ALLOWED_CONTROL_USERS", {"123"}):
-            with mock.patch.object(app, "run_kol_fetch_cycle", return_value={"x-kol1": 2}) as mocked_fetch:
-                with mock.patch.object(app, "generate_kol_digest_for_day", return_value=fake_path) as mocked_generate:
-                    with mock.patch.object(app, "_read_kol_digest_preview", return_value="# KOL Daily Digest"):
-                        result = app.handle_command("/kol_now", user_id="123", user_name="alice")
-        self.assertIn("KOL fetch done: 1 sources", result)
-        self.assertIn("x-kol1: 2 new posts fetched", result)
-        mocked_fetch.assert_called_once()
-        mocked_generate.assert_called_once()
-
     def test_handle_command_blocks_unauthorized_local_control(self):
         with mock.patch.object(app, "ALLOWED_CONTROL_USERS", set()):
             msg = app.handle_command("open https://example.com", user_id="123", user_name="alice")
@@ -1039,7 +878,9 @@ class SmokeTests(unittest.TestCase):
             },
         }
 
-        with mock.patch.object(app, "store_message") as mocked_store:
+        with mock.patch.object(app, "FEATURE_TRANSCRIBE_ENABLED", True), mock.patch.object(
+            app, "store_message"
+        ) as mocked_store:
             with mock.patch.object(app, "append_markdown") as mocked_append:
                 with mock.patch.object(app, "_spawn_background_to_thread") as mocked_bg:
                     with mock.patch.object(app, "handle_transcribe_audio_message", new=mock.AsyncMock(return_value=False)):
@@ -1148,7 +989,9 @@ class SmokeTests(unittest.TestCase):
 
         app._recent_message_fingerprints.clear()
 
-        with mock.patch.object(app, "store_message") as mocked_store:
+        with mock.patch.object(app, "FEATURE_TRANSCRIBE_ENABLED", True), mock.patch.object(
+            app, "store_message"
+        ) as mocked_store:
             with mock.patch.object(app, "append_markdown") as mocked_append:
                 with mock.patch.object(app, "_spawn_background_to_thread") as mocked_bg:
                     with mock.patch.object(app, "handle_transcribe_audio_message", new=mock.AsyncMock(return_value=False)):
@@ -1190,7 +1033,9 @@ class SmokeTests(unittest.TestCase):
             },
         }
 
-        with mock.patch.object(app, "store_message") as mocked_store:
+        with mock.patch.object(app, "FEATURE_TRANSCRIBE_ENABLED", True), mock.patch.object(
+            app, "store_message"
+        ) as mocked_store:
             with mock.patch.object(app, "append_markdown") as mocked_append:
                 with mock.patch.object(app, "_spawn_background_to_thread") as mocked_bg:
                     with mock.patch.object(app, "handle_transcribe_audio_message", new=mock.AsyncMock(return_value=False)):
@@ -1582,6 +1427,53 @@ class SmokeTests(unittest.TestCase):
                     if fp.is_dir():
                         fp.rmdir()
 
+    def test_build_recent_news_links_html_fetches_when_local_md_is_missing(self):
+        tmp_news = Path("tests_runtime_news_fetch_fallback")
+        now = datetime.now(tz=app.get_local_tz())
+        current_iso = (now - timedelta(hours=1)).isoformat()
+        current_name = now.strftime("%Y%m%d_news.md")
+
+        def fake_fetch(**kwargs):
+            (tmp_news / current_name).write_text(
+                "---\n"
+                f'published_at: "{current_iso}"\n'
+                "canonical:\n"
+                '  source: "Reuters"\n'
+                '  url: "https://example.com/fetched"\n'
+                'title: "Fetched title"\n'
+                "---\n"
+                "Summary\n",
+                encoding="utf-8",
+            )
+            return {current_name[:8]}
+
+        try:
+            if tmp_news.exists():
+                for fp in tmp_news.rglob("*"):
+                    if fp.is_file():
+                        fp.unlink()
+            tmp_news.mkdir(exist_ok=True)
+            with mock.patch.object(app, "NEWS_MD_DIR", tmp_news):
+                with mock.patch.object(app, "DROPBOX_SYNC_ENABLED", False):
+                    with mock.patch.object(app, "_translate_news_titles_to_zh", return_value={}):
+                        with mock.patch.object(app, "fetch_and_store_news", side_effect=fake_fetch) as fetch_mock:
+                            html = app.build_recent_news_links_html(now=now)
+                            self.assertEqual(fetch_mock.call_count, 1)
+                            self.assertIn("https://example.com/fetched", html)
+
+                            # allow_fetch=False 時不應再抓一次（house 已在上游抓過）
+                            (tmp_news / current_name).unlink()
+                            fetch_mock.reset_mock()
+                            empty_html = app.build_recent_news_links_html(now=now, allow_fetch=False)
+                            self.assertEqual(fetch_mock.call_count, 0)
+                            self.assertIn("指定期間無可用新聞資料", empty_html)
+        finally:
+            if tmp_news.exists():
+                for fp in tmp_news.rglob("*"):
+                    if fp.is_file():
+                        fp.unlink()
+                tmp_news.rmdir()
+
     def test_news_and_house_news_filter_local_entries_by_source(self):
         tmp_news = Path("tests_runtime_house_news_links")
         now = datetime.now(tz=app.get_local_tz())
@@ -1633,14 +1525,130 @@ class SmokeTests(unittest.TestCase):
                     if fp.is_dir():
                         fp.rmdir()
 
+    def _make_temp_news_db(self, name: str) -> Path:
+        db_path = Path(name)
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{db_path}{suffix}")
+            if candidate.exists():
+                candidate.unlink()
+        self.addCleanup(self._remove_temp_news_db, db_path)
+        with mock.patch.object(app, "DB_PATH", db_path):
+            with mock.patch.object(app, "FEATURE_NEWS_ENABLED", True):
+                app.init_storage()
+        return db_path
+
+    @staticmethod
+    def _remove_temp_news_db(db_path: Path) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{db_path}{suffix}")
+            if candidate.exists():
+                candidate.unlink()
+
+    def test_fetch_and_store_news_survives_concurrent_duplicate_insert(self):
+        db_path = self._make_temp_news_db("tests_runtime_news_race.sqlite")
+        now = datetime.now(tz=app.get_local_tz())
+        url = "https://example.com/race-article"
+        entry = {
+            "source": "Reuters",
+            "title": "Race article",
+            "url": url,
+            "summary": "Summary",
+            "published_at": now - timedelta(hours=1),
+        }
+
+        def steal_the_url(conn, item, recent_rows):
+            # 模擬另一個 writer 在 exists 檢查之後、我們寫入之前搶先 commit 同一個 hash_url。
+            with app._connect_db() as other:
+                other.execute(
+                    "INSERT INTO news_clusters (cluster_date, cluster_seq, canonical_url) VALUES (?, ?, ?)",
+                    (now.strftime("%Y%m%d"), 1, url),
+                )
+                other_cluster_id = other.execute("SELECT last_insert_rowid()").fetchone()[0]
+                other.execute(
+                    """
+                    INSERT INTO news_items
+                    (cluster_id, source, title, title_norm, url, summary, published_at, hash_url, hash_title, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        other_cluster_id,
+                        item["source"],
+                        item["title"],
+                        item["title_norm"],
+                        url,
+                        item["summary"],
+                        (now - timedelta(hours=1)).isoformat(),
+                        item["hash_url"],
+                        item["hash_title"],
+                        now.isoformat(),
+                    ),
+                )
+                other.commit()
+            return real_ensure_cluster(conn, item, recent_rows)
+
+        real_ensure_cluster = app.ensure_cluster
+        with mock.patch.object(app, "DB_PATH", db_path):
+            with mock.patch.object(app, "fetch_news_entries", return_value=[entry]):
+                with mock.patch.object(app, "ensure_cluster", side_effect=steal_the_url):
+                    with mock.patch.object(app, "write_news_markdown_for_date") as mocked_write:
+                        changed_dates = app.fetch_and_store_news(lookback_hours=24)
+
+            with app._connect_db() as conn:
+                item_count = conn.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
+                cluster_count = conn.execute("SELECT COUNT(*) FROM news_clusters").fetchone()[0]
+
+        self.assertEqual(changed_dates, set())
+        self.assertEqual(item_count, 1)
+        # 我們自己剛建的 cluster 沒有 item 掛上去，應該被回收，只留下另一個 writer 的那筆。
+        self.assertEqual(cluster_count, 1)
+        mocked_write.assert_not_called()
+
+    def test_fetch_and_store_news_runs_are_serialised(self):
+        # fetch_news_entries 回空清單時目前會在碰 DB 前就早退，但那是巧合性的安全：
+        # 早退一旦移到 DB 存取之後，沒釘住 DB_PATH 的話就會寫進正式 messages.sqlite。
+        db_path = self._make_temp_news_db("tests_runtime_news_serialised.sqlite")
+        active = 0
+        max_active = 0
+        guard = threading.Lock()
+
+        def slow_fetch(*args, **kwargs):
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with guard:
+                active -= 1
+            return []
+
+        with mock.patch.object(app, "DB_PATH", db_path), mock.patch.object(
+            app, "fetch_news_entries", side_effect=slow_fetch
+        ):
+            threads = [
+                threading.Thread(target=app.fetch_and_store_news, kwargs={"lookback_hours": 24})
+                for _ in range(3)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+
+        self.assertFalse(any(t.is_alive() for t in threads))
+        self.assertEqual(max_active, 1)
+
     def test_news_email_subject_uses_date_only_for_news_and_house_news(self):
         now = datetime(2026, 5, 12, 9, 30, tzinfo=app.get_local_tz())
 
-        self.assertEqual(app._build_recent_news_email_subject(now=now), "[JAT News] 2026-05-12")
-        self.assertEqual(
-            app._build_recent_news_email_subject(now=now, scope="house"),
-            "[HOUSE News] 2026-05-12",
-        )
+        # Pin the prefixes: they are env-configurable, and this test is about the
+        # date-only suffix, not about whatever the local .env happens to set.
+        with mock.patch.object(app, "NEWS_EMAIL_SUBJECT_PREFIX", "[JAT News]"), mock.patch.object(
+            app, "HOUSE_NEWS_EMAIL_SUBJECT_PREFIX", "[HOUSE News]"
+        ):
+            self.assertEqual(app._build_recent_news_email_subject(now=now), "[JAT News] 2026-05-12")
+            self.assertEqual(
+                app._build_recent_news_email_subject(now=now, scope="house"),
+                "[HOUSE News] 2026-05-12",
+            )
 
     def test_news_source_command_lists_sources(self):
         rows = [(1, "Reuters", "https://example.com/rss", 1)]

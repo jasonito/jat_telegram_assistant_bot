@@ -49,45 +49,6 @@ try:
 except Exception:
     vision = None
 
-from slack_bolt import App as SlackApp
-from slack_bolt.adapter.socket_mode import SocketModeHandler
-KOL_DIGEST_IMPORT_ERROR: Exception | None = None
-try:
-    from kol_digest import (
-        DEFAULT_WATCHLIST_PATH,
-        add_watchlist_entry,
-        build_facebook_source_adapter,
-        build_x_source_adapter,
-        fetch_posts_for_watchlist,
-        init_kol_digest_storage,
-        list_watchlist_entries,
-        list_posts_for_digest,
-        load_watchlist,
-        remove_watchlist_entry,
-        render_digest_markdown,
-        set_watchlist_entry_enabled,
-        sync_watchlist_to_db,
-        write_digest_file,
-    )
-    KOL_DIGEST_MODULE_AVAILABLE = True
-except Exception as e:
-    KOL_DIGEST_IMPORT_ERROR = e
-    KOL_DIGEST_MODULE_AVAILABLE = False
-    DEFAULT_WATCHLIST_PATH = None
-    add_watchlist_entry = None
-    build_facebook_source_adapter = None
-    build_x_source_adapter = None
-    fetch_posts_for_watchlist = None
-    init_kol_digest_storage = None
-    list_watchlist_entries = None
-    list_posts_for_digest = None
-    load_watchlist = None
-    remove_watchlist_entry = None
-    render_digest_markdown = None
-    set_watchlist_entry_enabled = None
-    sync_watchlist_to_db = None
-    write_digest_file = None
-
 try:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -99,18 +60,6 @@ except Exception:
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("jat")
-
-
-def _kol_digest_unavailable_reason() -> str:
-    if KOL_DIGEST_IMPORT_ERROR is None:
-        return "kol digest module unavailable"
-    return f"kol digest module unavailable: {type(KOL_DIGEST_IMPORT_ERROR).__name__}: {KOL_DIGEST_IMPORT_ERROR}"
-
-
-def _require_kol_digest_available() -> str | None:
-    if KOL_DIGEST_MODULE_AVAILABLE:
-        return None
-    return f"KOL digest 功能目前不可用。{_kol_digest_unavailable_reason()}"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -290,13 +239,6 @@ ALLOWED_CONTROL_USERS = {
     for user in os.getenv("TELEGRAM_ALLOWED_CONTROL_USERS", "").split(",")
     if user.strip()
 }
-if DEFAULT_WATCHLIST_PATH is None:
-    DEFAULT_WATCHLIST_PATH = DATA_DIR / "kol_watchlist.json"
-
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
-SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN", "")
-SLACK_USER_ID = os.getenv("SLACK_USER_ID", "")
-SLACK_DEBUG = os.getenv("SLACK_DEBUG", "0").lower() in {"1", "true", "yes"}
 
 AI_SUMMARY_ENABLED = os.getenv("AI_SUMMARY_ENABLED", "0").lower() in {"1", "true", "yes"}
 AI_SUMMARY_PROVIDER = os.getenv("AI_SUMMARY_PROVIDER", "openai").strip().lower()
@@ -367,6 +309,8 @@ NEWS_RSS_URLS_ENV = os.getenv("NEWS_RSS_URLS", "")
 NEWS_RSS_URLS_FILE = os.getenv("NEWS_RSS_URLS_FILE", "")
 NEWS_ENABLED = os.getenv("NEWS_ENABLED", "1").lower() in {"1", "true", "yes"}
 NEWS_FETCH_INTERVAL_MINUTES = int(os.getenv("NEWS_FETCH_INTERVAL_MINUTES", "360"))
+# 指令觸發的補抓最多等背景抓取多久，避免卡住的來源讓 /news 永遠等下去。
+NEWS_FETCH_WAIT_TIMEOUT_SECONDS = max(1, int(os.getenv("NEWS_FETCH_WAIT_TIMEOUT_SECONDS", "300")))
 NEWS_LOOKBACK_HOURS = max(1, int(os.getenv("NEWS_LOOKBACK_HOURS", "24")))
 NEWS_PUSH_MAX_ITEMS = int(os.getenv("NEWS_PUSH_MAX_ITEMS", "10"))
 NEWS_PUSH_ENABLED = os.getenv("NEWS_PUSH_ENABLED", "0").lower() in {"1", "true", "yes"}
@@ -477,18 +421,7 @@ FEATURE_OCR_CHOICE_ENABLED = _env_flag("FEATURE_OCR_CHOICE_ENABLED", False)
 OCR_CHOICE_SCOPE = (os.getenv("OCR_CHOICE_SCOPE", "private") or "private").strip().lower()
 OCR_CHOICE_TIMEOUT_SECONDS = int(os.getenv("OCR_CHOICE_TIMEOUT_SECONDS", "60"))
 OCR_CHOICE_TIMEOUT_DEFAULT = (os.getenv("OCR_CHOICE_TIMEOUT_DEFAULT", "skip") or "skip").strip().lower()
-FEATURE_SLACK_ENABLED = _env_flag("FEATURE_SLACK_ENABLED", True)
 LOCAL_NOTES_ENABLED = _env_flag("LOCAL_NOTES_ENABLED", not IS_CHITCHAT_PROFILE)
-KOL_WATCHLIST_PATH = Path(os.getenv("KOL_WATCHLIST_PATH", str(DEFAULT_WATCHLIST_PATH))).resolve()
-KOL_DIGEST_ENABLED = _env_flag("KOL_DIGEST_ENABLED", APP_PROFILE == "digest")
-KOL_DIGEST_DB_PATH = Path(os.getenv("KOL_DIGEST_DB_PATH", str(DATA_DIR / "kol_digest.sqlite"))).resolve()
-KOL_DIGEST_OUTPUT_DIR = Path(os.getenv("KOL_DIGEST_OUTPUT_DIR", str(DATA_DIR / "digests"))).resolve()
-KOL_DIGEST_FETCH_INTERVAL_HOURS = max(1, int(os.getenv("KOL_DIGEST_FETCH_INTERVAL_HOURS", "6")))
-KOL_DIGEST_FETCH_LIMIT_PER_SOURCE = max(1, int(os.getenv("KOL_DIGEST_FETCH_LIMIT_PER_SOURCE", "20")))
-KOL_X_SOURCE_PROVIDER = (os.getenv("KOL_X_SOURCE_PROVIDER", "snscrape") or "snscrape").strip().lower()
-KOL_FACEBOOK_SOURCE_PROVIDER = (os.getenv("KOL_FACEBOOK_SOURCE_PROVIDER", "stub") or "stub").strip().lower()
-KOL_DIGEST_TIME = os.getenv("KOL_DIGEST_TIME", "08:00").strip() or "08:00"
-KOL_DIGEST_TZ_NAME = os.getenv("KOL_DIGEST_TZ", "Asia/Taipei").strip() or "Asia/Taipei"
 
 DAILY_PODCAST_SHOWS: tuple[dict[str, str], ...] = (
     {
@@ -711,6 +644,9 @@ _TRANSCRIBE_JOBS: dict[int, dict] = {}
 _TRANSCRIBE_JOBS_LOCK = threading.Lock()
 _TRANSCRIBE_BUSY_NOTICE_IDS: dict[int, list[int]] = {}
 _TRANSCRIBE_BUSY_NOTICE_IDS_LOCK = threading.Lock()
+# 背景 news thread（開機 / 定時）與指令觸發的補抓共用同一個 SQLite 檔，
+# 併行時會撞到 news_items.hash_url 的去重檢查，所以整段 ingest 串行化。
+_NEWS_FETCH_LOCK = threading.Lock()
 
 
 class TranscribeJobCancelled(Exception):
@@ -1238,8 +1174,12 @@ def _spawn_background_to_thread(func, /, *args, label: str = "background") -> No
 
 
 async def _handle_recent_news_email_delivery(chat_id: int, html: str, *, scope: str = "news") -> bool:
-    if '• <a href=' not in (html or ""):
-        await send_message(chat_id, "新聞資料不足，email 未寄出。")
+    if '<a href=' not in (html or ""):
+        detail = await asyncio.to_thread(_describe_latest_local_news_file)
+        message = "新聞資料不足，email 未寄出。"
+        if detail:
+            message = f"{message}\n{detail}"
+        await send_message(chat_id, message)
         return True
     email_ready, email_status = _get_recent_news_email_status()
     if not email_ready:
@@ -3262,38 +3202,6 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
     if text_lower.startswith("/status"):
         return build_status_report()
 
-    if (
-        text_lower.startswith("/kol_today")
-        or text_lower.startswith("/kol_yesterday")
-        or text_lower.startswith("/kol_now")
-    ):
-        unavailable = _require_kol_digest_available()
-        if unavailable:
-            return unavailable
-        return _handle_kol_digest_command(text, user_id=user_id, user_name=user_name)
-
-    if text_lower.startswith("/digest_watchlist"):
-        unavailable = _require_kol_digest_available()
-        if unavailable:
-            return unavailable
-        return _handle_digest_watchlist_command(text, user_id=user_id, user_name=user_name)
-    if (
-        text_lower.startswith("/add_kol")
-        or text_lower.startswith("/list_kol")
-        or text_lower.startswith("/on_kol")
-        or text_lower.startswith("/off_kol")
-        or text_lower.startswith("/del_kol")
-    ):
-        unavailable = _require_kol_digest_available()
-        if unavailable:
-            return unavailable
-        return _handle_digest_watchlist_slash_command(text, user_id=user_id, user_name=user_name)
-    if text_lower.startswith("add kol ") or text_lower.startswith("list kol") or text_lower.startswith("on kol ") or text_lower.startswith("off kol ") or text_lower.startswith("del kol "):
-        unavailable = _require_kol_digest_available()
-        if unavailable:
-            return unavailable
-        return _handle_digest_watchlist_short_command(text, user_id=user_id, user_name=user_name)
-
     if text_lower.startswith("/whoami"):
         return "請在 Telegram 對話中使用 /whoami。"
 
@@ -3350,13 +3258,6 @@ def handle_command(text: str, user_id: str | None = None, user_name: str | None 
             "/status",
             "/summary_notes_daily",
         ]
-        if KOL_DIGEST_MODULE_AVAILABLE:
-            cmds.extend([
-                "/kol_today",
-                "/kol_yesterday",
-                "/kol_now",
-                "/digest_watchlist",
-            ])
         if APP_PROFILE == "chitchat":
             cmds.append("/notion_test")
         if FEATURE_NEWS_ENABLED:
@@ -3398,203 +3299,6 @@ def route_user_text_command(
         parse_mode = "HTML"
         disable_preview = True
     return [reply], parse_mode, disable_preview
-
-
-def _handle_digest_watchlist_command(
-    text: str,
-    user_id: str | None = None,
-    user_name: str | None = None,
-) -> str:
-    unavailable = _require_kol_digest_available()
-    if unavailable:
-        return unavailable
-    tokens = (text or "").strip().split()
-    sub = tokens[1].lower() if len(tokens) > 1 else "help"
-    modifying = sub in {"add", "enable", "disable", "remove"}
-    if modifying and not _is_allowed_control_user(user_id, user_name):
-        return "未授權管理 digest watchlist。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"
-
-    if sub == "help":
-        return "\n".join(
-            [
-                "Digest watchlist:",
-                "- /list_kol",
-                "- /add_kol <handle_or_url> [display_name]",
-                "- /on_kol <kol_id>",
-                "- /off_kol <kol_id>",
-                "- /del_kol <kol_id>",
-            ]
-        )
-
-    if sub == "list":
-        entries = list_watchlist_entries(KOL_WATCHLIST_PATH)
-        if not entries:
-            return f"Watchlist is empty. File: {KOL_WATCHLIST_PATH}"
-        lines = [f"Watchlist ({len(entries)})", f"file: {KOL_WATCHLIST_PATH}"]
-        for item in entries:
-            status = "on" if item.enabled else "off"
-            lines.append(
-                f"- {item.kol_id} [{status}] {item.platform} {item.display_name} -> {item.handle_or_url}"
-            )
-        return "\n".join(lines)
-
-    if sub == "add":
-        if len(tokens) < 4:
-            return "Usage: /digest_watchlist add <x|facebook> <handle_or_url> [display_name]"
-        platform = tokens[2].strip().lower()
-        handle_or_url = tokens[3].strip()
-        display_name = " ".join(tokens[4:]).strip() if len(tokens) > 4 else None
-        try:
-            item, created = add_watchlist_entry(
-                KOL_WATCHLIST_PATH,
-                platform=platform,
-                handle_or_url=handle_or_url,
-                display_name=display_name,
-            )
-        except Exception as e:
-            return f"Failed to add watchlist entry: {type(e).__name__}: {e}"
-        action = "added" if created else "already exists"
-        return f"{action}: {item.kol_id} ({item.platform}) {item.display_name} -> {item.handle_or_url}"
-
-    if sub in {"enable", "disable"}:
-        if len(tokens) < 3:
-            return f"Usage: /digest_watchlist {sub} <kol_id>"
-        try:
-            item = set_watchlist_entry_enabled(KOL_WATCHLIST_PATH, tokens[2].strip(), enabled=(sub == "enable"))
-        except KeyError:
-            return f"Unknown kol_id: {tokens[2].strip()}"
-        except Exception as e:
-            return f"Failed to update watchlist entry: {type(e).__name__}: {e}"
-        status = "enabled" if item.enabled else "disabled"
-        return f"{status}: {item.kol_id} ({item.platform}) {item.display_name}"
-
-    if sub == "remove":
-        if len(tokens) < 3:
-            return "Usage: /digest_watchlist remove <kol_id>"
-        try:
-            item = remove_watchlist_entry(KOL_WATCHLIST_PATH, tokens[2].strip())
-        except KeyError:
-            return f"Unknown kol_id: {tokens[2].strip()}"
-        except Exception as e:
-            return f"Failed to remove watchlist entry: {type(e).__name__}: {e}"
-        return f"removed: {item.kol_id} ({item.platform}) {item.display_name}"
-
-    return "Unknown /digest_watchlist subcommand. Use /digest_watchlist help."
-
-
-def _infer_kol_platform(handle_or_url: str) -> str:
-    raw = (handle_or_url or "").strip().lower()
-    if not raw:
-        raise ValueError("handle_or_url is required")
-    if "facebook.com/" in raw:
-        return "facebook"
-    if "x.com/" in raw or "twitter.com/" in raw or raw.startswith("@"):
-        return "x"
-    if "://" in raw:
-        raise ValueError("unsupported platform; use an X or Facebook URL")
-    return "x"
-
-
-def _handle_digest_watchlist_slash_command(
-    text: str,
-    user_id: str | None = None,
-    user_name: str | None = None,
-) -> str:
-    cmd_text = (text or "").strip()
-    lower = cmd_text.lower()
-    if lower == "/list_kol":
-        return _handle_digest_watchlist_command("/digest_watchlist list", user_id=user_id, user_name=user_name)
-    if lower.startswith("/add_kol"):
-        parts = cmd_text.split(maxsplit=2)
-        if len(parts) < 2:
-            return "Usage:\n- /add_kol <handle_or_url> [display_name]"
-        handle_or_url = parts[1].strip()
-        display_name = parts[2].strip() if len(parts) > 2 else None
-        try:
-            platform = _infer_kol_platform(handle_or_url)
-        except Exception as e:
-            return f"Failed to infer platform: {type(e).__name__}: {e}"
-        return _handle_digest_watchlist_command(
-            " ".join(
-                [
-                    "/digest_watchlist",
-                    "add",
-                    platform,
-                    handle_or_url,
-                    display_name or "",
-                ]
-            ).strip(),
-            user_id=user_id,
-            user_name=user_name,
-        )
-    if lower.startswith("/on_kol"):
-        parts = cmd_text.split(maxsplit=1)
-        if len(parts) < 2:
-            return "Usage:\n- /on_kol <kol_id>"
-        return _handle_digest_watchlist_command(
-            f"/digest_watchlist enable {parts[1].strip()}",
-            user_id=user_id,
-            user_name=user_name,
-        )
-    if lower.startswith("/off_kol"):
-        parts = cmd_text.split(maxsplit=1)
-        if len(parts) < 2:
-            return "Usage:\n- /off_kol <kol_id>"
-        return _handle_digest_watchlist_command(
-            f"/digest_watchlist disable {parts[1].strip()}",
-            user_id=user_id,
-            user_name=user_name,
-        )
-    if lower.startswith("/del_kol"):
-        parts = cmd_text.split(maxsplit=1)
-        if len(parts) < 2:
-            return "Usage:\n- /del_kol <kol_id>"
-        return _handle_digest_watchlist_command(
-            f"/digest_watchlist remove {parts[1].strip()}",
-            user_id=user_id,
-            user_name=user_name,
-        )
-    return "Unknown kol command. Use:\n- /list_kol\n- /add_kol <handle_or_url> [display_name]"
-
-
-def _handle_digest_watchlist_short_command(
-    text: str,
-    user_id: str | None = None,
-    user_name: str | None = None,
-) -> str:
-    cmd_text = (text or "").strip()
-    lower = cmd_text.lower()
-    if lower == "list kol":
-        return _handle_digest_watchlist_command("/digest_watchlist list", user_id=user_id, user_name=user_name)
-    if lower.startswith("add kol "):
-        payload = cmd_text[len("add kol ") :].strip()
-        return _handle_digest_watchlist_slash_command(
-            f"/add_kol {payload}",
-            user_id=user_id,
-            user_name=user_name,
-        )
-    if lower.startswith("on kol "):
-        kol_id = cmd_text[7:].strip()
-        return _handle_digest_watchlist_command(
-            f"/digest_watchlist enable {kol_id}",
-            user_id=user_id,
-            user_name=user_name,
-        )
-    if lower.startswith("off kol "):
-        kol_id = cmd_text[8:].strip()
-        return _handle_digest_watchlist_command(
-            f"/digest_watchlist disable {kol_id}",
-            user_id=user_id,
-            user_name=user_name,
-        )
-    if lower.startswith("del kol "):
-        kol_id = cmd_text[8:].strip()
-        return _handle_digest_watchlist_command(
-            f"/digest_watchlist remove {kol_id}",
-            user_id=user_id,
-            user_name=user_name,
-        )
-    return "Unknown kol command. Use:\n- /list_kol\n- /add_kol <handle_or_url> [display_name]"
 
 
 def store_message(
@@ -3653,24 +3357,6 @@ def append_markdown(
     with md_path.open("a", encoding="utf-8") as f:
         f.write(line)
     _sync_single_note_file_to_dropbox(md_path)
-
-
-def append_slack_note_markdown(
-    channel_id: str,
-    user_name: str,
-    text: str,
-    message_ts: datetime,
-) -> None:
-    notes_dir = NOTES_DIR / "slack"
-    notes_dir.mkdir(parents=True, exist_ok=True)
-    day = (message_ts or datetime.now()).strftime("%Y-%m-%d")
-    md_path = notes_dir / f"{day}_slack.md"
-    if not md_path.exists():
-        md_path.write_text(f"# {day} slack\n\n", encoding="utf-8")
-    time_str = (message_ts or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
-    line = f"- [{time_str}] {user_name}: {text}\n"
-    with md_path.open("a", encoding="utf-8") as f:
-        f.write(line)
 
 
 def append_ocr_markdown(
@@ -5118,27 +4804,6 @@ def search_notes(keyword: str, channel_id: str | None, limit: int = 8) -> list[t
     return rows
 
 
-def process_slack_note(
-    channel_id: str,
-    user_id: str,
-    user_name: str,
-    text: str,
-    message_ts: datetime,
-) -> tuple[bool, str]:
-    if channel_id.startswith("D"):
-        bucket = "inbox"
-    elif channel_id.startswith(("C", "G")):
-        bucket = "channel"
-    else:
-        bucket = "unknown"
-    meeting_id = None
-
-    store_message("slack", channel_id, channel_id, user_id, user_name, text, message_ts)
-    store_note("slack", channel_id, user_id, user_name, text, message_ts, meeting_id, bucket)
-    append_slack_note_markdown(channel_id, user_name, text, message_ts)
-    return True, "Saved."
-
-
 def search_messages(keyword: str, limit: int = 10, day: str | None = None) -> list[tuple]:
     kw = f"%{keyword}%"
     params = [kw]
@@ -5212,7 +4877,7 @@ def detect_mode(context_text: str) -> str:
 
     urls = re.findall(r"https?://", text)
     if len(urls) >= 2 and avg_para_len <= 120:
-        return "slack_daily"
+        return "daily_digest"
 
     article_score = 0
     non_ascii_hits = sum(1 for ch in text if ord(ch) > 127)
@@ -5223,7 +4888,7 @@ def detect_mode(context_text: str) -> str:
     if article_score >= 2:
         return "article_summary"
 
-    return "slack_daily"
+    return "daily_digest"
 
 
 def generate_ai_summary(
@@ -5311,7 +4976,7 @@ def generate_ai_summary(
         "Use only the provided input. Do not invent facts. "
         "Output must be in Traditional Chinese."
     )
-    SLACK_DAILY_PROMPT = (
+    DAILY_DIGEST_PROMPT = (
         f"隢 {day} ?Ｗ銝隞?Slack 瘥??嚗?雿輻頛詨鞈?嚗?擃葉???n\n"
         "頛詨?澆?嚗?潮摰?嚗n"
         "A. 隞??\n"
@@ -5347,7 +5012,7 @@ def generate_ai_summary(
     if mode == "article_summary":
         user_prompt = ARTICLE_SUMMARY_PROMPT
     else:
-        user_prompt = SLACK_DAILY_PROMPT
+        user_prompt = DAILY_DIGEST_PROMPT
 
     try:
         if provider == "openai":
@@ -5977,6 +5642,54 @@ def _source_name_from_url(url: str) -> str:
         if host.endswith(suffix):
             return name
     return host.split(".")[0].capitalize()
+
+
+# Ordered (needle, canonical name) pairs for folding feed-title variants (e.g. "Bloomberg
+# Industries", "Reuters(GNews)") into one display group when grouping the news digest by source.
+_NEWS_SOURCE_GROUP_ALIASES: list[tuple[str, str]] = [
+    ("south china morning post", "South China Morning Post"),
+    ("scmp", "South China Morning Post"),
+    ("nikkei asia", "Nikkei Asia"),
+    ("asia nikkei", "Nikkei Asia"),
+    ("nikkei", "Nikkei Asia"),
+    ("the information", "The Information"),
+    ("the decoder", "The Decoder"),
+    ("the verge", "The Verge"),
+    ("ars technica", "Ars Technica"),
+    ("financial times", "Financial Times"),
+    ("mit technology review", "MIT Technology Review"),
+    ("ieee spectrum", "IEEE Spectrum"),
+    ("venturebeat", "VentureBeat"),
+    ("semianalysis", "SemiAnalysis"),
+    ("semiwiki", "SemiWiki"),
+    ("caixin", "Caixin Global"),
+    ("reuters", "Reuters"),
+    ("bloomberg", "Bloomberg"),
+    ("techcrunch", "TechCrunch"),
+    ("techmeme", "Techmeme"),
+    ("techorange", "TechOrange"),
+    ("technews", "TechNews"),
+    ("科技新報", "科技新報"),
+    ("zdnet", "ZDNet"),
+    ("futurism", "Futurism"),
+    ("wccftech", "Wccftech"),
+    ("ee times", "EE Times"),
+    ("eetimes", "EE Times"),
+    ("bbc", "BBC"),
+    ("axios", "Axios"),
+]
+
+
+def _simplify_news_source_name(source: str) -> str:
+    raw = (source or "").strip()
+    if not raw:
+        return "Unknown"
+    cleaned = re.sub(r"\s*\((?:gnews|via[^)]*)\)\s*$", "", raw, flags=re.IGNORECASE).strip()
+    lowered = cleaned.lower()
+    for needle, canonical in _NEWS_SOURCE_GROUP_ALIASES:
+        if needle in lowered:
+            return canonical
+    return cleaned or raw
 
 
 def _pick_best_news_url(canonical_url: str, source_urls: list[str], summary_text: str) -> str:
@@ -6854,19 +6567,61 @@ def _render_news_entries_html(items: list[dict[str, str]], *, header: str) -> st
     all_titles = [item.get("title", "").strip() for item in items]
     translations = _translate_news_titles_to_zh(all_titles)
 
-    lines = [f"<b>{escape(header)}</b>", ""]
+    # `items` arrives sorted newest-first, so the first item seen for each group is that
+    # source's most recent article — grouping in encounter order also sorts the groups by
+    # source recency, with no separate sort pass needed.
+    groups: dict[str, list[dict[str, str]]] = {}
+    group_order: list[str] = []
     for item in items:
-        title = item.get("title", "").strip()
-        display_title = translations.get(title, "").strip() or title or "Untitled"
-        url = item.get("url", "").strip()
-        lines.append(f'• <a href="{escape(url, quote=True)}">{escape(display_title)}</a>')
+        group_name = _simplify_news_source_name(item.get("source", ""))
+        if group_name not in groups:
+            groups[group_name] = []
+            group_order.append(group_name)
+        groups[group_name].append(item)
+
+    lines = [f"<b>{escape(header)}</b>", ""]
+    for group_name in group_order:
+        lines.append(f"<b>{escape(group_name)}</b>")
+        for idx, item in enumerate(groups[group_name], start=1):
+            title = item.get("title", "").strip()
+            display_title = translations.get(title, "").strip() or title or "Untitled"
+            url = item.get("url", "").strip()
+            lines.append(f'{idx}. <a href="{escape(url, quote=True)}">{escape(display_title)}</a>')
+        lines.append("")
     return "\n".join(lines).rstrip()
 
 
-def build_recent_news_links_html(now: datetime | None = None, *, scope: str = "news") -> str:
+def _describe_latest_local_news_file() -> str:
+    try:
+        files = sorted(NEWS_MD_DIR.glob("*_news.md"))
+    except Exception:
+        return ""
+    if not files:
+        return "本機尚無新聞檔案。"
+    latest = files[-1]
+    try:
+        updated = datetime.fromtimestamp(latest.stat().st_mtime, tz=get_local_tz())
+    except Exception:
+        return f"本機最新新聞檔：{latest.name}"
+    return f"本機最新新聞檔：{latest.name}（更新於 {updated:%Y-%m-%d %H:%M}）"
+
+
+def build_recent_news_links_html(
+    now: datetime | None = None,
+    *,
+    scope: str = "news",
+    allow_fetch: bool = True,
+    status_callback: Callable[[int, str, str | None], None] | None = None,
+) -> str:
     current = now or datetime.now(tz=get_local_tz())
     lookback = 72 if scope == "house" else 24
     items = _load_recent_news_entries_from_local(now=current, scope=scope, lookback_hours=lookback)
+    if not items and allow_fetch:
+        # 本機 md 還沒落地（例如剛開機、startup fetch 仍在跑），直接補抓一次再讀
+        if status_callback:
+            status_callback(25, "本機新聞資料不足，正在即時抓取", _describe_latest_local_news_file())
+        fetch_and_store_news(status_callback=status_callback, scope=scope, lookback_hours=lookback)
+        items = _load_recent_news_entries_from_local(now=current, scope=scope, lookback_hours=lookback)
     if not items and DROPBOX_SYNC_ENABLED:
         sync_dropbox_news_to_local(full_scan=True)
         items = _load_recent_news_entries_from_local(now=current, scope=scope, lookback_hours=lookback)
@@ -8801,7 +8556,8 @@ def ensure_cluster(
     conn: sqlite3.Connection,
     item: dict,
     recent_rows: list[tuple],
-) -> int:
+) -> tuple[int, bool]:
+    """回傳 (cluster_id, created)；created=True 表示這次新建、目前還沒有任何 news_items 掛上去。"""
     title_norm = item["title_norm"]
     cluster_id = find_similar_cluster(recent_rows, title_norm)
     published_at = item["published_at"] or datetime.now(tz=get_local_tz())
@@ -8855,7 +8611,7 @@ def ensure_cluster(
             sets = ", ".join(f"{k} = ?" for k in update_fields.keys())
             params = list(update_fields.values()) + [cluster_id]
             conn.execute(f"UPDATE news_clusters SET {sets} WHERE id = ?", params)
-        return cluster_id
+        return cluster_id, False
 
     cluster_date = published_at.strftime("%Y%m%d")
     row = conn.execute(
@@ -8882,10 +8638,40 @@ def ensure_cluster(
     )
     cluster_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     recent_rows.append((cluster_id, title_norm))
-    return cluster_id
+    return cluster_id, True
 
 
 def fetch_and_store_news(
+    *,
+    lookback_hours: int | None = None,
+    status_callback: Callable[[int, str, str | None], None] | None = None,
+    scope: str = "news",
+) -> set[str]:
+    acquired = _NEWS_FETCH_LOCK.acquire(blocking=False)
+    if not acquired:
+        # 背景 thread 正在抓（開機補抓最常見）。等它做完，本機 md 也就落地了。
+        print("[INFO] news fetch already running; waiting for the in-flight run to finish")
+        if status_callback:
+            status_callback(10, "已有新聞抓取進行中", "等待前一輪完成後再繼續")
+        acquired = _NEWS_FETCH_LOCK.acquire(timeout=NEWS_FETCH_WAIT_TIMEOUT_SECONDS)
+        if not acquired:
+            # 前一輪卡住（例如某個來源沒回應）時不要跟著卡死；寫入端本身可容忍重複。
+            print(
+                f"[WARN] news fetch lock not released within {NEWS_FETCH_WAIT_TIMEOUT_SECONDS}s; "
+                "proceeding without it"
+            )
+    try:
+        return _fetch_and_store_news_locked(
+            lookback_hours=lookback_hours,
+            status_callback=status_callback,
+            scope=scope,
+        )
+    finally:
+        if acquired:
+            _NEWS_FETCH_LOCK.release()
+
+
+def _fetch_and_store_news_locked(
     *,
     lookback_hours: int | None = None,
     status_callback: Callable[[int, str, str | None], None] | None = None,
@@ -8936,12 +8722,12 @@ def fetch_and_store_news(
             if exists:
                 continue
 
-            cluster_id = ensure_cluster(conn, item, recent_rows)
+            cluster_id, cluster_created = ensure_cluster(conn, item, recent_rows)
             published_iso = published_dt.isoformat()
             created_iso = now.isoformat()
-            conn.execute(
+            cur = conn.execute(
                 """
-                INSERT INTO news_items
+                INSERT OR IGNORE INTO news_items
                 (cluster_id, source, title, title_norm, url, summary, published_at, hash_url, hash_title, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -8958,6 +8744,14 @@ def fetch_and_store_news(
                     created_iso,
                 ),
             )
+            if not cur.rowcount:
+                # 另一個 writer（例如另一個行程）在 exists 檢查之後搶先寫入同一個 hash_url。
+                # 這裡剛建的 cluster 還沒有任何 item，直接收掉避免留下空 cluster。
+                print(f"[INFO] news item already ingested by another writer: {item['url'][:120]}")
+                if cluster_created:
+                    conn.execute("DELETE FROM news_clusters WHERE id = ?", (cluster_id,))
+                    recent_rows[:] = [r for r in recent_rows if r[0] != cluster_id]
+                continue
             row = conn.execute(
                 "SELECT cluster_date FROM news_clusters WHERE id = ?",
                 (cluster_id,),
@@ -9164,9 +8958,13 @@ def handle_news_command(
             status_callback(20, "正在讀取本地新聞資料", None)
         if scope == "house":
             fetch_and_store_news(status_callback=status_callback, scope=scope, lookback_hours=72)
+            if status_callback:
+                status_callback(75, "正在整理最新新聞輸出", None)
+            return [build_recent_news_links_html(scope=scope, allow_fetch=False)]
+        html = build_recent_news_links_html(scope=scope, status_callback=status_callback)
         if status_callback:
             status_callback(75, "正在整理最新新聞輸出", None)
-        return [build_recent_news_links_html(scope=scope)]
+        return [html]
     if sub == "add":
         if status_callback:
             status_callback(30, "正在新增新聞來源", None)
@@ -9294,19 +9092,6 @@ def set_telegram_commands() -> None:
     commands = [
         {"command": "summary_notes_daily", "description": "Daily notes digest"},
     ]
-    if APP_PROFILE == "digest":
-        commands.extend(
-            [
-                {"command": "list_kol", "description": "List tracked KOLs"},
-                {"command": "add_kol", "description": "Add a KOL"},
-                {"command": "on_kol", "description": "Enable a KOL"},
-                {"command": "off_kol", "description": "Disable a KOL"},
-                {"command": "del_kol", "description": "Remove a KOL"},
-                {"command": "kol_today", "description": "Show today's KOL digest"},
-                {"command": "kol_yesterday", "description": "Show yesterday's KOL digest"},
-                {"command": "kol_now", "description": "Fetch now and rebuild digest"},
-            ]
-        )
     if APP_PROFILE == "chitchat":
         commands.append({"command": "notion_test", "description": "Run Notion text/image diagnostics"})
     if FEATURE_NEWS_ENABLED:
@@ -9520,178 +9305,9 @@ def build_status_report() -> str:
     lines.extend([
         f"note markdown files (3d): {notes_3d}",
         f"dropbox sync: {'on' if DROPBOX_SYNC_ENABLED else 'off'} ({DROPBOX_SYNC_TIME} {DROPBOX_SYNC_TZ_NAME})",
-        "kol digest: "
-        + (
-            "unavailable "
-            + f"({_kol_digest_unavailable_reason()})"
-            if not KOL_DIGEST_MODULE_AVAILABLE
-            else "on "
-            + (
-                f"(x={KOL_X_SOURCE_PROVIDER}, facebook={KOL_FACEBOOK_SOURCE_PROVIDER}, "
-                f"{KOL_DIGEST_FETCH_INTERVAL_HOURS}h fetch, {KOL_DIGEST_TIME} {KOL_DIGEST_TZ_NAME})"
-            )
-            if KOL_DIGEST_ENABLED
-            else "off"
-        ),
         f"today: {day}",
     ])
     return "\n".join(lines)
-
-
-def _get_kol_digest_tz():
-    try:
-        return ZoneInfo(KOL_DIGEST_TZ_NAME)
-    except ZoneInfoNotFoundError:
-        return get_local_tz()
-
-
-def _kol_fetch_run_key(
-    now: datetime,
-    *,
-    digest_hour: int,
-    digest_minute: int,
-    interval_hours: int,
-) -> str | None:
-    if now.minute != digest_minute:
-        return None
-    step = max(1, int(interval_hours))
-    if ((now.hour - digest_hour) % step) != 0:
-        return None
-    return f"{now.strftime('%Y-%m-%d')}:{now.hour:02d}:{now.minute:02d}"
-
-
-def _kol_digest_run_key(now: datetime, *, digest_hour: int, digest_minute: int) -> str | None:
-    if now.hour != digest_hour or now.minute != digest_minute:
-        return None
-    return f"{now.strftime('%Y-%m-%d')}:{now.hour:02d}:{now.minute:02d}"
-
-
-def run_kol_fetch_cycle() -> dict[str, int]:
-    unavailable = _require_kol_digest_available()
-    if unavailable:
-        raise RuntimeError(unavailable)
-    watchlist = load_watchlist(KOL_WATCHLIST_PATH)
-    init_kol_digest_storage(KOL_DIGEST_DB_PATH)
-    sync_watchlist_to_db(KOL_DIGEST_DB_PATH, watchlist)
-    adapters = {
-        "x": build_x_source_adapter(KOL_X_SOURCE_PROVIDER),
-        "facebook": build_facebook_source_adapter(KOL_FACEBOOK_SOURCE_PROVIDER),
-    }
-    results = fetch_posts_for_watchlist(
-        KOL_DIGEST_DB_PATH,
-        watchlist,
-        adapters_by_platform=adapters,
-        limit_per_source=KOL_DIGEST_FETCH_LIMIT_PER_SOURCE,
-    )
-    return results
-
-
-def _build_kol_source_health_lines(fetch_results: dict[str, int]) -> list[str]:
-    if not fetch_results:
-        return ["No enabled KOL sources in watchlist."]
-    lines: list[str] = []
-    for kol_id, count in sorted(fetch_results.items()):
-        if count == -1:
-            lines.append(f"{kol_id}: fetch failed")
-        elif count == -2:
-            lines.append(f"{kol_id}: provider unavailable")
-        else:
-            lines.append(f"{kol_id}: {count} new posts fetched")
-    return lines
-
-
-def _kol_digest_day_string(offset_days: int = 0, now: datetime | None = None) -> str:
-    effective_now = now.astimezone(_get_kol_digest_tz()) if now else datetime.now(tz=_get_kol_digest_tz())
-    return (effective_now + timedelta(days=offset_days)).strftime("%Y-%m-%d")
-
-
-def _kol_digest_day_bounds(target_day: str, now: datetime | None = None) -> tuple[datetime, datetime]:
-    tz = _get_kol_digest_tz()
-    effective_now = now.astimezone(tz) if now else datetime.now(tz=tz)
-    day_start = datetime.fromisoformat(f"{target_day}T00:00:00").replace(tzinfo=tz)
-    day_end = day_start + timedelta(days=1)
-    return day_start, min(day_end, effective_now)
-
-
-def generate_kol_digest_for_day(target_day: str, generated_at: datetime | None = None) -> Path:
-    unavailable = _require_kol_digest_available()
-    if unavailable:
-        raise RuntimeError(unavailable)
-    now = generated_at.astimezone(_get_kol_digest_tz()) if generated_at else datetime.now(tz=_get_kol_digest_tz())
-    since, until = _kol_digest_day_bounds(target_day, now=now)
-    watchlist = load_watchlist(KOL_WATCHLIST_PATH)
-    init_kol_digest_storage(KOL_DIGEST_DB_PATH)
-    sync_watchlist_to_db(KOL_DIGEST_DB_PATH, watchlist)
-    posts = list_posts_for_digest(KOL_DIGEST_DB_PATH, since=since, until=until, limit=500)
-    markdown = render_digest_markdown(
-        target_day,
-        posts,
-        generated_at=now,
-    )
-    return write_digest_file(KOL_DIGEST_OUTPUT_DIR, target_day, markdown)
-
-
-def generate_kol_daily_digest(force_now: datetime | None = None) -> Path:
-    now = force_now.astimezone(_get_kol_digest_tz()) if force_now else datetime.now(tz=_get_kol_digest_tz())
-    return generate_kol_digest_for_day(_kol_digest_day_string(0, now=now), generated_at=now)
-
-
-def _read_kol_digest_preview(path: Path, max_chars: int = 3500) -> str:
-    text = path.read_text(encoding="utf-8", errors="replace").strip()
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + "\n\n...[truncated]"
-
-
-def _handle_kol_digest_command(
-    text: str,
-    user_id: str | None = None,
-    user_name: str | None = None,
-) -> str:
-    unavailable = _require_kol_digest_available()
-    if unavailable:
-        return unavailable
-    cmd_text = (text or "").strip()
-    lower = cmd_text.lower()
-    if lower.startswith("/kol_now"):
-        if not _is_allowed_control_user(user_id, user_name):
-            return "未授權執行 KOL 即時抓取。請設定 TELEGRAM_ALLOWED_CONTROL_USERS。"
-        try:
-            results = run_kol_fetch_cycle()
-            path = generate_kol_digest_for_day(_kol_digest_day_string(0))
-        except Exception as e:
-            return f"KOL digest run failed: {type(e).__name__}: {e}"
-        lines = [
-            f"KOL fetch done: {len(results)} sources",
-            *[f"- {line}" for line in _build_kol_source_health_lines(results)],
-            "",
-            f"Digest file: {path}",
-            "",
-            _read_kol_digest_preview(path),
-        ]
-        return "\n".join(lines).strip()
-
-    if lower.startswith("/kol_today"):
-        try:
-            today = _kol_digest_day_string(0)
-            path = KOL_DIGEST_OUTPUT_DIR / f"{today.replace('-', '')}_kol_digest.md"
-            if not path.exists():
-                path = generate_kol_digest_for_day(today)
-        except Exception as e:
-            return f"Failed to load KOL digest: {type(e).__name__}: {e}"
-        return _read_kol_digest_preview(path)
-
-    if lower.startswith("/kol_yesterday"):
-        try:
-            day = _kol_digest_day_string(-1)
-            path = KOL_DIGEST_OUTPUT_DIR / f"{day.replace('-', '')}_kol_digest.md"
-            if not path.exists():
-                path = generate_kol_digest_for_day(day)
-        except Exception as e:
-            return f"Failed to load KOL digest: {type(e).__name__}: {e}"
-        return _read_kol_digest_preview(path)
-
-    return "Unknown KOL digest command. Use:\n- /kol_today\n- /kol_yesterday\n- /kol_now"
 
 
 def push_news_to_subscribers() -> None:
@@ -9811,49 +9427,6 @@ def start_news_thread() -> None:
                 print(f"news worker error: {e}")
 
     t = threading.Thread(target=loop, daemon=True)
-    t.start()
-
-
-def start_kol_digest_thread() -> None:
-    if not KOL_DIGEST_MODULE_AVAILABLE:
-        print(f"[INFO] KOL digest worker unavailable: {_kol_digest_unavailable_reason()}")
-        return
-    if not KOL_DIGEST_ENABLED:
-        print("[INFO] KOL digest worker disabled by KOL_DIGEST_ENABLED=0")
-        return
-
-    digest_hour, digest_minute = parse_hhmm(KOL_DIGEST_TIME, default_hour=8, default_minute=0)
-
-    def loop():
-        last_fetch_key = ""
-        last_digest_key = ""
-        while True:
-            now = datetime.now(tz=_get_kol_digest_tz())
-            fetch_key = _kol_fetch_run_key(
-                now,
-                digest_hour=digest_hour,
-                digest_minute=digest_minute,
-                interval_hours=KOL_DIGEST_FETCH_INTERVAL_HOURS,
-            )
-            if fetch_key and fetch_key != last_fetch_key:
-                try:
-                    results = run_kol_fetch_cycle()
-                    logger.info("KOL fetch cycle done key=%s results=%s", fetch_key, results)
-                except Exception as e:
-                    logger.warning("KOL fetch cycle failed key=%s error=%s: %s", fetch_key, type(e).__name__, e)
-                last_fetch_key = fetch_key
-
-            digest_key = _kol_digest_run_key(now, digest_hour=digest_hour, digest_minute=digest_minute)
-            if digest_key and digest_key != last_digest_key:
-                try:
-                    path = generate_kol_digest_for_day(_kol_digest_day_string(-1, now=now), generated_at=now)
-                    logger.info("KOL daily digest generated key=%s path=%s", digest_key, path)
-                except Exception as e:
-                    logger.warning("KOL daily digest failed key=%s error=%s: %s", digest_key, type(e).__name__, e)
-                last_digest_key = digest_key
-            time.sleep(60)
-
-    t = threading.Thread(target=loop, daemon=True, name="kol-digest-worker")
     t.start()
 
 
@@ -10426,7 +9999,8 @@ async def process_telegram_update(update: dict) -> None:
                         print(f"[WARN] reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
         except Exception as e:
             print(f"[WARN] private command handling failed: {type(e).__name__}: {e}")
-            await send_message(chat_id, f"指令處理失敗：{type(e).__name__}")
+            print(traceback.format_exc())
+            await send_message(chat_id, f"指令處理失敗：{type(e).__name__}: {e}"[:400])
         return
 
     # Group chats: only handle explicit slash commands.
@@ -10462,6 +10036,8 @@ async def process_telegram_update(update: dict) -> None:
                         print(f"[WARN] group reply send failed chat_id={chat_id} text_preview={chunk[:80]!r}")
         except Exception as e:
             print(f"[WARN] group command handling failed: {type(e).__name__}: {e}")
+            print(traceback.format_exc())
+            # 群組是多人場合，例外訊息可能夾帶路徑或第三方 API 回應；細節只留在 log。
             await send_message(chat_id, f"指令處理失敗：{type(e).__name__}")
         return
 
@@ -10566,139 +10142,6 @@ async def telegram_webhook(request: Request):
     return JSONResponse({"ok": True})
 
 
-def start_slack_socket_mode() -> None:
-    if not (SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_USER_ID):
-        print("Slack tokens/user not set; skipping Slack Socket Mode.")
-        return
-
-    slack_app = SlackApp(token=SLACK_BOT_TOKEN)
-    if SLACK_DEBUG:
-        print("[SLACK] Socket Mode starting...")
-
-    @slack_app.command("/note")
-    def handle_slack_note(ack, respond, command):
-        ack()
-        text = (command.get("text") or "").strip()
-        if not text:
-            respond("Usage: /note <text>")
-            return
-        channel_id = command.get("channel_id", "")
-        user_id = command.get("user_id", "")
-        user_name = command.get("user_name") or user_id
-        msg_ts = None
-        if command.get("command_ts"):
-            try:
-                msg_ts = _local_datetime_from_unix(command.get("command_ts"))
-            except Exception:
-                msg_ts = None
-        ok, msg = process_slack_note(channel_id, user_id, user_name, text, msg_ts)
-        respond(msg)
-
-    @slack_app.command("/summary_notes_daily")
-    def handle_slack_summary_notes_daily(ack, respond, command):
-        ack()
-        text = (command.get("text") or "").strip()
-        day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
-        parts = build_scoped_summary(day, "note")
-        respond("\n".join(parts))
-
-    @slack_app.command("/status")
-    def handle_slack_status(ack, respond, command):
-        ack()
-        respond(build_status_report())
-
-    @slack_app.command("/summary_news_daily")
-    def handle_slack_summary_news_daily(ack, respond, command):
-        ack()
-        if not FEATURE_NEWS_ENABLED:
-            respond("新聞功能已關閉。")
-            return
-        text = (command.get("text") or "").strip()
-        day = text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text or "") else datetime.now().strftime("%Y-%m-%d")
-        parts = build_scoped_summary(day, "news")
-        respond("\n".join(parts))
-
-    @slack_app.event("message")
-    def handle_slack_message(event, say):
-        if SLACK_DEBUG:
-            print(f"[SLACK] event received: keys={list(event.keys())}")
-        if event.get("subtype"):
-            if SLACK_DEBUG:
-                print("[SLACK] ignored: subtype present")
-            return
-        if event.get("bot_id"):
-            if SLACK_DEBUG:
-                print("[SLACK] ignored: bot message")
-            return
-        channel_type = event.get("channel_type")
-        if channel_type and channel_type != "im":
-            if SLACK_DEBUG:
-                print(f"[SLACK] ignored: channel_type={channel_type}")
-            return
-        if event.get("user") != SLACK_USER_ID:
-            if SLACK_DEBUG:
-                print(f"[SLACK] ignored: user mismatch {event.get('user')}")
-            return
-
-        text = event.get("text")
-        if not text:
-            return
-
-        msg_ts = None
-        if event.get("ts"):
-            try:
-                msg_ts = _local_datetime_from_unix(event.get("ts"))
-            except Exception:
-                msg_ts = None
-
-        # DM text commands fallback (when slash commands are not configured)
-        if text.startswith("/note "):
-            payload = text[len("/note ") :].strip()
-            if payload:
-                channel_id = event.get("channel", "")
-                user_id = event.get("user", "")
-                user_name = user_id
-                ok, msg = process_slack_note(channel_id, user_id, user_name, payload, msg_ts)
-                say(msg)
-                return
-        if text.startswith("/summary_notes_daily"):
-            tokens = text.split()
-            day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
-            parts = build_scoped_summary(day, "note")
-            say("\n".join(parts))
-            return
-        if text.startswith("/summary_news_daily"):
-            if not FEATURE_NEWS_ENABLED:
-                say("新聞功能已關閉。")
-                return
-            tokens = text.split()
-            day = tokens[1] if len(tokens) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", tokens[1]) else datetime.now().strftime("%Y-%m-%d")
-            parts = build_scoped_summary(day, "news")
-            say("\n".join(parts))
-            return
-        if text.startswith("/status"):
-            say(build_status_report())
-            return
-
-        channel_id = event.get("channel", "")
-        user_id = event.get("user", "")
-        user_name = user_id
-        store_message("slack", channel_id, channel_id, user_id, user_name, text, msg_ts)
-        append_markdown("slack", channel_id, user_name, text, msg_ts)
-
-    handler = SocketModeHandler(slack_app, SLACK_APP_TOKEN)
-    handler.connect()
-    Event().wait()
-
-
-def start_slack_thread() -> None:
-    if not FEATURE_SLACK_ENABLED:
-        print("[INFO] Slack worker disabled by FEATURE_SLACK_ENABLED=0")
-        return
-    t = threading.Thread(target=start_slack_socket_mode, daemon=True)
-    t.start()
-
-
 def start_background_workers_once() -> None:
     global _startup_done
     with _startup_lock:
@@ -10706,8 +10149,6 @@ def start_background_workers_once() -> None:
             return
         set_telegram_commands()
         start_news_thread()
-        start_kol_digest_thread()
-        start_slack_thread()
         start_dropbox_sync_thread()
         start_ocr_choice_expire_thread()
         start_telegram_polling_thread()

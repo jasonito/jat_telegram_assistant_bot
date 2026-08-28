@@ -6,7 +6,6 @@ uvicorn
 python-dotenv
 requests
 httpx
-slack_bolt
 feedparser
 rapidfuzz
 tzdata

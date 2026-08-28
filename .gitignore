@@ -19,3 +19,8 @@ read/messages.sqlite
 
 tests_runtime*/
 
+# DATA_DIR runtime output (same class as read/_runtime, read/images)
+read/news/
+
+# machine-local Claude Code permissions
+.claude/settings.local.json

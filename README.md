@@ -19,8 +19,6 @@ Notes:
 - systemd template: `deploy/jat-bot.service.example`
 - Server operation runbook: `docs/SERVER_RUNBOOK.md`
 - Project memory / recurring pitfalls: `docs/PROJECT_MEMORY.md`
-- KOL Daily Digest plan: `docs/KOL_DAILY_DIGEST_PLAN.md`
-- KOL watchlist seed: `read/kol_watchlist.json`
 
 ## Env
 
@@ -28,7 +26,6 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 
 - main bot: `.env.main`
 - chitchat bot: `.env.chitchat`
-- digest bot: `.env.digest`
 
 `start.ps1` loads env values from `-EnvFile`, and `start-both.ps1` already uses `.env.main` + `.env.chitchat`.
 
@@ -49,7 +46,7 @@ Use profile-specific env files instead of a shared `.env` whenever possible:
 
 ### Segment C: Feature Flags
 - 用途：不改程式碼就切換主要功能。
-- 主要參數：`FEATURE_NEWS_ENABLED`、`FEATURE_TRANSCRIBE_ENABLED`、`FEATURE_TRANSCRIBE_AUTO_URL`、`FEATURE_OCR_ENABLED`、`FEATURE_OCR_CHOICE_ENABLED`、`FEATURE_SLACK_ENABLED`。
+- 主要參數：`FEATURE_NEWS_ENABLED`、`FEATURE_TRANSCRIBE_ENABLED`、`FEATURE_TRANSCRIBE_AUTO_URL`、`FEATURE_OCR_ENABLED`、`FEATURE_OCR_CHOICE_ENABLED`。
 - OCR 選擇行為：`OCR_CHOICE_SCOPE`、`OCR_CHOICE_TIMEOUT_SECONDS`、`OCR_CHOICE_TIMEOUT_DEFAULT`。
 
 ### Segment D: Transcription Engine
@@ -92,20 +89,14 @@ Default transcription baseline: `WHISPER_MODEL=small`, `TRANSCRIBE_CHUNK_MINUTES
 - 用途：把 chitchat 的文字、圖片、transcript 追加到 Notion 頁面。
 - 主要參數：`NOTION_ENABLED`、`NOTION_TOKEN`、`NOTION_VERSION`、`NOTION_CHATLOG_YEAR_PAGES_JSON`、`NOTION_CHATLOG_FALLBACK_PAGE_ID`、`NOTION_CHATLOG_IMAGE_MODE`、`NOTION_FILE_UPLOAD_VERSION`、`NOTION_CHATLOG_OCR_MODE`、`NOTION_CHATLOG_INCLUDE_TIME`。
 
-### Segment J: Slack (optional)
-- 用途：啟用 Socket Mode DM logging。
-- 主要參數：`SLACK_BOT_TOKEN`、`SLACK_APP_TOKEN`、`SLACK_USER_ID`、`SLACK_DEBUG`。
-
 ### Templates
 
 - main profile 範本：`.env.main.example`
 - chitchat profile 範本：`.env.chitchat.example`
-- digest profile 範本：`.env.digest.example`
 - 舊版通用範本：`.env.example`
 
 - Main profile template: `.env.main.example`
 - Chitchat profile template: `.env.chitchat.example`
-- Digest profile template: `.env.digest.example`
 - Legacy generic template: `.env.example`
 
 ## Run
@@ -114,12 +105,6 @@ Direct uvicorn run:
 
 ```powershell
 uvicorn app_chitchat:app --host 0.0.0.0 --port 8000
-```
-
-Digest profile direct run:
-
-```powershell
-uvicorn app_digest:app --host 0.0.0.0 --port 8002
 ```
 
 Recommended startup script:
@@ -140,7 +125,6 @@ Run with specific env file and port:
 ```powershell
 .\start.ps1 -EnvFile .env.main -Port 8000
 .\start.ps1 -EnvFile .env.chitchat -Port 8001
-.\start.ps1 -EnvFile .env.digest -Port 8002
 ```
 
 Register the main bot to auto-start on Windows logon:
@@ -160,55 +144,6 @@ Start both bots:
 .\start-both.ps1
 ```
 
-The digest bot is currently started separately so its rollout stays independent from the existing main + chitchat startup flow.
-
-Phase 1 KOL digest scaffold now lives in `kol_digest.py`. It currently provides:
-
-- watchlist loading from `data/kol_watchlist.json`
-- SQLite schema bootstrap for KOL sources, posts, and digest runs
-- normalized post persistence with dedupe
-- markdown digest rendering to `read/digests/`-style output paths
-- replaceable social-source adapters via `build_x_source_adapter()`, `build_facebook_source_adapter()`, and `build_social_source_adapter()`
-- optional `snscrape`-backed X adapter via `SnscrapeXAdapter`
-- optional Apify-backed X adapter skeleton via `ApifyXAdapter`
-- Facebook provider interface wired via `StubFacebookAdapter` placeholder, so Meta Pages API or scraper-backed implementations can plug in without changing the digest flow
-- Telegram watchlist management via `/digest_watchlist`
-- digest profile background scheduler aligned to `08:00 Asia/Taipei`
-- default fetch slots at `02:00 / 08:00 / 14:00 / 20:00 Asia/Taipei`, with the `08:00` slot generating the previous calendar day's digest
-
-Current X adapter notes:
-
-- select the provider with `KOL_X_SOURCE_PROVIDER=snscrape|apify`
-- `snscrape` remains the default bootstrap path
-- `ApifyXAdapter` is wired as a generic task/actor client and usually needs `APIFY_X_INPUT_TEMPLATE_JSON` to match the chosen actor schema
-- provider-specific notes live in `docs/APIFY_X_ADAPTER.md`
-
-Current Facebook adapter notes:
-
-- select the provider with `KOL_FACEBOOK_SOURCE_PROVIDER=stub`
-- `stub` is the current default and intentionally fails with a clear error until a real Facebook adapter is plugged in
-- planned real implementations can target Meta `Page Public Content Access` or a scraper-backed fetcher behind the same `SocialSourceAdapter` contract
-- the Meta skeleton is now wired as `KOL_FACEBOOK_SOURCE_PROVIDER=meta`
-- required env for the Meta skeleton: `META_GRAPH_API_ACCESS_TOKEN` or `META_PAGE_PUBLIC_CONTENT_ACCESS_TOKEN`
-- optional env for the Meta skeleton: `META_GRAPH_API_VERSION`, `META_FACEBOOK_POSTS_EDGE`, `META_FACEBOOK_FIELDS`
-- this adapter only proves the Graph API integration path; actual success still depends on Meta app review / `Page Public Content Access` approval and the exact Page permissions granted to the token
-
-Digest watchlist command notes:
-
-- list: `/list_kol`
-- add: `/add_kol https://x.com/example Display Name`
-- add with handle: `/add_kol @example Display Name`
-- today digest: `/kol_today`
-- yesterday digest: `/kol_yesterday`
-- fetch now + rebuild digest: `/kol_now`
-- enable: `/on_kol <kol_id>`
-- disable: `/off_kol <kol_id>`
-- remove: `/del_kol <kol_id>`
-- platform is inferred automatically: `facebook.com` => `facebook`, `x.com`/`twitter.com`/`@handle`/plain handle => `x`
-- legacy forms still work: `/digest_watchlist ...` and `add kol ...`
-- mutation commands require the Telegram user to be allowlisted in `TELEGRAM_ALLOWED_CONTROL_USERS`
-- optional env override: `KOL_WATCHLIST_PATH`
-
 Troubleshoot startup/command routing (keep logs streaming in current terminal):
 
 ```powershell
@@ -218,7 +153,6 @@ powershell -ExecutionPolicy Bypass -File .\start-both.ps1 -EnableLogs -Monitor
 Startup troubleshooting notes:
 
 - If `start-both.ps1` reports `Health check did not become ready ... /healthz within 30s`, check the uvicorn startup log first. The failure may be an app startup exception, not an HTTP health route problem.
-- The main profile now tolerates a missing `kol_digest.py`. KOL commands/features are marked unavailable instead of crashing the whole bot during import.
 - `set_telegram_commands()` failures to `api.telegram.org` should no longer kill startup. If Telegram is blocked by local firewall / endpoint policy, the bot can still start and serve `/healthz`, but Telegram polling or command sync may log connection errors.
 - If you need to isolate the issue quickly, test the app import directly:
 
@@ -290,10 +224,6 @@ python -m unittest discover -s tests -p "test_*.py"
 - Markdown 檔案：`H:\我的雲端硬碟\Obsidian\Resource\note\YYYY-MM-DD_note.md`
 - SQLite 資料庫：`DATA_DIR\messages.sqlite`
 - `chitchat` bot 的一般聊天文字不會追加到本地 note markdown；chatlog 會寫到 Notion。
-
-Slack DM logging（不回覆）：
-- 來自指定 `SLACK_USER_ID` 的 DM 會依照目前 profile 的同一路由寫入 SQLite/Markdown。
-- 啟動 uvicorn 後，再對 bot 傳送 DM。
 
 轉錄執行行為：
 - 長音訊會逐段轉錄，執行時會回報 `Transcribing segment n/m...`。
