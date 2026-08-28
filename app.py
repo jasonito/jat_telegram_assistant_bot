@@ -2768,8 +2768,13 @@ def _build_polish_system_prompt(mode: str) -> str:
     return base + "\n輸入已經是繁體中文，只做上述整理，不要翻譯。\n"
 
 
-def _polish_one_chunk(chunk: str, mode: str, index: int, total: int) -> str | None:
-    """Polish a single chunk, retrying once. Returns None if it could not be done."""
+def _polish_one_chunk(chunk: str, mode: str, index: int, total: int) -> tuple[str | None, str]:
+    """Polish a single chunk, retrying once.
+
+    Returns (text, reason). text is None when the chunk could not be polished;
+    reason is "" on success and starts with AI_UNREACHABLE_PREFIX when the
+    provider never answered, which tells the caller to stop rather than retry.
+    """
     system_prompt = _build_polish_system_prompt(mode)
     user_prompt = (
         f"這是一份長逐字稿的第 {index}/{total} 段，"
@@ -2780,26 +2785,35 @@ def _polish_one_chunk(chunk: str, mode: str, index: int, total: int) -> str | No
     )
     ratio = PODCAST_POLISH_MIN_RATIO if mode == "polish" else PODCAST_POLISH_MIN_RATIO_TRANSLATE
     min_length = max(1, int(len(chunk) * ratio))
+    last_reason = "no response"
     for attempt in (1, 2):
+        errors: list[str] = []
         out = _normalize_text_value(
             _run_ai_chat(
                 system_prompt,
                 user_prompt,
                 temperature=PODCAST_POLISH_TEMPERATURE,
                 timeout_seconds=PODCAST_POLISH_TIMEOUT_SECONDS,
+                on_error=errors.append,
             )
         ).strip()
+        if errors and errors[0].startswith(AI_UNREACHABLE_PREFIX):
+            # The endpoint is down; a second attempt would just wait out another
+            # connect timeout.
+            print(f"[WARN] polish chunk {index}/{total}: {errors[0]}")
+            return None, errors[0]
         if not out:
-            print(f"[WARN] polish chunk {index}/{total} attempt {attempt}: empty response")
+            last_reason = errors[0] if errors else "empty response"
+            print(f"[WARN] polish chunk {index}/{total} attempt {attempt}: {last_reason}")
             continue
         if len(out) < min_length:
-            print(
-                f"[WARN] polish chunk {index}/{total} attempt {attempt}: "
+            last_reason = (
                 f"output too short ({len(out)} < {min_length}); likely summarised or truncated"
             )
+            print(f"[WARN] polish chunk {index}/{total} attempt {attempt}: {last_reason}")
             continue
-        return out
-    return None
+        return out, ""
+    return None, last_reason
 
 
 def _prepare_transcript_polish(path: Path) -> dict[str, object] | None:
@@ -2890,7 +2904,20 @@ async def _polish_transcript_file(
                 await on_progress(index, total, mode)
             except Exception:
                 pass
-        polished = await asyncio.to_thread(_polish_one_chunk, chunk, mode, index, total)
+        polished, reason = await asyncio.to_thread(_polish_one_chunk, chunk, mode, index, total)
+        if reason.startswith(AI_UNREACHABLE_PREFIX):
+            # No point walking the remaining chunks into the same timeout.
+            print(
+                f"[WARN] polish: provider unreachable at chunk {index}/{total} "
+                f"for {path.name}; file left unchanged"
+            )
+            return {
+                "status": "unreachable",
+                "chunks": total,
+                "failed": failed + 1,
+                "mode": mode,
+                "reason": reason,
+            }
         if polished is None:
             # Keep the raw text so nothing is lost, and flag it for review.
             failed += 1
@@ -2899,7 +2926,7 @@ async def _polish_transcript_file(
             parts.append(polished)
 
     if failed == total:
-        # Every chunk failed: the provider is down. Leave the file untouched.
+        # Every chunk failed. Leave the file untouched.
         print(f"[WARN] polish: all {total} chunk(s) failed for {path.name}; file left unchanged")
         return {"status": "failed", "chunks": total, "failed": failed, "mode": mode}
 
@@ -3106,15 +3133,19 @@ async def _handle_fixed_podcast_command(
                         cancel_event.is_set,
                     )
                     polish_status = str(polish_result.get("status") or "")
-                    if polish_status == "failed":
-                        polish_notes.append(f"{show_label}：潤飾失敗，已保留原始逐字稿")
+                    if polish_status == "unreachable":
+                        polish_notes.append(
+                            f"{show_label} — AI 服務連不上，已保留原始逐字稿"
+                        )
+                    elif polish_status == "failed":
+                        polish_notes.append(f"{show_label} — 潤飾失敗，已保留原始逐字稿")
                     elif polish_status == "cancelled":
-                        polish_notes.append(f"{show_label}：潤飾已取消，已保留原始逐字稿")
+                        polish_notes.append(f"{show_label} — 潤飾已取消，已保留原始逐字稿")
                     elif polish_status == "ok":
                         polish_failed = int(polish_result.get("failed") or 0)
                         if polish_failed:
                             polish_notes.append(
-                                f"{show_label}：潤飾完成，但有 {polish_failed} 段失敗並保留原文"
+                                f"{show_label} — 潤飾完成，但有 {polish_failed} 段失敗並保留原文"
                             )
 
                 await asyncio.to_thread(
@@ -5585,16 +5616,50 @@ def _resolve_ai_provider() -> str:
     return provider
 
 
+_AI_FAILURE_LOG_SEEN: dict[str, float] = {}
+
+# Reasons that mean "the provider is not answering at all", as opposed to it
+# answering with something unusable. Callers use this to stop retrying early.
+AI_UNREACHABLE_PREFIX = "unreachable: "
+
+
+def _log_ai_failure(context: str, reason: str) -> None:
+    """Print a provider failure, collapsing identical repeats within a minute."""
+    key = f"{context}|{reason[:150]}"
+    now = time.time()
+    if now - _AI_FAILURE_LOG_SEEN.get(key, 0.0) < 60:
+        return
+    _AI_FAILURE_LOG_SEEN[key] = now
+    print(f"[WARN] {context}: {reason}")
+
+
+def _describe_ai_exception(exc: Exception) -> str:
+    """Turn a transport failure into a short reason, flagged if it is a dead endpoint."""
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        # Connect/read timeouts and refused connections all mean the endpoint is
+        # not answering; retrying the same call just burns time.
+        return f"{AI_UNREACHABLE_PREFIX}{type(exc).__name__}: {str(exc)[:160]}"
+    return f"{type(exc).__name__}: {str(exc)[:160]}"
+
+
 def _run_ai_chat(
     system_prompt: str,
     user_prompt: str,
     *,
     temperature: float | None = None,
     timeout_seconds: int | None = None,
+    on_error: Callable[[str], None] | None = None,
 ) -> str | None:
     provider = _resolve_ai_provider()
     chat_temperature = AI_SUMMARY_TEMPERATURE if temperature is None else temperature
     chat_timeout = AI_SUMMARY_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+
+    def fail(reason: str) -> None:
+        _log_ai_failure(f"ai chat {provider}/{_resolve_ai_model_name()}", reason)
+        if on_error:
+            on_error(reason)
+        return None
+
     try:
         if provider == "openai":
             if not OPENAI_API_KEY:
@@ -5616,7 +5681,7 @@ def _run_ai_chat(
                 timeout=chat_timeout,
             )
             if resp.status_code >= 300:
-                return None
+                return fail(f"http {resp.status_code}: {resp.text[:200]}")
             data = resp.json()
             return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
 
@@ -5634,7 +5699,7 @@ def _run_ai_chat(
                 timeout=chat_timeout,
             )
             if resp.status_code >= 300:
-                return None
+                return fail(f"http {resp.status_code}: {resp.text[:200]}")
             data = resp.json()
             candidates = data.get("candidates") or []
             if not candidates:
@@ -5662,7 +5727,7 @@ def _run_ai_chat(
                 timeout=chat_timeout,
             )
             if resp.status_code >= 300:
-                return None
+                return fail(f"http {resp.status_code}: {resp.text[:200]}")
             data = resp.json()
             blocks = data.get("content") or []
             return "\n".join((b.get("text") or "").strip() for b in blocks if b.get("type") == "text").strip() or None
@@ -5687,7 +5752,7 @@ def _run_ai_chat(
                 timeout=chat_timeout,
             )
             if resp.status_code >= 300:
-                return None
+                return fail(f"http {resp.status_code}: {resp.text[:200]}")
             data = resp.json()
             return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
 
@@ -5707,12 +5772,12 @@ def _run_ai_chat(
                 timeout=chat_timeout,
             )
             if resp.status_code >= 300:
-                return None
+                return fail(f"http {resp.status_code}: {resp.text[:200]}")
             data = resp.json()
             return data.get("message", {}).get("content", "").strip() or None
-    except Exception:
-        return None
-    return None
+    except Exception as e:
+        return fail(_describe_ai_exception(e))
+    return fail(f"no handler for provider {provider!r}")
 
 
 def _strip_markdown_noise(text: str) -> str:
