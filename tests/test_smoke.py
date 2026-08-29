@@ -1980,6 +1980,432 @@ class SmokeTests(unittest.TestCase):
             "Podcast Q&A Earnings Recap.md",
         )
 
+    # --- AI provider preflight / "continue anyway?" confirmation -------------
+
+    def _reset_ai_precheck_cache(self):
+        with app._AI_PRECHECK_LOCK:
+            app._AI_PRECHECK_CACHE.clear()
+        self.addCleanup(app._AI_PRECHECK_CACHE.clear)
+
+    def test_probe_ai_provider_reports_the_unreachable_reason(self):
+        def fake_chat(system_prompt, user_prompt, **kwargs):
+            kwargs["on_error"](f"{app.AI_UNREACHABLE_PREFIX}ConnectionError: refused")
+            return None
+
+        with mock.patch.object(app, "_run_ai_chat", side_effect=fake_chat):
+            reachable, reason = app._probe_ai_provider()
+
+        self.assertFalse(reachable)
+        self.assertTrue(reason.startswith(app.AI_UNREACHABLE_PREFIX))
+
+    def test_probe_ai_provider_reports_a_reason_when_the_call_stays_silent(self):
+        # _run_ai_chat returns None without calling on_error when no API key is set.
+        with mock.patch.object(app, "_run_ai_chat", return_value=None):
+            reachable, reason = app._probe_ai_provider()
+
+        self.assertFalse(reachable)
+        self.assertTrue(reason)
+
+    def test_check_ai_provider_reachable_reuses_a_recent_verdict(self):
+        self._reset_ai_precheck_cache()
+        with mock.patch.object(app, "_probe_ai_provider", return_value=(False, "boom")) as probe:
+            first = app._check_ai_provider_reachable()
+            second = app._check_ai_provider_reachable()
+
+        self.assertEqual(first, (False, "boom"))
+        self.assertEqual(second, (False, "boom"))
+        self.assertEqual(probe.call_count, 1)
+
+        with mock.patch.object(app, "_probe_ai_provider", return_value=(True, "")) as forced:
+            self.assertEqual(app._check_ai_provider_reachable(force=True), (True, ""))
+            self.assertEqual(forced.call_count, 1)
+
+    def test_ensure_ai_provider_or_confirm_stays_quiet_when_the_provider_answers(self):
+        self._reset_ai_precheck_cache()
+        sender = mock.AsyncMock(return_value=1)
+        with mock.patch.object(app, "AI_PRECHECK_ENABLED", True):
+            with mock.patch.object(app, "AI_SUMMARY_ENABLED", True):
+                with mock.patch.object(app, "_probe_ai_provider", return_value=(True, "")):
+                    with mock.patch.object(app, "send_message", sender):
+                        ok = asyncio.run(
+                            app._ensure_ai_provider_or_confirm(7, "/news", degraded_note="x")
+                        )
+
+        self.assertTrue(ok)
+        sender.assert_not_called()
+
+    def test_ensure_ai_provider_or_confirm_prompts_and_records_the_pending_job(self):
+        db_path = self._make_temp_news_db("tests_runtime_ai_confirm.sqlite")
+        self._reset_ai_precheck_cache()
+        sender = mock.AsyncMock(return_value=4242)
+        with mock.patch.object(app, "DB_PATH", db_path):
+            with mock.patch.object(app, "AI_PRECHECK_ENABLED", True):
+                with mock.patch.object(app, "AI_SUMMARY_ENABLED", True):
+                    with mock.patch.object(
+                        app,
+                        "_probe_ai_provider",
+                        return_value=(False, f"{app.AI_UNREACHABLE_PREFIX}ConnectionError"),
+                    ):
+                        with mock.patch.object(app, "send_message", sender):
+                            ok = asyncio.run(
+                                app._ensure_ai_provider_or_confirm(
+                                    7,
+                                    "/news",
+                                    degraded_note="新聞標題不會翻譯",
+                                    user_id="9",
+                                    user_name="tester",
+                                )
+                            )
+
+            with app._connect_db() as conn:
+                rows = conn.execute(
+                    "SELECT chat_id, prompt_message_id, command_text, user_id, status "
+                    "FROM ai_pending_confirmations"
+                ).fetchall()
+
+        self.assertFalse(ok)
+        self.assertEqual(rows, [("7", 4242, "/news", "9", "pending")])
+
+        prompt_text = sender.await_args.args[1]
+        self.assertIn("AI 中轉站沒有回應", prompt_text)
+        self.assertIn("新聞標題不會翻譯", prompt_text)
+        buttons = sender.await_args.kwargs["reply_markup"]["inline_keyboard"][0]
+        self.assertEqual([b["text"] for b in buttons], ["繼續執行", "取消"])
+        for button in buttons:
+            self.assertTrue(app.AI_CONFIRM_CALLBACK_RE.match(button["callback_data"]))
+
+    def test_ensure_ai_provider_or_confirm_closes_the_job_when_the_prompt_cannot_be_sent(self):
+        db_path = self._make_temp_news_db("tests_runtime_ai_confirm_send_fail.sqlite")
+        self._reset_ai_precheck_cache()
+        with mock.patch.object(app, "DB_PATH", db_path):
+            with mock.patch.object(app, "AI_PRECHECK_ENABLED", True):
+                with mock.patch.object(app, "AI_SUMMARY_ENABLED", True):
+                    with mock.patch.object(app, "_probe_ai_provider", return_value=(False, "down")):
+                        with mock.patch.object(app, "send_message", mock.AsyncMock(return_value=None)):
+                            ok = asyncio.run(
+                                app._ensure_ai_provider_or_confirm(7, "/news", degraded_note="x")
+                            )
+
+            with app._connect_db() as conn:
+                statuses = [
+                    row[0]
+                    for row in conn.execute("SELECT status FROM ai_pending_confirmations").fetchall()
+                ]
+
+        self.assertFalse(ok)
+        self.assertEqual(statuses, ["send_failed"])
+
+    def test_ensure_ai_provider_or_confirm_is_skipped_while_ai_summary_is_off(self):
+        sender = mock.AsyncMock(return_value=1)
+        with mock.patch.object(app, "AI_PRECHECK_ENABLED", True):
+            with mock.patch.object(app, "AI_SUMMARY_ENABLED", False):
+                with mock.patch.object(app, "_probe_ai_provider") as probe:
+                    with mock.patch.object(app, "send_message", sender):
+                        ok = asyncio.run(
+                            app._ensure_ai_provider_or_confirm(7, "/news", degraded_note="x")
+                        )
+
+        self.assertTrue(ok)
+        probe.assert_not_called()
+        sender.assert_not_called()
+
+    def test_news_command_asks_before_running_when_the_provider_is_down(self):
+        gate = mock.AsyncMock(return_value=False)
+        with mock.patch.object(app, "FEATURE_NEWS_ENABLED", True):
+            with mock.patch.object(app, "_ensure_ai_provider_or_confirm", gate):
+                with mock.patch.object(app, "handle_news_command") as news:
+                    with mock.patch.object(app, "send_message", mock.AsyncMock(return_value=1)):
+                        handled = asyncio.run(app.handle_news_command_with_progress(7, "/news"))
+
+        self.assertTrue(handled)
+        news.assert_not_called()
+        self.assertEqual(gate.await_args.args[1], "/news")
+
+    def test_news_source_subcommand_never_probes_the_provider(self):
+        gate = mock.AsyncMock(return_value=False)
+        with mock.patch.object(app, "FEATURE_NEWS_ENABLED", True):
+            with mock.patch.object(app, "_ensure_ai_provider_or_confirm", gate):
+                with mock.patch.object(app, "handle_news_command", return_value=["News sources:"]):
+                    with mock.patch.object(app, "send_message", mock.AsyncMock(return_value=1)):
+                        with mock.patch.object(app, "edit_message", mock.AsyncMock(return_value=True)):
+                            handled = asyncio.run(
+                                app.handle_news_command_with_progress(7, "/news_source")
+                            )
+
+        self.assertTrue(handled)
+        gate.assert_not_awaited()
+
+    def test_podcast_command_asks_before_transcribing_when_the_provider_is_down(self):
+        gate = mock.AsyncMock(return_value=False)
+        with mock.patch.object(app, "FEATURE_TRANSCRIBE_ENABLED", True):
+            with mock.patch.object(app, "PODCAST_POLISH_ENABLED", True):
+                with mock.patch.object(app, "_ensure_ai_provider_or_confirm", gate):
+                    with mock.patch.object(app, "_load_transcription_module") as loader:
+                        with mock.patch.object(app, "send_message", mock.AsyncMock(return_value=1)):
+                            handled = asyncio.run(
+                                app.handle_daily_podcast_command(7, "/daily_podcast 1")
+                            )
+
+        self.assertTrue(handled)
+        loader.assert_not_called()
+        self.assertEqual(gate.await_args.args[1], "/daily_podcast 1")
+
+    def test_podcast_command_never_probes_the_provider_while_polishing_is_off(self):
+        gate = mock.AsyncMock(return_value=False)
+        with mock.patch.object(app, "FEATURE_TRANSCRIBE_ENABLED", True):
+            with mock.patch.object(app, "PODCAST_POLISH_ENABLED", False):
+                with mock.patch.object(app, "_ensure_ai_provider_or_confirm", gate):
+                    with mock.patch.object(
+                        app, "_load_transcription_module", side_effect=RuntimeError("stop here")
+                    ):
+                        with mock.patch.object(app, "send_message", mock.AsyncMock(return_value=1)):
+                            handled = asyncio.run(
+                                app.handle_daily_podcast_command(7, "/daily_podcast 1")
+                            )
+
+        self.assertTrue(handled)
+        gate.assert_not_awaited()
+
+    def test_shorten_ai_failure_reason_drops_the_urllib3_dump(self):
+        raw = (
+            f"{app.AI_UNREACHABLE_PREFIX}ConnectTimeout: HTTPConnectionPool("
+            "host='192.168.1.142', port=8317): Max retries exceeded with url: "
+            "/v1/chat/completions (Caused by ConnectTimeoutError(...))"
+        )
+
+        short = app._shorten_ai_failure_reason(raw)
+
+        self.assertEqual(short, "連線逾時，端點沒有回應（ConnectTimeout）")
+        self.assertNotIn("HTTPConnectionPool", short)
+
+    def test_shorten_ai_failure_reason_keeps_an_http_status(self):
+        self.assertEqual(
+            app._shorten_ai_failure_reason('http 401: {"error":"bad key"}'),
+            'http 401: {"error":"bad key"}',
+        )
+
+    def test_ai_confirm_callback_cancel_closes_the_job_without_resuming(self):
+        db_path = self._make_temp_news_db("tests_runtime_ai_confirm_cancel.sqlite")
+        job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        resume = mock.AsyncMock()
+        with mock.patch.object(app, "DB_PATH", db_path):
+            app._create_ai_confirm_job(
+                job_id=job_id, chat_id=7, command_text="/news", user_id="9", user_name="tester"
+            )
+            app._set_ai_confirm_prompt_message_id(job_id, 4242)
+            with mock.patch.object(app, "answer_callback_query", mock.AsyncMock(return_value=True)):
+                with mock.patch.object(app, "clear_message_inline_keyboard", mock.AsyncMock(return_value=True)):
+                    with mock.patch.object(app, "edit_message", mock.AsyncMock(return_value=True)):
+                        with mock.patch.object(app, "_resume_command_with_ai_skipped", resume):
+                            asyncio.run(
+                                app.handle_ai_confirm_callback(
+                                    {
+                                        "id": "cb-1",
+                                        "data": f"ai_offline:{job_id}:cancel",
+                                        "message": {"chat": {"id": 7}},
+                                    }
+                                )
+                            )
+
+            with app._connect_db() as conn:
+                status = conn.execute(
+                    "SELECT status FROM ai_pending_confirmations WHERE job_id = ?", (job_id,)
+                ).fetchone()[0]
+
+        self.assertEqual(status, "cancelled")
+        resume.assert_not_called()
+
+    def test_ai_confirm_callback_go_resumes_the_original_command(self):
+        db_path = self._make_temp_news_db("tests_runtime_ai_confirm_go.sqlite")
+        job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeef"
+        resume = mock.AsyncMock()
+
+        async def run_case():
+            await app.handle_ai_confirm_callback(
+                {
+                    "id": "cb-2",
+                    "data": f"ai_offline:{job_id}:go",
+                    "message": {"chat": {"id": 7}},
+                }
+            )
+            # The resume runs as its own task, so give the loop a turn to start it.
+            await asyncio.sleep(0)
+
+        with mock.patch.object(app, "DB_PATH", db_path):
+            app._create_ai_confirm_job(
+                job_id=job_id, chat_id=7, command_text="/news", user_id="9", user_name="tester"
+            )
+            app._set_ai_confirm_prompt_message_id(job_id, 4242)
+            with mock.patch.object(app, "answer_callback_query", mock.AsyncMock(return_value=True)):
+                with mock.patch.object(app, "clear_message_inline_keyboard", mock.AsyncMock(return_value=True)):
+                    with mock.patch.object(app, "edit_message", mock.AsyncMock(return_value=True)):
+                        with mock.patch.object(app, "_resume_command_with_ai_skipped", resume):
+                            asyncio.run(run_case())
+
+            with app._connect_db() as conn:
+                status = conn.execute(
+                    "SELECT status FROM ai_pending_confirmations WHERE job_id = ?", (job_id,)
+                ).fetchone()[0]
+
+        self.assertEqual(status, "confirmed")
+        resume.assert_awaited_once_with(7, "/news", "9", "tester")
+
+    def test_ai_confirm_callback_rejects_a_second_press(self):
+        db_path = self._make_temp_news_db("tests_runtime_ai_confirm_twice.sqlite")
+        job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeef0"
+        resume = mock.AsyncMock()
+        answers = mock.AsyncMock(return_value=True)
+        with mock.patch.object(app, "DB_PATH", db_path):
+            app._create_ai_confirm_job(
+                job_id=job_id, chat_id=7, command_text="/news", user_id="9", user_name="tester"
+            )
+            app._set_ai_confirm_prompt_message_id(job_id, 4242)
+            app._update_ai_confirm_job_status(job_id, "cancelled")
+            with mock.patch.object(app, "answer_callback_query", answers):
+                with mock.patch.object(app, "clear_message_inline_keyboard", mock.AsyncMock(return_value=True)):
+                    with mock.patch.object(app, "edit_message", mock.AsyncMock(return_value=True)):
+                        with mock.patch.object(app, "_resume_command_with_ai_skipped", resume):
+                            asyncio.run(
+                                app.handle_ai_confirm_callback(
+                                    {
+                                        "id": "cb-3",
+                                        "data": f"ai_offline:{job_id}:go",
+                                        "message": {"chat": {"id": 7}},
+                                    }
+                                )
+                            )
+
+        resume.assert_not_called()
+        self.assertIn("已處理", answers.await_args.args[1])
+
+    def test_ai_confirm_callback_expires_instead_of_running(self):
+        db_path = self._make_temp_news_db("tests_runtime_ai_confirm_expired.sqlite")
+        job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeef1"
+        resume = mock.AsyncMock()
+        with mock.patch.object(app, "DB_PATH", db_path):
+            with mock.patch.object(app, "AI_CONFIRM_TIMEOUT_SECONDS", 30):
+                app._create_ai_confirm_job(
+                    job_id=job_id, chat_id=7, command_text="/news", user_id="9", user_name="tester"
+                )
+            app._set_ai_confirm_prompt_message_id(job_id, 4242)
+            with app._connect_db() as conn:
+                conn.execute(
+                    "UPDATE ai_pending_confirmations SET expires_at = ? WHERE job_id = ?",
+                    ((datetime.now() - timedelta(minutes=1)).isoformat(timespec="seconds"), job_id),
+                )
+                conn.commit()
+            with mock.patch.object(app, "answer_callback_query", mock.AsyncMock(return_value=True)):
+                with mock.patch.object(app, "clear_message_inline_keyboard", mock.AsyncMock(return_value=True)):
+                    with mock.patch.object(app, "edit_message", mock.AsyncMock(return_value=True)):
+                        with mock.patch.object(app, "_resume_command_with_ai_skipped", resume):
+                            asyncio.run(
+                                app.handle_ai_confirm_callback(
+                                    {
+                                        "id": "cb-4",
+                                        "data": f"ai_offline:{job_id}:go",
+                                        "message": {"chat": {"id": 7}},
+                                    }
+                                )
+                            )
+
+            with app._connect_db() as conn:
+                status = conn.execute(
+                    "SELECT status FROM ai_pending_confirmations WHERE job_id = ?", (job_id,)
+                ).fetchone()[0]
+
+        self.assertEqual(status, "expired")
+        resume.assert_not_called()
+
+    def test_ai_confirm_callback_ignores_a_press_from_another_chat(self):
+        db_path = self._make_temp_news_db("tests_runtime_ai_confirm_other_chat.sqlite")
+        job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeef2"
+        resume = mock.AsyncMock()
+        with mock.patch.object(app, "DB_PATH", db_path):
+            app._create_ai_confirm_job(
+                job_id=job_id, chat_id=7, command_text="/news", user_id="9", user_name="tester"
+            )
+            with mock.patch.object(app, "answer_callback_query", mock.AsyncMock(return_value=True)):
+                with mock.patch.object(app, "_resume_command_with_ai_skipped", resume):
+                    asyncio.run(
+                        app.handle_ai_confirm_callback(
+                            {
+                                "id": "cb-5",
+                                "data": f"ai_offline:{job_id}:go",
+                                "message": {"chat": {"id": 8}},
+                            }
+                        )
+                    )
+
+            with app._connect_db() as conn:
+                status = conn.execute(
+                    "SELECT status FROM ai_pending_confirmations WHERE job_id = ?", (job_id,)
+                ).fetchone()[0]
+
+        self.assertEqual(status, "pending")
+        resume.assert_not_called()
+
+    def test_resume_command_with_ai_skipped_short_circuits_provider_calls(self):
+        seen = []
+
+        async def fake_news(chat_id, command_text, *, user_id=None, user_name=None):
+            seen.append(app._run_ai_chat("system", "user"))
+            return True
+
+        with mock.patch.object(app, "handle_daily_podcast_command", mock.AsyncMock(return_value=False)):
+            with mock.patch.object(app, "handle_china_podcast_command", mock.AsyncMock(return_value=False)):
+                with mock.patch.object(app, "handle_house_podcast_command", mock.AsyncMock(return_value=False)):
+                    with mock.patch.object(app, "handle_news_command_with_progress", fake_news):
+                        with mock.patch.object(
+                            app.requests,
+                            "post",
+                            side_effect=AssertionError("the provider must not be called"),
+                        ):
+                            asyncio.run(app._resume_command_with_ai_skipped(7, "/news", "9", "tester"))
+
+        self.assertEqual(seen, [None])
+        # The flag lives in the resumed task's context, so it must not leak out.
+        self.assertFalse(app._AI_SKIPPED_FOR_RUN.get())
+
+    def test_process_telegram_update_routes_the_ai_confirm_callback(self):
+        ai_cb = mock.AsyncMock()
+        ocr_cb = mock.AsyncMock()
+        with mock.patch.object(app, "handle_ai_confirm_callback", ai_cb):
+            with mock.patch.object(app, "handle_ocr_choice_callback", ocr_cb):
+                asyncio.run(
+                    app.process_telegram_update(
+                        {
+                            "callback_query": {
+                                "id": "cb-6",
+                                "data": "ai_offline:aaaaaaaa:go",
+                                "message": {"chat": {"id": 7}},
+                            }
+                        }
+                    )
+                )
+
+        ai_cb.assert_awaited_once()
+        ocr_cb.assert_not_called()
+
+    def test_process_telegram_update_still_routes_the_ocr_callback(self):
+        ai_cb = mock.AsyncMock()
+        ocr_cb = mock.AsyncMock()
+        with mock.patch.object(app, "handle_ai_confirm_callback", ai_cb):
+            with mock.patch.object(app, "handle_ocr_choice_callback", ocr_cb):
+                asyncio.run(
+                    app.process_telegram_update(
+                        {
+                            "callback_query": {
+                                "id": "cb-7",
+                                "data": "ocr_choice:abcd1234:run",
+                                "message": {"chat": {"id": 7}},
+                            }
+                        }
+                    )
+                )
+
+        ocr_cb.assert_awaited_once()
+        ai_cb.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

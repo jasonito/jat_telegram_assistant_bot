@@ -17,6 +17,7 @@ import uuid
 import logging
 import traceback
 import calendar
+import contextvars
 from contextlib import contextmanager
 from email.message import EmailMessage
 from html.parser import HTMLParser
@@ -268,6 +269,16 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 DEEPLX_API_URL = os.getenv("DEEPLX_API_URL", "http://127.0.0.1:1188/translate").strip()
 DEEPLX_AUTH_KEY = os.getenv("DEEPLX_AUTH_KEY", "").strip()
+
+# Commands that lean on the AI provider probe it first and, when it is down, ask
+# the user whether a degraded run is worth it. See _ensure_ai_provider_or_confirm().
+AI_PRECHECK_ENABLED = _env_flag("AI_PRECHECK_ENABLED", True)
+# Kept well under AI_SUMMARY_TIMEOUT_SECONDS: the probe only has to tell a live
+# endpoint from a dead one, and the user is waiting on it before anything starts.
+AI_PRECHECK_TIMEOUT_SECONDS = int(os.getenv("AI_PRECHECK_TIMEOUT_SECONDS", "8"))
+# A probe costs a round trip, so back-to-back commands reuse a recent verdict.
+AI_PRECHECK_CACHE_SECONDS = int(os.getenv("AI_PRECHECK_CACHE_SECONDS", "60"))
+AI_CONFIRM_TIMEOUT_SECONDS = int(os.getenv("AI_CONFIRM_TIMEOUT_SECONDS", "300"))
 
 # Podcast transcript polishing (/daily_podcast, /china_podcast, /house_podcast).
 # Runs after a transcript is saved: cleans up the raw speech-to-text wall of text
@@ -665,6 +676,7 @@ ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".aac", ".wav", ".flac", ".m4a", ".ogg", ".w
 URL_RE = re.compile(r"https?://[^\s<>()]+", flags=re.I)
 DIRECT_AUDIO_URL_RE = re.compile(r"\.(mp3|m4a|wav|ogg|aac|flac|wma|opus)(\?|$)", re.IGNORECASE)
 OCR_CHOICE_CALLBACK_RE = re.compile(r"^ocr_choice:([a-f0-9-]{8,64}):(run|save)$", flags=re.I)
+AI_CONFIRM_CALLBACK_RE = re.compile(r"^ai_offline:([a-f0-9-]{8,64}):(go|cancel)$", flags=re.I)
 _TRANSCRIBE_JOBS: dict[int, dict] = {}
 _TRANSCRIBE_JOBS_LOCK = threading.Lock()
 _TRANSCRIBE_BUSY_NOTICE_IDS: dict[int, list[int]] = {}
@@ -1099,6 +1111,25 @@ def init_storage() -> None:
             conn.execute("ALTER TABLE ocr_pending_choices ADD COLUMN message_ts TEXT")
         except sqlite3.OperationalError:
             pass
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_pending_confirmations (
+                job_id TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                prompt_message_id INTEGER,
+                command_text TEXT NOT NULL,
+                user_id TEXT,
+                user_name TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_confirm_status_expires "
+            "ON ai_pending_confirmations(status, expires_at)"
+        )
         conn.commit()
 
 
@@ -1382,6 +1413,17 @@ async def handle_news_command_with_progress(
 ) -> bool:
     if not FEATURE_NEWS_ENABLED or not _is_news_command_text(cmd_text):
         return False
+    # Only the digest subcommands translate headlines through the provider;
+    # source management and debug output never touch it.
+    if _get_news_command_subcommand(cmd_text) in {"", "latest"}:
+        if not await _ensure_ai_provider_or_confirm(
+            chat_id,
+            cmd_text,
+            degraded_note="新聞標題不會翻譯成中文，會直接顯示原文。",
+            user_id=user_id,
+            user_name=user_name,
+        ):
+            return True
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[tuple[int, str, str | None]] = asyncio.Queue()
@@ -3130,6 +3172,18 @@ async def _handle_fixed_podcast_command(
     if error:
         await send_message(chat_id, f"{error}\n\n{usage_text}")
         return True
+    # Checked after the arguments resolve, so a typo still gets its usage text
+    # instead of a provider prompt for a command that was never going to run.
+    if PODCAST_POLISH_ENABLED:
+        if not await _ensure_ai_provider_or_confirm(
+            chat_id,
+            text,
+            degraded_note=(
+                "轉錄會照常完成，但逐字稿不會潤飾，"
+                "非中文的內容也不會翻譯。"
+            ),
+        ):
+            return True
     try:
         tx = _load_transcription_module()
     except Exception as e:
@@ -5809,6 +5863,12 @@ def _run_ai_chat(
     timeout_seconds: int | None = None,
     on_error: Callable[[str], None] | None = None,
 ) -> str | None:
+    if _AI_SKIPPED_FOR_RUN.get():
+        # The user was told the provider is down and chose to run anyway. Every call
+        # would spend the full timeout before failing, so skip straight to the
+        # caller's fallback instead of stalling the command once per item.
+        return None
+
     provider = _resolve_ai_provider()
     chat_temperature = AI_SUMMARY_TEMPERATURE if temperature is None else temperature
     chat_timeout = AI_SUMMARY_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
@@ -5937,6 +5997,344 @@ def _run_ai_chat(
     except Exception as e:
         return fail(_describe_ai_exception(e))
     return fail(f"no handler for provider {provider!r}")
+
+
+# ---------------------------------------------------------------------------
+# Provider preflight and the "continue anyway?" prompt
+#
+# /news and the podcast commands both degrade quietly when the provider is
+# unreachable: news headlines stay in their source language, and transcripts are
+# left unpolished. Both also take a long time to get there, because every title
+# batch and every transcript chunk waits out its own timeout first. So probe the
+# provider up front and let the user decide, rather than letting them discover it
+# from the output half an hour later.
+# ---------------------------------------------------------------------------
+
+# Set for the duration of a run the user confirmed while the provider was down.
+# asyncio.to_thread copies the caller's context, so the flag follows the command
+# into its worker threads without being visible to any other chat's command.
+_AI_SKIPPED_FOR_RUN: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ai_skipped_for_run", default=False
+)
+
+_AI_PRECHECK_CACHE: dict[str, tuple[float, bool, str]] = {}
+_AI_PRECHECK_LOCK = threading.Lock()
+
+
+def _describe_ai_endpoint() -> str:
+    """Provider, model and base URL for the offline notice. Never the API key."""
+    provider = _resolve_ai_provider()
+    model = _resolve_ai_model_name()
+    base = {
+        "openai": OPENAI_BASE_URL,
+        "huggingface": HUGGINGFACE_BASE_URL,
+        "ollama": OLLAMA_BASE_URL,
+    }.get(provider, "")
+    return f"{provider} / {model}（{base}）" if base else f"{provider} / {model}"
+
+
+def _probe_ai_provider() -> tuple[bool, str]:
+    """Send a throwaway completion. Returns (reachable, reason).
+
+    Going through _run_ai_chat keeps the probe honest: it exercises the same
+    endpoint, credentials and model the real calls use, for every provider,
+    rather than a per-provider health URL that can pass while the model 404s.
+    """
+    reasons: list[str] = []
+    answer = _run_ai_chat(
+        "You are a health check. Reply with the single word: ok",
+        "ok",
+        temperature=0.0,
+        timeout_seconds=AI_PRECHECK_TIMEOUT_SECONDS,
+        on_error=reasons.append,
+    )
+    if answer:
+        return True, ""
+    if reasons:
+        return False, reasons[0]
+    # _run_ai_chat returns None without reporting a reason when the provider has
+    # no API key configured, and when the endpoint answers with empty content.
+    return False, "沒有回應（請檢查 API key 與模型設定）"
+
+
+def _check_ai_provider_reachable(*, force: bool = False) -> tuple[bool, str]:
+    """_probe_ai_provider() with a short cache, keyed by provider and model."""
+    key = f"{_resolve_ai_provider()}|{_resolve_ai_model_name()}"
+    now = time.time()
+    if not force:
+        with _AI_PRECHECK_LOCK:
+            cached = _AI_PRECHECK_CACHE.get(key)
+        if cached and now - cached[0] < AI_PRECHECK_CACHE_SECONDS:
+            return cached[1], cached[2]
+    reachable, reason = _probe_ai_provider()
+    with _AI_PRECHECK_LOCK:
+        _AI_PRECHECK_CACHE[key] = (time.time(), reachable, reason)
+    return reachable, reason
+
+
+def _create_ai_confirm_job(
+    *,
+    job_id: str,
+    chat_id: int,
+    command_text: str,
+    user_id: str | None,
+    user_name: str | None,
+) -> None:
+    now = datetime.now()
+    expires = now + timedelta(seconds=max(30, AI_CONFIRM_TIMEOUT_SECONDS))
+    with _connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO ai_pending_confirmations
+            (job_id, chat_id, prompt_message_id, command_text, user_id, user_name,
+             created_at, expires_at, status)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'pending')
+            """,
+            (
+                job_id,
+                str(chat_id),
+                command_text,
+                user_id or "",
+                user_name or "",
+                now.isoformat(timespec="seconds"),
+                expires.isoformat(timespec="seconds"),
+            ),
+        )
+        conn.commit()
+
+
+def _set_ai_confirm_prompt_message_id(job_id: str, message_id: int | None) -> None:
+    with _connect_db() as conn:
+        conn.execute(
+            "UPDATE ai_pending_confirmations SET prompt_message_id = ? WHERE job_id = ?",
+            (message_id, job_id),
+        )
+        conn.commit()
+
+
+def _get_ai_confirm_job(job_id: str) -> tuple | None:
+    with _connect_db() as conn:
+        return conn.execute(
+            """
+            SELECT job_id, chat_id, prompt_message_id, command_text, user_id, user_name,
+                   expires_at, status
+            FROM ai_pending_confirmations
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+
+
+def _update_ai_confirm_job_status(job_id: str, status: str) -> None:
+    with _connect_db() as conn:
+        conn.execute(
+            "UPDATE ai_pending_confirmations SET status = ? WHERE job_id = ?",
+            (status, job_id),
+        )
+        conn.commit()
+
+
+def _shorten_ai_failure_reason(reason: str) -> str:
+    """Trim a provider failure to one readable line for a chat message.
+
+    A transport error arrives as a paragraph of urllib3 retry-pool detail; the
+    only part worth showing is which exception it was. HTTP failures are already
+    short and carry the status, so they pass through.
+    """
+    text = (reason or "").strip()
+    if not text:
+        return ""
+    if not text.startswith(AI_UNREACHABLE_PREFIX):
+        return text[:160]
+    exc_name = text[len(AI_UNREACHABLE_PREFIX):].split(":", 1)[0].strip()
+    friendly = {
+        "ConnectTimeout": "連線逾時，端點沒有回應",
+        "ConnectionError": "無法連線到端點",
+        "ReadTimeout": "已連上但回應逾時",
+        "Timeout": "連線逾時",
+    }.get(exc_name, "無法連線到端點")
+    return f"{friendly}（{exc_name}）" if exc_name else friendly
+
+
+def _build_ai_confirm_keyboard(job_id: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "繼續執行", "callback_data": f"ai_offline:{job_id}:go"},
+                {"text": "取消", "callback_data": f"ai_offline:{job_id}:cancel"},
+            ]
+        ]
+    }
+
+
+def _build_ai_offline_prompt(command_text: str, reason: str, degraded_note: str) -> str:
+    minutes = max(1, (max(30, AI_CONFIRM_TIMEOUT_SECONDS) + 59) // 60)
+    lines = [
+        "⚠️ AI 中轉站沒有回應",
+        "",
+        f"端點：{_describe_ai_endpoint()}",
+    ]
+    short_reason = _shorten_ai_failure_reason(reason)
+    if short_reason:
+        lines.append(f"原因：{short_reason}")
+    lines += [
+        "",
+        f"指令：{command_text[:120]}",
+        f"影響：{degraded_note}",
+        "",
+        f"要繼續執行嗎？{minutes} 分鐘內未選擇就自動取消。",
+    ]
+    return "\n".join(lines)
+
+
+async def _ensure_ai_provider_or_confirm(
+    chat_id: int,
+    command_text: str,
+    *,
+    degraded_note: str,
+    user_id: str | None = None,
+    user_name: str | None = None,
+) -> bool:
+    """True when the command may run now.
+
+    False means the provider is down and the user has been asked to confirm; the
+    command is then re-entered from handle_ai_confirm_callback(), or dropped.
+    """
+    if not AI_PRECHECK_ENABLED or not AI_SUMMARY_ENABLED or _AI_SKIPPED_FOR_RUN.get():
+        return True
+
+    reachable, reason = await asyncio.to_thread(_check_ai_provider_reachable)
+    if reachable:
+        return True
+
+    print(
+        f"[INFO] ai precheck failed chat_id={chat_id} "
+        f"cmd={command_text[:60]!r} reason={reason[:120]}"
+    )
+    job_id = str(uuid.uuid4())
+    await asyncio.to_thread(
+        _create_ai_confirm_job,
+        job_id=job_id,
+        chat_id=chat_id,
+        command_text=command_text,
+        user_id=user_id,
+        user_name=user_name,
+    )
+    message_id = await send_message(
+        chat_id,
+        _build_ai_offline_prompt(command_text, reason, degraded_note),
+        reply_markup=_build_ai_confirm_keyboard(job_id),
+    )
+    if message_id is None:
+        # Nobody can answer a prompt that never arrived; close the job rather than
+        # leave a pending row a later callback could act on.
+        await asyncio.to_thread(_update_ai_confirm_job_status, job_id, "send_failed")
+        print(f"[WARN] ai precheck prompt send failed chat_id={chat_id}")
+        return False
+    await asyncio.to_thread(_set_ai_confirm_prompt_message_id, job_id, message_id)
+    return False
+
+
+async def _resume_command_with_ai_skipped(
+    chat_id: int,
+    command_text: str,
+    user_id: str | None,
+    user_name: str | None,
+) -> None:
+    """Re-enter the confirmed command with AI calls short-circuited."""
+    _AI_SKIPPED_FOR_RUN.set(True)
+    try:
+        if await handle_daily_podcast_command(chat_id, command_text):
+            return
+        if await handle_china_podcast_command(chat_id, command_text):
+            return
+        if await handle_house_podcast_command(chat_id, command_text):
+            return
+        if await handle_news_command_with_progress(
+            chat_id,
+            command_text,
+            user_id=user_id or None,
+            user_name=user_name or None,
+        ):
+            return
+        await send_message(chat_id, f"無法繼續執行：{command_text[:120]}")
+    except Exception as e:
+        print(f"[WARN] ai confirm resume failed: {type(e).__name__}: {e}")
+        print(traceback.format_exc())
+        await send_message(chat_id, f"指令處理失敗：{type(e).__name__}: {e}"[:400])
+
+
+async def handle_ai_confirm_callback(callback: dict) -> None:
+    callback_id = callback.get("id") or ""
+    data = (callback.get("data") or "").strip()
+    msg = callback.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    m = AI_CONFIRM_CALLBACK_RE.match(data)
+    if not m:
+        await answer_callback_query(callback_id, "無效操作", show_alert=False)
+        return
+    job_id, action = m.group(1), m.group(2).lower()
+
+    job = await asyncio.to_thread(_get_ai_confirm_job, job_id)
+    if not job:
+        await answer_callback_query(callback_id, "任務不存在或已過期", show_alert=False)
+        return
+    (
+        _job_id,
+        job_chat_id,
+        prompt_message_id,
+        command_text,
+        job_user_id,
+        job_user_name,
+        expires_at,
+        status,
+    ) = job
+    if str(chat_id or "") != str(job_chat_id):
+        await answer_callback_query(callback_id, "無效操作", show_alert=False)
+        return
+    if status != "pending":
+        await answer_callback_query(callback_id, "此請求已處理", show_alert=False)
+        return
+
+    now = datetime.now()
+    try:
+        expire_dt = datetime.fromisoformat(str(expires_at))
+    except Exception:
+        expire_dt = now
+
+    async def close_prompt(text: str) -> None:
+        if not prompt_message_id:
+            return
+        await clear_message_inline_keyboard(int(job_chat_id), int(prompt_message_id))
+        await edit_message(int(job_chat_id), int(prompt_message_id), text)
+
+    # Expiry is enforced here rather than by a sweeper thread: the timeout action
+    # is "do nothing", so there is nothing that has to run on a schedule.
+    if now >= expire_dt:
+        await asyncio.to_thread(_update_ai_confirm_job_status, job_id, "expired")
+        await answer_callback_query(callback_id, "已逾時", show_alert=False)
+        await close_prompt(
+            f"⚠️ AI 中轉站沒有回應：已逾時自動取消，{command_text[:80]} 未執行。"
+        )
+        return
+
+    if action == "cancel":
+        await asyncio.to_thread(_update_ai_confirm_job_status, job_id, "cancelled")
+        await answer_callback_query(callback_id, "已取消", show_alert=False)
+        await close_prompt(f"已取消 {command_text[:80]}。")
+        return
+
+    await asyncio.to_thread(_update_ai_confirm_job_status, job_id, "confirmed")
+    await answer_callback_query(callback_id, "繼續執行", show_alert=False)
+    await close_prompt(f"已確認繼續執行 {command_text[:80]}（略過 AI 步驟）。")
+    asyncio.create_task(
+        _resume_command_with_ai_skipped(
+            int(job_chat_id),
+            command_text,
+            job_user_id,
+            job_user_name,
+        )
+    )
 
 
 def _strip_markdown_noise(text: str) -> str:
@@ -10457,7 +10855,10 @@ def start_telegram_polling_watchdog_thread() -> None:
 async def process_telegram_update(update: dict) -> None:
     callback = update.get("callback_query") or {}
     if callback:
-        await handle_ocr_choice_callback(callback)
+        if AI_CONFIRM_CALLBACK_RE.match((callback.get("data") or "").strip()):
+            await handle_ai_confirm_callback(callback)
+        else:
+            await handle_ocr_choice_callback(callback)
         return
 
     is_edited_message = bool(update.get("edited_message"))
